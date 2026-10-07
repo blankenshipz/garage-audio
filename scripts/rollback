@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+main() {
 cd "$HOME/garage-audio"
 # No volumes deleted. Stop audio first; never resume player on rollback.
 systemctl --user stop garage-player garage-dsp 2>/dev/null || true
@@ -22,3 +23,7 @@ cp "releases/$previous/compose.yaml" "releases/$previous/requirements.txt" "rele
 printf '%s\n' "$previous" > state/revision
 docker compose -p garage-audio up -d
 echo 'MA restored; native DSP/player remain stopped and require muted restart.'
+}
+# Parse the complete transaction before it can overwrite this script. Exit is
+# in the same parsed command list, so Bash never reads replacement bytes.
+main "$@"; exit "$?"
