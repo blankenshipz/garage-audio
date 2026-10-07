@@ -4,9 +4,13 @@ After=network.target
 [Service]
 User=garage-dsp
 Group=garage-stream
+SupplementaryGroups=garage-control
 RuntimeDirectory=garage-audio
 RuntimeDirectoryMode=0750
 ExecStart=/usr/local/libexec/garage-audio/dsp-daemon
+PrivateNetwork=yes
+StateDirectory=garage-audio-dsp
+StateDirectoryMode=0700
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=5
@@ -23,5 +27,6 @@ RestrictAddressFamilies=AF_UNIX AF_INET
 DevicePolicy=closed
 DeviceAllow=char-alsa rw
 ReadWritePaths=/run/garage-audio
+ReadWritePaths=/var/lib/garage-audio-dsp
 [Install]
 WantedBy=multi-user.target

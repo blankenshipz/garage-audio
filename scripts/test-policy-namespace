@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# OWN PROJECT test container, no devices/ports/caps/root runtime provisioning.
+set -euo pipefail
+cd "$HOME/garage-audio"
+container=garage-audio-policy-test
+if docker inspect "$container" >/dev/null 2>&1; then echo 'Existing named test container; inspect ownership before retrying.'; exit 1; fi
+testdir=$(mktemp -d "$PWD/state/policy-ns.XXXXXX")
+cleanup(){ docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$testdir"; }
+trap cleanup EXIT
+docker run -d --name "$container" --label com.docker.compose.project=garage-audio \
+  --user 1000:1000 --network none --cap-drop ALL --security-opt no-new-privileges \
+  --mount "type=bind,src=$PWD/garage_audio,dst=/code/garage_audio,readonly" \
+  --mount "type=bind,src=$PWD/tests/policy_namespace.py,dst=/code/test.py,readonly" \
+  --mount "type=bind,src=$PWD/tools/camilladsp,dst=/camilladsp,readonly" \
+  --mount "type=bind,src=$PWD/tools/policy-wheels,dst=/wheels,readonly" \
+  --mount "type=bind,src=$testdir,dst=/test" \
+  --env PYTHONPATH=/code:/test/sdk \
+  --entrypoint /bin/sh \
+  ghcr.io/music-assistant/server:2.10.5@sha256:28023f8c0d96ca2496391f3218a6d70d7ef3ba84db846b3a3f3cd9ce7ef8aedc \
+  -c '/app/venv/bin/python -c "import pathlib,zipfile; [zipfile.ZipFile(p).extractall(\"/test/sdk\") for p in pathlib.Path(\"/wheels\").glob(\"*.whl\")]" && exec /app/venv/bin/python /code/test.py' >/dev/null
+for _ in {1..40}; do test ! -S "$testdir/control.sock" || break; sleep .1; done
+if test ! -S "$testdir/control.sock"; then docker logs "$container"; exit 1; fi
+TEST_SOCKET="$testdir/control.sock" venv/bin/python - <<'PY'
+import os,socket
+from garage_audio.ipc import request
+path=os.environ['TEST_SOCKET']
+with socket.socket() as raw:
+    raw.settimeout(1)
+    if raw.connect_ex(('127.0.0.1',1234))==0:raise AssertionError('private raw port reachable on host')
+status=request({'cmd':'status'},path)
+assert status['muted'] and status['volume_db']==-60 and status['ceiling_db']==-20
+for bad in [{'cmd':'SetConfig','config':{'devices':{'volume_limit':50}}},{'cmd':'volume','db':0}]:
+    try:request(bad,path)
+    except RuntimeError:pass
+    else:raise AssertionError('policy bypass accepted')
+status=request({'cmd':'status'},path);assert status['muted'] and status['ceiling_db']==-20
+print('PASS real private container loopback inaccessible from host; peer-authorized Unix status/control works and rejects raw config/ceiling bypass (FILE/null only)')
+PY

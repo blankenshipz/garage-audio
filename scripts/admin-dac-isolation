@@ -1,41 +1,5 @@
 #!/usr/bin/env bash
-# STAGED ONLY: run by administrator after attended USB identity verification.
-# Does not start services, trigger existing devices, reboot or open audio.
-set -euo pipefail
-test "$(id -u)" -eq 0 || { echo 'Run with interactive sudo after reviewing exact USB identity.'; exit 1; }
-test "$#" -eq 3 || { echo 'Usage: sudo bash admin-dac-isolation VERIFIED_USB_VENDOR VERIFIED_USB_PRODUCT VERIFIED_USB_SERIAL'; exit 1; }
-vendor=${1,,} product=${2,,} serial=$3
-[[ "$vendor" =~ ^[[:xdigit:]]{4}$ && "$product" =~ ^[[:xdigit:]]{4}$ ]] || exit 1
-[[ "$serial" =~ ^[A-Za-z0-9_.:-]+$ ]] || { echo 'Missing/unsupported stable USB serial; stop and resolve identity, never wildcard.'; exit 1; }
-root=/home/zach/garage-audio
-test -f "$root/tools/camilla.tar.gz"
-echo '55f5ec2ed80fcc79a543672f9f89ace4557d290d80584ef31ee0442111bd0b11  /home/zach/garage-audio/tools/camilla.tar.gz' | sha256sum -c -
-groupadd -f garage-stream
-groupadd -f garage-dac
-id garage-dsp >/dev/null 2>&1 || useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin --gid garage-stream garage-dsp
-usermod -aG garage-stream zach
-test "$(id -nG garage-dsp)" = garage-stream || { echo 'DSP identity has unexpected groups; review before provisioning'; exit 1; }
-if id -nG zach | tr ' ' '\n' | grep -qx audio; then
-  echo 'zach retains audio membership. Review removing it and refresh login before enforcing DAC isolation.'
-  exit 1
-fi
-mkdir -p /usr/local/libexec/garage-audio /etc/garage-audio
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-tar xzf "$root/tools/camilla.tar.gz" -C "$tmp"
-install -o root -g root -m 0755 "$tmp/camilladsp" /usr/local/libexec/garage-audio/camilladsp
-install -o root -g root -m 0755 "$root/scripts/dsp-daemon" /usr/local/libexec/garage-audio/dsp-daemon
-for target in /etc/udev/rules.d/99-garage-audio-dac.rules /etc/systemd/system/garage-audio-dsp.service; do
-  backup="/etc/garage-audio/$(basename "$target").pre-install"
-  if test -e "$target" && test ! -e "$backup"; then cp -p "$target" "$backup"; fi
-done
-# Exact USB ancestor attributes. No broad audio/internal/scanner-device rule.
-for kernel in 'pcmC*D*p' 'controlC*'; do
-  printf 'SUBSYSTEM=="sound", KERNEL=="%s", ATTRS{idVendor}=="%s", ATTRS{idProduct}=="%s", ATTRS{serial}=="%s", OWNER="garage-dsp", GROUP="garage-dac", MODE="0600", TAG-="uaccess"\n' "$kernel" "$vendor" "$product" "$serial"
-done > /etc/udev/rules.d/99-garage-audio-dac.rules
-install -o root -g root -m 0644 "$root/config/system/garage-audio-dsp.service" /etc/systemd/system/garage-audio-dsp.service
-systemctl daemon-reload
-udevadm control --reload-rules
-echo 'Definitions installed, NOT started/enabled; no existing device trigger.'
-echo 'Fresh login for garage-stream membership; attended apply/replug and verify exact node owner/mode/ACL before any start.'
-echo 'Only after that review: sudo systemctl enable --now garage-audio-dsp'
+# Old mutable-path sudo bootstrap is intentionally refused.
+echo 'DO NOT sudo a mutable project installer. Use the hash-pinned root-private'
+echo 'snapshot bootstrap and bundle described in docs/dac-isolation.md.' >&2
+exit 1

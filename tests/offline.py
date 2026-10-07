@@ -15,7 +15,7 @@ from types import SimpleNamespace
 import yaml
 from camilladsp import CamillaClient
 from garage_audio.profile import DEFAULT, compile_profile, validate, hardware_config
-from garage_audio.control import apply_graph, edit_profile, readback, commissioning_window
+from garage_audio.control import apply_graph, edit_profile, readback, commissioning_window, store
 from garage_audio.rew import parse
 from garage_audio.hardware import validate_identity
 
@@ -139,14 +139,15 @@ class DSPTests(unittest.TestCase):
                         except OSError:time.sleep(.1)
                     if proc.poll() is not None: raise RuntimeError(proc.stderr.read().decode())
                     self.assertTrue(c.volume.main_mute());self.assertEqual(c.volume.main_volume(),-60)
-                    cli=[str(ROOT/'venv/bin/python'),'-m','garage_audio.control','--port','1235']
+                    state=Path(directory)
+                    cli=[str(ROOT/'venv/bin/python'),'-m','garage_audio.control','--port','1235','--isolated-file-test-state',str(state)]
                     result=subprocess.run(cli+['volume','-30'],cwd=ROOT,env=ENV,capture_output=True,text=True,timeout=10)
                     self.assertEqual(result.returncode,0,result.stderr)
                     self.assertEqual(json.loads(result.stdout)['volume_db'],-30)
                     invalid=subprocess.run(cli+['volume','0'],cwd=ROOT,env=ENV,capture_output=True,text=True,timeout=10)
                     self.assertNotEqual(invalid.returncode,0)
                     self.assertTrue(c.volume.main_mute())
-                    audit=json.loads((ROOT/'state/audit.jsonl').read_text().splitlines()[-1])
+                    audit=json.loads((state/'audit.jsonl').read_text().splitlines()[-1])
                     self.assertEqual(audit['failed'],'ValueError');self.assertTrue(audit['muted'])
                     c.volume.set_main_volume(0)
                     # Getter reports requested fader; native effective ceiling is
@@ -167,7 +168,7 @@ class DSPTests(unittest.TestCase):
                     candidate=compile_profile(p,config['devices']['capture'],config['devices']['playback'])
                     c.volume.set_main_volume(-35)
                     apply_graph(c,p,state,candidate)
-                    self.assertEqual(json.loads((state/'active-profile.json').read_text()),p)
+                    self.assertEqual(store(state)['active'],p)
                     self.assertEqual(c.config.active()['filters']['left_gain']['parameters']['gain'],-3)
                     self.assertTrue(c.volume.main_mute());self.assertEqual(c.volume.main_volume(),-35)
                     rb=readback(c)
@@ -177,17 +178,17 @@ class DSPTests(unittest.TestCase):
                     # isolated FILE/null apply, never on failure or restart.
                     c.volume.set_main_volume(-40);c.volume.set_main_mute(False)
                     # Successful second transaction creates known-good receipt.
-                    apply_graph(c,DEFAULT,state,config,authorized_unmuted=True)
+                    apply_graph(c,DEFAULT,state,config,authorized_unmuted=True,generation=lambda:proc.pid)
                     self.assertFalse(c.volume.main_mute());self.assertEqual(c.volume.main_volume(),-40)
-                    self.assertEqual(json.loads((state/'known-good-profile.json').read_text()),p)
-                    with self.assertRaises(Exception):apply_graph(c,p,state,broken,authorized_unmuted=True)
+                    self.assertEqual(store(state)['known_good'],p)
+                    with self.assertRaises(Exception):apply_graph(c,p,state,broken,authorized_unmuted=True,generation=lambda:proc.pid)
                     self.assertTrue(c.volume.main_mute());self.assertEqual(c.volume.main_volume(),-60)
                     time.sleep(.2)
                     self.assertEqual(c.config.active()['filters'],valid['filters'])
                     c.volume.set_main_volume(-45);c.volume.set_main_mute(False)
                     with self.assertRaises(ValueError):apply_graph(c,p,state,candidate)
                     self.assertTrue(c.volume.main_mute());self.assertEqual(c.volume.main_volume(),-60)
-                    self.assertEqual(json.loads((state/'active-profile.json').read_text()),DEFAULT)
+                    self.assertEqual(store(state)['active'],DEFAULT)
                     if cycle == 0:
                         cli_state=state/'cli';cli_state.mkdir()
                         (cli_state/'active-profile.json').write_text(json.dumps(DEFAULT))

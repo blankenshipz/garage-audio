@@ -1,12 +1,5 @@
 #!/usr/bin/env bash
-# Installed root-owned by reviewed administrator provisioning, never as zach.
+# Root-owned verified snapshot, private network configured by the system unit.
 set -euo pipefail
 test "$(id -un)" = garage-dsp
-umask 057
-fifo=/run/garage-audio/capture.fifo
-test ! -e "$fifo" || rm "$fifo"
-mkfifo -m 0620 "$fifo"
-# No arbitrary project executable, mutable startup config, state-restored volume
-# or direct PipeWire/hardware app connection. Only this UID owns UMC nodes.
-cat "$fifo" | /usr/local/libexec/garage-audio/camilladsp \
-  -a 127.0.0.1 -p 1234 --wait --no_config --gain=-60 --mute
+exec /usr/local/libexec/garage-audio/venv/bin/python -I /usr/local/libexec/garage-audio/entry.py

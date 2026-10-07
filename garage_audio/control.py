@@ -23,6 +23,37 @@ def atomic(path, obj):
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+    fd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
+    try:os.fsync(fd)
+    finally:os.close(fd)
+
+def store(state):
+    path=state/'profile-store.json'
+    if path.exists():
+        value=json.loads(path.read_text())
+        return {'active':validate(value['active']),'known_good':validate(value['known_good'])}
+    active=load(state/'active-profile.json') if (state/'active-profile.json').exists() else None
+    return {'active':active,'known_good':active}
+
+def active_profile(state):
+    return store(state)['active']
+
+def prove_mute(c):
+    c.volume.set_main_mute(True);c.volume.set_main_volume(-60)
+    if not c.volume.main_mute() or c.volume.main_volume()!=-60:raise RuntimeError('cannot prove mute/-60')
+
+def fail_close(c, stop_producer):
+    try:prove_mute(c);return True
+    except Exception:stop_producer();return False
+
+def connect_guarded(c, stop_producer):
+    try:c.connect()
+    except Exception:
+        fail_close(c,stop_producer)
+        raise
+
+def stop_project_producer():
+    return subprocess.run(['systemctl','--user','stop','garage-player','garage-dsp'],check=False,timeout=10,capture_output=True)
 
 def readback(c):
     config = c.config.active() or {}
@@ -40,19 +71,25 @@ def apply(c, p, state, alsa, authorized_unmuted=False):
     candidate = hardware_config(p, alsa)
     apply_graph(c, p, state, candidate, authorized_unmuted)
 
-def apply_graph(c, p, state, candidate, authorized_unmuted=False, persist=True):
+def apply_graph(c, p, state, candidate, authorized_unmuted=False, persist=True, generation=None):
     """Internal transaction shared by hardware CLI and isolated file tests."""
     previous = c.config.active()
     prior_volume = c.volume.main_volume()
     prior_mute = c.volume.main_mute()
-    c.volume.set_main_mute(True)
-    c.volume.set_main_volume(-60)
+    epoch=generation() if generation else None
+    saved=None
+    had_store=(state/'profile-store.json').exists()
+    committed=False
+    prove_mute(c)
     # Commands acknowledge target settings before the400ms DSP ramp completes.
     time.sleep(.45)
     try:
+        saved=store(state) if persist else None
         number(prior_volume, -90, -20)
         if not prior_mute and not authorized_unmuted:
             raise ValueError('active attended authorization required to preserve existing unmute')
+        if not prior_mute and generation is None:
+            raise ValueError('unmute preservation requires owned DSP generation')
         validated = c.config.validate(candidate)
         c.config.set_active(validated)
         for _ in range(30):
@@ -63,21 +100,31 @@ def apply_graph(c, p, state, candidate, authorized_unmuted=False, persist=True):
                     continue
                 if not c.volume.main_mute() or c.volume.main_volume() != -60:
                     raise RuntimeError('reload mute/-60 boundary not effective')
+                if generation and generation()!=epoch:raise RuntimeError('DSP generation changed during transaction')
+                if persist:
+                    previous_profile=saved['active'] or validate(p)
+                    new_store={'active':validate(p),'known_good':previous_profile}
+                    committed=True
+                    atomic(state/'profile-store.json',new_store)
+                    if store(state)!=new_store:raise RuntimeError('durable profile readback mismatch')
+                # All durable writes/readback precede the LAST mute restore.
                 c.volume.set_main_volume(prior_volume)
+                if generation and generation()!=epoch:raise RuntimeError('DSP generation changed before mute restore')
                 if not prior_mute:
                     c.volume.set_main_mute(False)
                 if c.volume.main_mute() != prior_mute or abs(c.volume.main_volume()-prior_volume) > .01:
                     raise RuntimeError('prior master state could not be restored')
-                if persist and (state / 'active-profile.json').exists():
-                    atomic(state / 'known-good-profile.json', load(state / 'active-profile.json'))
-                if persist: atomic(state / 'active-profile.json', p)
                 return
         raise RuntimeError('effective graph did not become ready')
     except Exception:
+        # Silence/readback FIRST. Never reload a rollback graph while unmuted.
+        prove_mute(c)
         if previous:
             c.config.set_active(previous)
-        c.volume.set_main_mute(True)
-        c.volume.set_main_volume(-60)
+        prove_mute(c)
+        if committed:
+            if saved['active'] is not None:atomic(state/'profile-store.json',saved)
+            elif not had_store:(state/'profile-store.json').unlink(missing_ok=True)
         raise
 
 def edit_profile(p, args):
@@ -150,6 +197,17 @@ def main():
         e = sub.add_parser(cmd); e.add_argument('channel', choices=['left','right','sub'])
         if cmd == 'peq-delete': e.add_argument('index', type=int)
     args = ap.parse_args()
+    if not args.isolated_file_test_state:
+        from .ipc import request
+        try:
+            payload=vars(args).copy()
+            if args.cmd=='profile':payload['profile']=load(args.path)
+            print(json.dumps(request(payload)))
+        except Exception:
+            # Cannot prove broker/DSP mute; close ONLY the project PCM source.
+            stop_project_producer()
+            raise
+        return
     state = ROOT / 'state'
     if args.isolated_file_test_state:
         state=Path(args.isolated_file_test_state).resolve()
@@ -160,8 +218,10 @@ def main():
     state.mkdir(exist_ok=True)
     with (state / 'control.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        c = CamillaClient('127.0.0.1', args.port); c.connect()
+        c = CamillaClient('127.0.0.1', args.port)
+        stop=stop_project_producer
         try:
+            connect_guarded(c,stop)
             isolated_devices=None
             if args.isolated_file_test_state:
                 cfg=c.config.active() or {}
@@ -191,9 +251,9 @@ def main():
             elif args.cmd != 'status':
                 alsa = None if isolated_devices else bound_device(state)
                 if args.cmd == 'profile': p = load(args.path)
-                elif args.cmd == 'rollback': p = load(state / 'known-good-profile.json')
+                elif args.cmd == 'rollback': p = store(state)['known_good']
                 else:
-                    p = edit_profile(load(state / 'active-profile.json'), args)
+                    p = edit_profile(active_profile(state), args)
                 if isolated_devices:
                     candidate=compile_profile(p,isolated_devices['capture'],isolated_devices['playback'])
                     apply_graph(c,p,state,candidate,authorized_unmuted=args.attended_profile is not None)
