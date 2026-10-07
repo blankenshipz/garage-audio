@@ -1,0 +1,13 @@
+[Unit]
+Description=Garage headless graph policy
+Requires=garage-pipewire.service
+After=garage-pipewire.service
+[Service]
+Environment=PIPEWIRE_RUNTIME_DIR=%t/garage-audio
+Environment=PIPEWIRE_REMOTE=garage-pipewire
+Environment=WIREPLUMBER_CONFIG_DIR=%h/garage-audio/config:/usr/share/wireplumber
+ExecStart=/usr/bin/wireplumber
+Restart=on-failure
+RestartSec=3
+[Install]
+WantedBy=default.target

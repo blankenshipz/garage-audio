@@ -1,0 +1,18 @@
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.4
+aiosignal==1.4.0
+anyascii==0.3.3
+attrs==26.1.0
+camilladsp @ https://github.com/HEnquist/pycamilladsp/archive/fdc0d163e02dd73206a493402b43c83502ad83d7.tar.gz#sha256=d9d33cab26c4cabcd85daccfbb39a3294579eed8816fbe0ca77f36fe0370f087
+frozenlist==1.8.0
+idna==3.20
+mashumaro==3.23
+multidict==6.9.1
+music_assistant_client==1.6.0
+music_assistant_models==1.1.214
+orjson==3.12.0
+propcache==0.5.4
+PyYAML==6.0.3
+typing_extensions==4.16.0
+websocket-client==1.9.0
+yarl==1.25.1

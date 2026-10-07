@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+host=zach@192.168.68.74
+revision=$(git rev-parse HEAD)
+ssh "$host" 'umask 077; test "$(hostname)" = garage-server; mkdir -p /home/zach/garage-audio/releases /home/zach/garage-audio/state/music /home/zach/garage-audio/state/ma; chmod 700 /home/zach/garage-audio/state /home/zach/garage-audio/state/ma'
+git archive HEAD | ssh "$host" "mkdir -p /home/zach/garage-audio/releases/$revision; tar xf - -C /home/zach/garage-audio/releases/$revision"
+ssh "$host" "set -eu; umask 077; cd /home/zach/garage-audio; docker compose -p garage-audio -f releases/$revision/compose.yaml config -q; test ! -f state/revision || cp state/revision state/previous-revision; mkdir -p state/backups; if test -f compose.yaml; then docker compose -p garage-audio stop music-assistant; tar czf state/backups/ma-before-$revision.tar.gz -C state ma; fi; cp -R releases/$revision/garage_audio releases/$revision/config releases/$revision/scripts releases/$revision/profiles .; cp releases/$revision/compose.yaml releases/$revision/requirements.txt releases/$revision/requirements.lock .; printf '%s\n' '$revision' > state/revision; docker compose -p garage-audio up -d"

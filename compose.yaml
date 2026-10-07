@@ -1,0 +1,17 @@
+name: garage-audio
+services:
+  music-assistant:
+    image: ghcr.io/music-assistant/server:2.10.5@sha256:28023f8c0d96ca2496391f3218a6d70d7ef3ba84db846b3a3f3cd9ce7ef8aedc
+    restart: unless-stopped
+    user: "1000:1000"
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    volumes:
+      - ./state/ma:/data
+      - ./state/music:/music:ro
+    ports:
+      - 127.0.0.1:8095:8095
+      - 127.0.0.1:8097:8097
+      - 127.0.0.1:3483:3483/tcp
+    environment:
+      LOG_LEVEL: info

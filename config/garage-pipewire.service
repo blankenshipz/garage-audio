@@ -1,0 +1,10 @@
+[Unit]
+Description=Garage isolated 48k virtual sink (no hardware nodes)
+[Service]
+ExecStart=/usr/bin/pipewire -c %h/garage-audio/config/pipewire.conf
+Environment=PIPEWIRE_RUNTIME_DIR=%t/garage-audio
+ExecStartPre=/usr/bin/mkdir -p %t/garage-audio
+Restart=on-failure
+RestartSec=3
+[Install]
+WantedBy=default.target

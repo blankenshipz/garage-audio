@@ -1,0 +1,8 @@
+state/
+tools/
+venv/
+__pycache__/
+*.pyc
+*.raw
+*.wav
+secrets/

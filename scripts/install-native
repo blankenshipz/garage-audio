@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$HOME/garage-audio"
+for b in pipewire wireplumber pw-record squeezelite; do command -v "$b" >/dev/null; done
+test "$(loginctl show-user "$USER" -p Linger --value)" = yes
+id -nG | tr ' ' '\n' | grep -qx audio
+mkdir -p "$HOME/.config/systemd/user" state
+for f in config/garage-*.service; do
+  target="$HOME/.config/systemd/user/$(basename "$f")"
+  if test -e "$target"; then cp -p "$target" "state/$(basename "$f").pre-install"; fi
+  install -m 644 "$f" "$target"
+done
+systemctl --user daemon-reload
+systemctl --user enable garage-pipewire garage-wireplumber garage-dsp garage-player
+# Never start hardware automatically. Boot guards refuse missing identity.
+echo 'Definitions installed. Do not start DSP/player before attended hardware commissioning.'

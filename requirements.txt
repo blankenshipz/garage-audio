@@ -1,0 +1,4 @@
+PyYAML==6.0.3
+websocket-client==1.9.0
+music-assistant-client==1.6.0
+camilladsp @ https://github.com/HEnquist/pycamilladsp/archive/fdc0d163e02dd73206a493402b43c83502ad83d7.tar.gz

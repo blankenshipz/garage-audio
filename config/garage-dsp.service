@@ -1,0 +1,14 @@
+[Unit]
+Description=Garage DSP fail-closed, always starts muted
+Requires=garage-wireplumber.service
+After=garage-wireplumber.service
+[Service]
+WorkingDirectory=%h/garage-audio
+Environment=PIPEWIRE_RUNTIME_DIR=%t/garage-audio
+Environment=PIPEWIRE_REMOTE=garage-pipewire
+ExecStart=%h/garage-audio/scripts/run-dsp
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+[Install]
+WantedBy=default.target

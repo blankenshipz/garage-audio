@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$HOME/garage-audio"
+test -f state/alsa-device || { echo 'UMC stable identity not commissioned; refusing hardware'; exit 1; }
+venv/bin/python - <<'PY'
+from garage_audio.profile import load, hardware_config
+import yaml
+from pathlib import Path
+p = Path('state/active-profile.json')
+profile = load(p if p.exists() else 'profiles/uncalibrated.json')
+alsa = Path('state/alsa-device').read_text().strip()
+card = alsa.split('CARD=')[1].split(',')[0]
+cards = Path('/proc/asound/cards').read_text()
+if f'[{card}' not in cards and f'[{card:15}' not in cards:
+    raise SystemExit('Configured UMC absent; no fallback')
+if 'UMC' not in cards.upper(): raise SystemExit('UMC hardware absent')
+Path('state/runtime.yaml').write_text(yaml.safe_dump(hardware_config(profile, alsa)))
+PY
+export LD_LIBRARY_PATH="$PWD/tools/libs/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+tools/camilladsp -c state/runtime.yaml
+# PW monitor supplies F32 stereo; ALSA DAC clock is master. AsyncSinc adapts
+# virtual graph clock via measured ALSA queue fill. No PW hardware output exists.
+pw-record --target garage_music --properties='{ stream.capture.sink = true node.dont-fallback = true }' --rate 48000 --channels 2 --format f32 - |
+  tools/camilladsp -a 127.0.0.1 -p 1234 --gain=-60 -m state/runtime.yaml

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$HOME/garage-audio"
+# No volumes deleted. Stop audio first; never resume player on rollback.
+systemctl --user stop garage-player garage-dsp 2>/dev/null || true
+if test "${1:-}" = --remove; then
+  docker compose -p garage-audio down
+  systemctl --user disable garage-player garage-dsp garage-wireplumber garage-pipewire 2>/dev/null || true
+  systemctl --user stop garage-wireplumber garage-pipewire 2>/dev/null || true
+  echo 'Project stopped; state and host packages retained. Restore pre-install units manually if present.'
+  exit
+fi
+previous=$(cat state/previous-revision)
+test -d "releases/$previous"
+# Data migration compatibility is not guaranteed; restore matching state backup first.
+test "${1:-}" = --state-reviewed || { echo 'Back up MA state and review migration compatibility; then --state-reviewed'; exit 1; }
+cp -R "releases/$previous/garage_audio" "releases/$previous/config" "releases/$previous/scripts" "releases/$previous/profiles" .
+cp "releases/$previous/compose.yaml" "releases/$previous/requirements.txt" .
+printf '%s\n' "$previous" > state/revision
+docker compose -p garage-audio up -d
+echo 'MA restored; native DSP/player remain stopped and require muted restart.'

@@ -1,0 +1,10 @@
+{
+  "name": "uncalibrated",
+  "channels": {
+    "left": {"gain": 0, "mute": false, "delay_ms": 0, "invert": false, "peq": []},
+    "right": {"gain": 0, "mute": false, "delay_ms": 0, "invert": false, "peq": []},
+    "sub": {"gain": 0, "mute": false, "delay_ms": 0, "invert": false, "peq": []}
+  },
+  "sub_trim": 0,
+  "peq_bypass": false
+}

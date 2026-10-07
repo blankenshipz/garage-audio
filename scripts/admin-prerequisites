@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# USER-EXECUTED ONLY. Does not start audio or configure/reboot/network/SSH.
+set -euo pipefail
+test "$(id -u)" -eq 0 || { echo 'Run using sudo; interactive approval required.'; exit 1; }
+apt-get update
+apt-get install --no-install-recommends \
+  pipewire=1.6.2-1ubuntu1.2 pipewire-bin=1.6.2-1ubuntu1.2 pipewire-alsa=1.6.2-1ubuntu1.2 \
+  wireplumber=0.5.13-1ubuntu1 libasound2t64=1.2.15.3-1ubuntu1.1 \
+  squeezelite=2.0.0-1541+git20250609.72e1fd8-1build1 python3-venv=3.14.3-0ubuntu2
+usermod -aG audio zach
+loginctl enable-linger zach
+echo 'Log out/in to refresh group access. No audio services started.'
+echo 'Then run ~/garage-audio/scripts/install-native as zach; hardware identity/acceptance still required.'
