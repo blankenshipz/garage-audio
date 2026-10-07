@@ -80,6 +80,8 @@ Readback contains requested volume, mute, native ceiling, effective filters and 
 
 ## Operations / recovery
 
+Emergency producer stop confirms identity-bound exit **before** disk persistence or manager calls. Disk latch failure is separately reported. An existing producer registration now remains a startup-blocking tombstone even after exit, so every subsequent producer start needs explicit muted/-60 `--rearm`; no failed latch write can silently permit restart. Supervisor errors also kill/reap before acquiring a persistence lock or writing state.
+
 ```sh
 docker compose -p garage-audio ps
 docker compose -p garage-audio logs --tail=50 music-assistant

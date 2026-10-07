@@ -16,6 +16,7 @@ import stat
 import subprocess
 import time
 import uuid
+import warnings
 from contextlib import contextmanager
 from .control import ROOT, atomic
 from .ipc import request
@@ -56,19 +57,26 @@ def terminate(record):
 def stop(state, manager=('systemctl','--user','stop','garage-player','garage-dsp'), timeout=2):
     # Independent stop FIRST: never wait on a broken user manager for silence.
     with locked(state):
-        atomic(state/'producer-stop.json',{'stopped_at':time.time(),'reason':'mute could not be proved'})
         path=state/'producer.json'
         if path.exists():
             info=path.lstat()
             if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid():raise PermissionError('untrusted producer record')
             result=terminate(json.loads(path.read_text()))
         else:result='no_registered_producer_under_start_lock'
+        # Nothing durable may precede the identity-bound emergency kill/exit
+        # proof. Keep the existing registration as a startup tombstone even
+        # when a new latch cannot be persisted (ENOSPC, EIO, permissions, fsync).
+        latch_error=None
+        try:atomic(state/'producer-stop.json',{'stopped_at':time.time(),'reason':'mute could not be proved'})
+        except OSError as error:
+            latch_error=type(error).__name__
+            warnings.warn('Producer exit verified; durable stop latch failed: '+latch_error)
     try:
         reply=subprocess.run(manager,check=False,timeout=timeout,capture_output=True)
         manager_status=f'exit{reply.returncode}'
     except subprocess.TimeoutExpired:manager_status='timeout'
     except OSError:manager_status='unavailable'
-    return {'producer':result,'manager':manager_status,'restart_latched':True}
+    return {'producer':result,'manager':manager_status,'restart_latched':latch_error is None,'latch_error':latch_error}
 
 def register(state,command,output):
     """Launch exactly one project PCM child; caller retains and reaps it."""
@@ -76,10 +84,9 @@ def register(state,command,output):
         if (state/'producer-stop.json').exists():raise RuntimeError('producer fail-close latch: explicit muted rearm required')
         path=state/'producer.json'
         if path.exists():
-            old=json.loads(path.read_text())
-            try:identity(old['pid'],old['marker'])
-            except (FileNotFoundError,ProcessLookupError):pass
-            else:raise RuntimeError('a producer is already registered; refusing replacement')
+            # Never auto-reuse an exited registration. It is the fail-close
+            # tombstone when disk failure prevents creation of a stop latch.
+            raise RuntimeError('producer registration exists: explicit muted rearm required')
         marker=uuid.uuid4().hex
         parent=os.getpid()
         def parent_death():
@@ -110,7 +117,12 @@ def supervise(state,command,output,initialize=lambda:request({'cmd':'initialize'
         child.wait(timeout=3)
         if child.returncode:raise RuntimeError('project PCM child failed')
     except BaseException:
-        with locked(state):atomic(state/'producer-stop.json',{'stopped_at':time.time(),'reason':'producer lifecycle/control loss'})
+        # Owned child exit FIRST, including before lock acquisition or fsync.
+        if child.poll() is None:child.kill()
+        child.wait(timeout=3)
+        try:
+            with locked(state):atomic(state/'producer-stop.json',{'stopped_at':time.time(),'reason':'producer lifecycle/control loss'})
+        except OSError as error:warnings.warn('Producer reaped; durable stop latch failed: '+type(error).__name__)
         raise
     finally:
         # Owned subprocess object remains bound to our child; wait verifies exit.
@@ -125,7 +137,15 @@ def main():
     if args.rearm:
         status=request({'cmd':'status'},timeout=2)
         if not status['muted'] or status['volume_db']!=-60:raise RuntimeError('rearm requires proved muted/-60 policy DSP')
-        with locked(state):(state/'producer-stop.json').unlink(missing_ok=True)
+        with locked(state):
+            path=state/'producer.json'
+            if path.exists():
+                record=json.loads(path.read_text())
+                try:identity(record['pid'],record['marker'])
+                except (FileNotFoundError,ProcessLookupError):pass
+                else:raise RuntimeError('cannot rearm while registered producer is alive')
+                path.unlink()
+            (state/'producer-stop.json').unlink(missing_ok=True)
         print('Producer rearmed while DSP muted/-60; start remains a fresh muted initialization.');return
     fifo=Path('/run/garage-audio/capture.fifo')
     import pwd
