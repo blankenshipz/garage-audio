@@ -11,7 +11,7 @@ ExecStartPre=%h/garage-audio/venv/bin/python -m garage_audio.control status
 ExecStartPre=%h/garage-audio/venv/bin/python -m garage_audio.control mute
 ExecStartPre=%h/garage-audio/venv/bin/python -m garage_audio.control volume -60
 WorkingDirectory=%h/garage-audio
-ExecStart=/usr/bin/squeezelite -n "Garage Speakers" -m 02:00:00:00:21:01 -s 127.0.0.1:3483 -o garage_music -r 48000 -a 80:4:32:1
+ExecStart=/usr/bin/squeezelite -n "Garage Speakers" -m 02:00:00:00:21:01 -s 127.0.0.1:3483 -o garage_music -r 48000-48000 -a 80:4:32:1
 Restart=on-failure
 RestartSec=5
 [Install]

@@ -2,12 +2,14 @@
 set -euo pipefail
 cd "$HOME/garage-audio"
 for b in pipewire wireplumber pw-record squeezelite; do command -v "$b" >/dev/null; done
+scripts/check-native-versions
 test "$(loginctl show-user "$USER" -p Linger --value)" = yes
-id -nG | tr ' ' '\n' | grep -qx audio
+id -nG | tr ' ' '\n' | grep -qx garage-stream
+test -f /etc/systemd/system/garage-audio-dsp.service
 mkdir -p "$HOME/.config/systemd/user" state
 for f in config/garage-*.service; do
   target="$HOME/.config/systemd/user/$(basename "$f")"
-  if test -e "$target"; then cp -p "$target" "state/$(basename "$f").pre-install"; fi
+  if test -e "$target" && test ! -e "state/$(basename "$f").pre-install"; then cp -p "$target" "state/$(basename "$f").pre-install"; fi
   install -m 644 "$f" "$target"
 done
 systemctl --user daemon-reload

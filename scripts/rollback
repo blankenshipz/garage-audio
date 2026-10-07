@@ -7,6 +7,9 @@ if test "${1:-}" = --remove; then
   docker compose -p garage-audio down
   systemctl --user disable garage-player garage-dsp garage-wireplumber garage-pipewire 2>/dev/null || true
   systemctl --user stop garage-wireplumber garage-pipewire 2>/dev/null || true
+  if systemctl is-active --quiet garage-audio-dsp; then
+    echo 'Dedicated system DAC daemon remains outside user permissions; administrator must separately review/run scripts/admin-dac-rollback.'
+  fi
   echo 'Project stopped; state and host packages retained. Restore pre-install units manually if present.'
   exit
 fi
@@ -15,7 +18,7 @@ test -d "releases/$previous"
 # Data migration compatibility is not guaranteed; restore matching state backup first.
 test "${1:-}" = --state-reviewed || { echo 'Back up MA state and review migration compatibility; then --state-reviewed'; exit 1; }
 cp -R "releases/$previous/garage_audio" "releases/$previous/config" "releases/$previous/scripts" "releases/$previous/profiles" .
-cp "releases/$previous/compose.yaml" "releases/$previous/requirements.txt" .
+cp "releases/$previous/compose.yaml" "releases/$previous/requirements.txt" "releases/$previous/requirements.lock" .
 printf '%s\n' "$previous" > state/revision
 docker compose -p garage-audio up -d
 echo 'MA restored; native DSP/player remain stopped and require muted restart.'

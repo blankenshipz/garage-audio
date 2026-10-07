@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fail closed on unverified native backend/version drift; never opens devices.
+set -euo pipefail
+pw=$(pipewire --version)
+grep -q 'Compiled with libpipewire 1.6.2' <<< "$pw"
+grep -q 'Linked with libpipewire 1.6.2' <<< "$pw"
+wp=$(wireplumber --version)
+grep -q 'Compiled with libwireplumber 0.5.13' <<< "$wp"
+grep -q 'Linked with libwireplumber 0.5.13' <<< "$wp"
+squeeze=$(squeezelite -? 2>&1)
+grep -q '^Squeezelite 2.0.0-1541,' <<< "$squeeze"

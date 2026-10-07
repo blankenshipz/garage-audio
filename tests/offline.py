@@ -11,11 +11,13 @@ import time
 import threading
 import faulthandler
 import unittest
+from types import SimpleNamespace
 import yaml
 from camilladsp import CamillaClient
 from garage_audio.profile import DEFAULT, compile_profile, validate, hardware_config
-from garage_audio.control import apply_graph
+from garage_audio.control import apply_graph, edit_profile, readback, commissioning_window
 from garage_audio.rew import parse
+from garage_audio.hardware import validate_identity
 
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / 'tools/camilladsp'
@@ -82,6 +84,31 @@ class DSPTests(unittest.TestCase):
             p=copy.deepcopy(DEFAULT);p['sub_trim']=x
             with self.assertRaises(ValueError):validate(p)
         with self.assertRaises(ValueError):hardware_config(DEFAULT,'default')
+        # ALSA card IDs need not contain the marketing name UMC. Binding is
+        # enforced by USB ancestry/owner metadata, not a guessed card spelling.
+        self.assertEqual(hardware_config(DEFAULT,'hw:CARD=U1820,DEV=0')['devices']['playback']['device'],'hw:CARD=U1820,DEV=0')
+        identity={'model':'UMC1820','vendor':'1234','product':'5678','serial':'SYNTHETIC_ONLY','alsa_card':'U1820','pcm':0}
+        self.assertEqual(validate_identity(identity),identity)
+        for key,value in [('model','internal'),('vendor','*'),('serial',''),('alsa_card','default:0'),('pcm',True)]:
+            invalid=dict(identity);invalid[key]=value
+            with self.assertRaises(ValueError):validate_identity(invalid)
+    def test_crossover_peq_edits(self):
+        p=edit_profile(DEFAULT,SimpleNamespace(cmd='crossover',hz=100))
+        p=edit_profile(p,SimpleNamespace(cmd='peq',channel='left',index=0,freq=1000,q=2,gain=-6))
+        a=run(p,hz=100)
+        reference=.1/math.sqrt(2)*10**(-26/20)
+        self.assertAlmostEqual(rms(a[3][48000:])/reference,.5,places=4)
+        self.assertAlmostEqual(rms(a[4][48000:])/reference,.5,places=4)
+        p=edit_profile(p,SimpleNamespace(cmd='peq',channel='left',index=0,freq=900,q=1,gain=-3))
+        self.assertEqual(p['channels']['left']['peq'][0]['freq'],900)
+        p=edit_profile(p,SimpleNamespace(cmd='peq-delete',channel='left',index=0))
+        self.assertEqual(p['channels']['left']['peq'],[])
+        p=edit_profile(p,SimpleNamespace(cmd='peq',channel='sub',index=0,freq=40,q=1,gain=-3))
+        self.assertEqual(edit_profile(p,SimpleNamespace(cmd='peq-clear',channel='sub'))['channels']['sub']['peq'],[])
+        for edit in [SimpleNamespace(cmd='crossover',hz=10),SimpleNamespace(cmd='peq',channel='left',index=2,freq=1000,q=2,gain=-6),
+                     SimpleNamespace(cmd='peq',channel='left',index=0,freq=1000,q=0,gain=-6),
+                     SimpleNamespace(cmd='peq',channel='left',index=0,freq=1000,q=2,gain=6)]:
+            with self.assertRaises(ValueError):edit_profile(DEFAULT,edit)
     def test_native_effective_ceiling(self):
         capped=run(gain=0);safe=run(gain=-20)
         for i in [2,3,4]: self.assertAlmostEqual(rms(capped[i][48000:])/rms(safe[i][48000:]),1,places=5)
@@ -96,7 +123,7 @@ class DSPTests(unittest.TestCase):
             config=compile_profile(DEFAULT,{'type':'Stdin','channels':2,'format':'F32_LE'},
                                    {'type':'File','channels':20,'format':'F32_LE','filename':'/dev/null'})
             path=Path(directory)/'null.yaml';path.write_text(yaml.safe_dump(config))
-            for _ in range(2):
+            for cycle in range(2):
                 proc=subprocess.Popen([str(BIN),'-a','127.0.0.1','-p','1235','--gain=-60','-m',str(path)],env=ENV,stdin=subprocess.PIPE,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
                 stop=threading.Event()
                 def feed():
@@ -135,18 +162,62 @@ class DSPTests(unittest.TestCase):
                     self.assertEqual(c.config.active()['filters'],valid['filters'])
                     state=Path(directory)
                     p=copy.deepcopy(DEFAULT);p['channels']['left']['gain']=-3
+                    p=edit_profile(p,SimpleNamespace(cmd='crossover',hz=100))
+                    p=edit_profile(p,SimpleNamespace(cmd='peq',channel='sub',index=0,freq=40,q=2,gain=-3))
                     candidate=compile_profile(p,config['devices']['capture'],config['devices']['playback'])
+                    c.volume.set_main_volume(-35)
                     apply_graph(c,p,state,candidate)
                     self.assertEqual(json.loads((state/'active-profile.json').read_text()),p)
                     self.assertEqual(c.config.active()['filters']['left_gain']['parameters']['gain'],-3)
-                    self.assertTrue(c.volume.main_mute());self.assertEqual(c.volume.main_volume(),-60)
+                    self.assertTrue(c.volume.main_mute());self.assertEqual(c.volume.main_volume(),-35)
+                    rb=readback(c)
+                    self.assertEqual(rb['crossover']['hp']['parameters']['freq'],100)
+                    self.assertEqual(rb['channel_filters']['sub_peq_0']['parameters']['gain'],-3)
+                    # Existing authorized unmute restored ONLY on successful
+                    # isolated FILE/null apply, never on failure or restart.
+                    c.volume.set_main_volume(-40);c.volume.set_main_mute(False)
                     # Successful second transaction creates known-good receipt.
-                    apply_graph(c,DEFAULT,state,config)
+                    apply_graph(c,DEFAULT,state,config,authorized_unmuted=True)
+                    self.assertFalse(c.volume.main_mute());self.assertEqual(c.volume.main_volume(),-40)
                     self.assertEqual(json.loads((state/'known-good-profile.json').read_text()),p)
-                    with self.assertRaises(Exception):apply_graph(c,p,state,broken)
+                    with self.assertRaises(Exception):apply_graph(c,p,state,broken,authorized_unmuted=True)
                     self.assertTrue(c.volume.main_mute());self.assertEqual(c.volume.main_volume(),-60)
                     time.sleep(.2)
                     self.assertEqual(c.config.active()['filters'],valid['filters'])
+                    c.volume.set_main_volume(-45);c.volume.set_main_mute(False)
+                    with self.assertRaises(ValueError):apply_graph(c,p,state,candidate)
+                    self.assertTrue(c.volume.main_mute());self.assertEqual(c.volume.main_volume(),-60)
+                    self.assertEqual(json.loads((state/'active-profile.json').read_text()),DEFAULT)
+                    if cycle == 0:
+                        cli_state=state/'cli';cli_state.mkdir()
+                        (cli_state/'active-profile.json').write_text(json.dumps(DEFAULT))
+                        test_cli=cli+['--isolated-file-test-state',str(cli_state)]
+                        c.volume.set_main_volume(-33)
+                        for command in [['crossover','120'],['peq','left','0','1000','2','-6'],['peq-delete','left','0'],['peq','sub','0','40','1','-3'],['peq-clear','sub']]:
+                            edited=subprocess.run(test_cli+command,cwd=ROOT,env=ENV,capture_output=True,text=True,timeout=10)
+                            self.assertEqual(edited.returncode,0,edited.stderr)
+                            effective=json.loads(edited.stdout)
+                            self.assertTrue(effective['muted']);self.assertEqual(effective['volume_db'],-33)
+                            self.assertEqual(effective['crossover']['hp']['parameters']['freq'],120)
+                            if command[0]=='peq':
+                                self.assertEqual(effective['channel_filters'][command[1]+'_peq_0']['parameters']['freq'],float(command[3]))
+                            elif command[0] in ('peq-delete','peq-clear'):
+                                self.assertNotIn(command[1]+'_peq_0',effective['channel_filters'])
+                        invalid=subprocess.run(test_cli+['crossover','10'],cwd=ROOT,env=ENV,capture_output=True,text=True,timeout=10)
+                        self.assertNotEqual(invalid.returncode,0)
+                        self.assertTrue(c.volume.main_mute());self.assertEqual(c.volume.main_volume(),-60)
+                        # Restore the original FILE graph before timer tests.
+                        apply_graph(c,DEFAULT,state,config)
+                        factory=lambda profile:compile_profile(profile,config['devices']['capture'],config['devices']['playback'])
+                        commissioning_window(c,DEFAULT,state,factory,'left',1,1235)
+                        self.assertTrue(c.volume.main_mute());self.assertEqual(c.volume.main_volume(),-60)
+                        self.assertEqual(c.config.active()['filters'],valid['filters'])
+                        # Detached guardian still mutes a FILE/null process
+                        # when no coordinating parent completion is provided.
+                        guardian=subprocess.Popen([str(ROOT/'venv/bin/python'),'-m','garage_audio.watchdog','--port','1235','--seconds','1'],cwd=ROOT,stdout=subprocess.PIPE,text=True)
+                        self.assertEqual(guardian.stdout.readline().strip(),'armed');guardian.stdout.close()
+                        c.volume.set_main_mute(False);guardian.wait(timeout=5)
+                        self.assertTrue(c.volume.main_mute());self.assertEqual(c.volume.main_volume(),-60)
                     c.disconnect()
                 finally:
                     stop.set();feeder.join(timeout=1);proc.stdin.close();proc.terminate()

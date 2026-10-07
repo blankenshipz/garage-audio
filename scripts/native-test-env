@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Source only for isolated user-local binaries, never hardware/default devices.
+NATIVE_ROOT="$HOME/garage-audio/tools/native/root"
+export LD_LIBRARY_PATH="$NATIVE_ROOT/usr/lib/x86_64-linux-gnu:$HOME/garage-audio/tools/libs/usr/lib/x86_64-linux-gnu"
+export SPA_PLUGIN_DIR="$NATIVE_ROOT/usr/lib/x86_64-linux-gnu/spa-0.2"
+export PIPEWIRE_MODULE_DIR="$NATIVE_ROOT/usr/lib/x86_64-linux-gnu/pipewire-0.3"
+export PIPEWIRE_CONFIG_DIR="$NATIVE_ROOT/usr/share/pipewire"
+export WIREPLUMBER_MODULE_DIR="$NATIVE_ROOT/usr/lib/x86_64-linux-gnu/wireplumber-0.5"
+export WIREPLUMBER_DATA_DIR="$NATIVE_ROOT/usr/share/wireplumber"
+export WIREPLUMBER_CONFIG_DIR="$HOME/garage-audio/config:$NATIVE_ROOT/usr/share/wireplumber"
+export ALSA_PLUGIN_DIR="$NATIVE_ROOT/usr/lib/x86_64-linux-gnu/alsa-lib"
+export ALSA_CONFIG_PATH="$HOME/garage-audio/config/asound.conf"
+export PIPEWIRE_RUNTIME_DIR="$HOME/garage-audio/state/native-runtime"
+export PIPEWIRE_REMOTE=garage-pipewire
+export XDG_STATE_HOME="$HOME/garage-audio/state/native-policy"
+export XDG_CACHE_HOME="$HOME/garage-audio/state/native-cache"
+export PATH="$NATIVE_ROOT/usr/bin:$PATH"
+mkdir -p "$PIPEWIRE_RUNTIME_DIR"
+chmod 700 "$PIPEWIRE_RUNTIME_DIR"

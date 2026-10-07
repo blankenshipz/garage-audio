@@ -1,0 +1,27 @@
+[Unit]
+Description=Garage DAC owner (separate non-login identity, muted wait on startup)
+After=network.target
+[Service]
+User=garage-dsp
+Group=garage-stream
+RuntimeDirectory=garage-audio
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/libexec/garage-audio/dsp-daemon
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=5
+KillMode=control-group
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+DevicePolicy=closed
+DeviceAllow=char-alsa rw
+ReadWritePaths=/run/garage-audio
+[Install]
+WantedBy=multi-user.target

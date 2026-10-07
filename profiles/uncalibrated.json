@@ -6,5 +6,6 @@
     "sub": {"gain": 0, "mute": false, "delay_ms": 0, "invert": false, "peq": []}
   },
   "sub_trim": 0,
-  "peq_bypass": false
+  "peq_bypass": false,
+  "crossover_hz": 80
 }

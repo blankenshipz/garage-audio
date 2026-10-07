@@ -2,21 +2,27 @@
 import copy
 import json
 import math
+import re
 
 DEFAULT = {'name': 'uncalibrated', 'channels': {
     c: {'gain': 0.0, 'mute': False, 'delay_ms': 0.0, 'invert': False, 'peq': []}
-    for c in ('left', 'right', 'sub')}, 'sub_trim': 0.0, 'peq_bypass': False}
+    for c in ('left', 'right', 'sub')}, 'sub_trim': 0.0, 'peq_bypass': False, 'crossover_hz': 80.0}
 
 def number(x, lo, hi):
     if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or not lo <= x <= hi:
         raise ValueError(f'expected finite number in [{lo}, {hi}]')
 
 def validate(p):
+    # Version-one files compiled an invariant 80 Hz crossover. Upgrade only
+    # that known schema, never arbitrary missing/extra fields.
+    if set(p) == set(DEFAULT) - {'crossover_hz'}:
+        p = copy.deepcopy(p); p['crossover_hz'] = 80.0
     if set(p) != set(DEFAULT) or not isinstance(p['name'], str) or len(p['name']) > 80:
         raise ValueError('invalid profile fields')
     if set(p['channels']) != {'left', 'right', 'sub'}:
         raise ValueError('exactly left/right/sub required')
     number(p['sub_trim'], -30, 0)
+    number(p['crossover_hz'], 40, 160)
     if type(p['peq_bypass']) is not bool:
         raise ValueError('invalid bypass')
     for c in p['channels'].values():
@@ -49,8 +55,8 @@ def compile_profile(p, capture, playback, hardware=False):
                        resampler={'type': 'AsyncSinc', 'profile': 'Balanced'},
                        target_level=2048, adjust_period=5)
     filters = {'headroom': {'type': 'Gain', 'parameters': {'gain': -6.0}},
-               'hp': {'type': 'BiquadCombo', 'parameters': {'type': 'LinkwitzRileyHighpass', 'freq': 80, 'order': 4}},
-               'lp': {'type': 'BiquadCombo', 'parameters': {'type': 'LinkwitzRileyLowpass', 'freq': 80, 'order': 4}}}
+               'hp': {'type': 'BiquadCombo', 'parameters': {'type': 'LinkwitzRileyHighpass', 'freq': p['crossover_hz'], 'order': 4}},
+               'lp': {'type': 'BiquadCombo', 'parameters': {'type': 'LinkwitzRileyLowpass', 'freq': p['crossover_hz'], 'order': 4}}}
     pipeline = [{'type': 'Filter', 'channels': [0, 1], 'names': ['headroom']},
                 {'type': 'Mixer', 'name': 'route'}]
     for label, index in [('left', 2), ('right', 3), ('sub', 4)]:
@@ -77,7 +83,7 @@ def compile_profile(p, capture, playback, hardware=False):
             'pipeline': pipeline}
 
 def hardware_config(p, alsa):
-    if not alsa.startswith('hw:CARD=') or ',DEV=' not in alsa or 'UMC' not in alsa.upper():
-        raise ValueError('explicit UMC hw:CARD identity required; no default/plughw')
+    if not re.fullmatch(r'hw:CARD=[A-Za-z0-9_]+,DEV=[0-9]+',alsa):
+        raise ValueError('explicit bound hw:CARD/DEV identity required; no default/plughw')
     return compile_profile(p, {'type': 'Stdin', 'channels': 2, 'format': 'F32_LE'},
                            {'type': 'Alsa', 'channels': 20, 'device': alsa, 'format': 'S32_LE'}, True)

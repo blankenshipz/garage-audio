@@ -14,7 +14,7 @@ The 80 Hz LR4 split is a safe starting template, not a conclusion about these sp
 ```sh
 venv/bin/python -m garage_audio.rew profiles/uncalibrated.json sub my-rew.txt profiles/measured-candidate.json
 venv/bin/python -m garage_audio.control profile profiles/measured-candidate.json
-# Remains muted/-60; independently inspect status and remeasure while attended.
+    # If previously muted, stays muted at prior bounded volume; failures reset-60.
 ```
 
 Importer and bounds were exercised with accepted cut-only PK, rejected boost, and rejected shelf text. Real REW exports/measurement files and actual mic behavior remain unverified. Keep raw `.mdat`, mic calibration provenance, positions, levels, old profile and new measurements privately. Never call a generated template a measured correction.

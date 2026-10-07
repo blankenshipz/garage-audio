@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# STAGED ONLY. Reverse only this project's reviewed root provisioning.
+set -euo pipefail
+test "$(id -u)" -eq 0
+systemctl stop garage-audio-dsp
+systemctl disable garage-audio-dsp
+for target in /etc/udev/rules.d/99-garage-audio-dac.rules /etc/systemd/system/garage-audio-dsp.service; do
+  backup="/etc/garage-audio/$(basename "$target").pre-install"
+  if test -f "$backup"; then cp -p "$backup" "$target"; else rm -f "$target"; fi
+done
+systemctl daemon-reload
+udevadm control --reload-rules
+echo 'Project DAC service stopped; original definitions restored. No device trigger/reboot.'
+echo 'Accounts/groups/packages/root-owned binary retained. Attended restore of device ownership/ACL may be needed; do not replug unattended.'
