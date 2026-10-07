@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -12,6 +13,14 @@ from .broker import Policy, serve
 from .control import atomic, connect_guarded, prove_mute
 from .hardware import bound_device, validate_identity
 from .profile import hardware_config
+
+def create_capture_fifo(path, uid, gid):
+    """Creation mode is umask-masked; explicitly set and verify final boundary."""
+    os.mkfifo(path,0o620)
+    os.chmod(path,0o620,follow_symlinks=False)
+    info=path.lstat()
+    if not stat.S_ISFIFO(info.st_mode) or stat.S_IMODE(info.st_mode)!=0o620 or (info.st_uid,info.st_gid)!=(uid,gid):
+        raise PermissionError('capture FIFO ownership/mode is not the required0620 boundary')
 
 def run():
     root=Path('/usr/local/libexec/garage-audio')
@@ -24,7 +33,7 @@ def run():
     (state/'alsa-device').write_text(f"hw:CARD={identity['alsa_card']},DEV={identity['pcm']}\n")
     fifo=runtime/'capture.fifo'
     if fifo.exists():fifo.unlink()
-    os.mkfifo(fifo,0o620)
+    create_capture_fifo(fifo,os.geteuid(),grp.getgrnam('garage-stream').gr_gid)
     process=subprocess.Popen([str(root/'camilladsp'),'-a','127.0.0.1','-p','1234',
                                '--wait','--no_config','--gain=-60','--mute'],stdin=subprocess.PIPE)
     def close(*_):

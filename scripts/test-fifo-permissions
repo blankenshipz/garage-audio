@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Nonprivileged distinct UID writer; no root service/device/network changes.
+set -euo pipefail
+cd "$HOME/garage-audio"
+directory=$(mktemp -d "$PWD/state/fifo-permissions.XXXXXX")
+chmod 750 "$directory"
+trap 'rm -rf "$directory"' EXIT
+TEST_DIRECTORY="$directory" venv/bin/python - <<'PY'
+import os,subprocess
+from pathlib import Path
+from garage_audio.daemon import create_capture_fifo
+path=Path(os.environ['TEST_DIRECTORY'])/'capture.fifo'
+old=os.umask(0o022)
+try:create_capture_fifo(path,os.getuid(),os.getgid())
+finally:os.umask(old)
+reader=os.open(path,os.O_RDONLY|os.O_NONBLOCK)
+try:
+ subprocess.run(['docker','run','--rm','--label','com.docker.compose.project=garage-audio',
+   '--network','none','--user','1001:1000','--cap-drop','ALL','--security-opt','no-new-privileges',
+   '--mount','type=bind,src='+str(path.parent)+',dst=/test',
+   '--entrypoint','/app/venv/bin/python',
+   'ghcr.io/music-assistant/server:2.10.5@sha256:28023f8c0d96ca2496391f3218a6d70d7ef3ba84db846b3a3f3cd9ce7ef8aedc',
+   '-c',"import os; assert os.getuid()==1001; fd=os.open('/test/capture.fifo',os.O_WRONLY|os.O_NONBLOCK); os.write(fd,b'group-write-proof'); os.close(fd)"],check=True)
+ assert os.read(reader,100)==b'group-write-proof'
+ print('PASS FIFO final0620 under umask0022; actual distinct UID1001/group1000 wrote to ownerUID1000/group1000 FIFO. Dedicated garage-dsp/garage-stream identities not provisioned/tested.')
+finally:os.close(reader)
+PY

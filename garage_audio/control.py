@@ -53,7 +53,8 @@ def connect_guarded(c, stop_producer):
         raise
 
 def stop_project_producer():
-    return subprocess.run(['systemctl','--user','stop','garage-player','garage-dsp'],check=False,timeout=10,capture_output=True)
+    from .producer import stop
+    return stop(ROOT/'state')
 
 def readback(c):
     config = c.config.active() or {}
@@ -271,8 +272,7 @@ def main():
             except Exception:
                 # A dead control connection cannot prove mute. Stop ONLY our
                 # player/DSP instead of carrying on with an unknown level.
-                subprocess.run(['systemctl','--user','stop','garage-player','garage-dsp'],
-                               check=False, timeout=10, capture_output=True)
+                stop_project_producer()
             with (state / 'audit.jsonl').open('a') as audit:
                 audit.write(json.dumps({'time': time.time(), 'command': args.cmd, 'failed': type(e).__name__, 'muted': muted})+'\n')
             raise

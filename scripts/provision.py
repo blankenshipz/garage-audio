@@ -16,7 +16,7 @@ import tarfile
 import tempfile
 
 CAM_SHA='55f5ec2ed80fcc79a543672f9f89ace4557d290d80584ef31ee0442111bd0b11'
-CODE={'garage_audio/'+name+'.py' for name in ['__init__','broker','control','daemon','hardware','ipc','profile']}
+CODE={'garage_audio/'+name+'.py' for name in ['__init__','broker','control','daemon','hardware','ipc','producer','profile']}
 ASSETS=CODE|{'scripts/dsp-daemon','scripts/policy-entry.py','scripts/admin-dac-rollback','config/system/garage-audio-dsp.service','camilla.tar.gz'}
 
 def digest(path):

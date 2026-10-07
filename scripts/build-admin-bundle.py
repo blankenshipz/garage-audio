@@ -6,7 +6,7 @@ from pathlib import Path
 import tarfile
 
 ROOT=Path(__file__).resolve().parents[1]
-code=['__init__','broker','control','daemon','hardware','ipc','profile']
+code=['__init__','broker','control','daemon','hardware','ipc','producer','profile']
 assets={f'garage_audio/{n}.py':ROOT/f'garage_audio/{n}.py' for n in code}
 assets.update({p:ROOT/p for p in ['scripts/dsp-daemon','scripts/policy-entry.py','scripts/admin-dac-rollback','config/system/garage-audio-dsp.service']})
 assets['camilla.tar.gz']=ROOT/'tools/camilla.tar.gz'
