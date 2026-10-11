@@ -13,6 +13,11 @@ processing observations are not physical-phone audibility/timeline acceptance.
 That phone-only cold Play → Pause/Resume → Stop acceptance remains pending and
 separately owned. This source review does not restart, redeploy or approve sound.
 
+The [review and architecture roadmap](docs/architecture-roadmap.md) compares hidden
+MA with a direct Spotify receiver, Docker-first services and chat-first app setup.
+This phase commits existing source and a plan only; migration, paid provider/model
+and budget remain undecided, and no paid calls are enabled.
+
 Everyday entry is [Spotify → Garage Speakers → Play](docs/spotify-only-quickstart.md),
 not the older MA manual listening-session button. The dashboard/MCP acoustic
 workspace remains distinct from receiver playback. Inference is still disabled.
