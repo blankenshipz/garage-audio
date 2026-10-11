@@ -1,0 +1,5 @@
+#!/bin/sh
+# SSH authenticates the caller. Never use a TTY or print the server token.
+set -eu
+host=${GARAGE_HOST:-zach@192.168.68.74}
+exec ssh -T -o BatchMode=yes "$host" docker exec -i garage-audio-dashboard python -m garage_audio.mcp_server

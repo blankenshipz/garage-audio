@@ -1,0 +1,11 @@
+{
+  "name": "basic-stereo-uncalibrated",
+  "channels": {
+    "left": {"gain": 0.0, "mute": false, "delay_ms": 0.0, "invert": false, "peq": []},
+    "right": {"gain": 0.0, "mute": false, "delay_ms": 0.0, "invert": false, "peq": []},
+    "sub": {"gain": 0.0, "mute": true, "delay_ms": 0.0, "invert": false, "peq": []}
+  },
+  "sub_trim": 0.0,
+  "peq_bypass": false,
+  "crossover_hz": 80.0
+}

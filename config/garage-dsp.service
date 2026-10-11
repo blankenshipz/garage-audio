@@ -7,7 +7,7 @@ WorkingDirectory=%h/garage-audio
 Environment=PIPEWIRE_RUNTIME_DIR=%t/garage-audio
 Environment=PIPEWIRE_REMOTE=garage-pipewire
 ExecStart=%h/garage-audio/scripts/run-dsp
-Restart=on-failure
+Restart=no
 RestartSec=5
 KillMode=control-group
 [Install]

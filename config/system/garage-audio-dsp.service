@@ -8,10 +8,11 @@ SupplementaryGroups=garage-control
 RuntimeDirectory=garage-audio
 RuntimeDirectoryMode=0750
 ExecStart=/usr/local/libexec/garage-audio/dsp-daemon
+Environment=LD_LIBRARY_PATH=/usr/local/libexec/garage-audio/libs/usr/lib/x86_64-linux-gnu
 PrivateNetwork=yes
 StateDirectory=garage-audio-dsp
 StateDirectoryMode=0700
-Restart=on-failure
+Restart=no
 RestartSec=5
 TimeoutStopSec=5
 KillMode=control-group

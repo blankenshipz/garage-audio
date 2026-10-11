@@ -1,0 +1,33 @@
+name: garage-audio-dashboard
+services:
+  dashboard:
+    image: ${DASHBOARD_IMAGE:?immutable dashboard image required}
+    container_name: garage-audio-dashboard
+    restart: unless-stopped
+    user: "1000:1000"
+    group_add: ["1003"] # verified garage-control GID; socket only, no DAC/audio group
+    init: true
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    pids_limit: 128
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=32m"]
+    ports: ["127.0.0.1:8098:8098", "192.168.68.74:8098:8098"]
+    extra_hosts: ["music-assistant:192.168.68.74"]
+    environment:
+      GARAGE_APP_BIND: 0.0.0.0
+      GARAGE_APP_STATE: /state
+      GARAGE_APP_TOKEN_FILE: /auth/dashboard-token
+      GARAGE_APP_URL: http://127.0.0.1:8098
+      GARAGE_APP_AUTHORITIES: 127.0.0.1:8098,localhost:8098,192.168.68.74:8098
+      GARAGE_TRUSTED_LAN_AUTHORITY: 192.168.68.74:8098 # explicit user-authorized ordinary access; NOT listening approval
+      MA_URL: http://music-assistant:8095
+    volumes:
+      - /home/zach/garage-audio/state/dashboard/data:/state
+      - /home/zach/garage-audio/state/dashboard/auth:/auth:ro
+      - /run/garage-speakers/web:/run/garage-speakers/web:ro
+    networks: [music]
+networks:
+  music:
+    external: true
+    name: garage-audio_default

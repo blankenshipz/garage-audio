@@ -8,6 +8,7 @@ Environment=PIPEWIRE_REMOTE=garage-pipewire
 Environment=XDG_STATE_HOME=%h/garage-audio/state/native-policy
 Environment=XDG_CACHE_HOME=%h/garage-audio/state/native-cache
 Environment=WIREPLUMBER_CONFIG_DIR=%h/garage-audio/config:/usr/share/wireplumber
+ExecStartPre=/usr/bin/python3 %h/garage-audio/scripts/wait-pipewire.py
 ExecStart=/usr/bin/wireplumber
 Restart=on-failure
 RestartSec=3

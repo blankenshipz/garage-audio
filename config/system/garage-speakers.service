@@ -1,0 +1,26 @@
+[Unit]
+Description=Garage phone speaker control (no sound on startup)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/libexec/garage-audio/venv/bin/python -I /usr/local/libexec/garage-audio/speaker-entry.py serve
+Restart=no
+UMask=0077
+RuntimeDirectory=garage-speakers
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+StateDirectory=garage-speakers
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+AmbientCapabilities=CAP_SETUID
+RestrictAddressFamilies=AF_UNIX AF_INET
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

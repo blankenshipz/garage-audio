@@ -21,7 +21,7 @@ def main():
         if not muted:raise RuntimeError('mute not effective')
     except Exception:
         # Stop ONLY our stream producer/player; dedicated daemon receives EOF.
-        subprocess.run(['systemctl','--user','stop','garage-player','garage-dsp'],check=False,capture_output=True,timeout=5)
+        subprocess.run(['systemctl','--user','stop','garage-dsp'],check=False,capture_output=True,timeout=5)
         muted='unknown';stopped=True
     finally:c.disconnect()
     with (ROOT/'state/audit.jsonl').open('a') as f:

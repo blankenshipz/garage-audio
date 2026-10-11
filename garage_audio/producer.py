@@ -54,7 +54,7 @@ def terminate(record):
         return 'exit_verified'
     finally:os.close(fd)
 
-def stop(state, manager=('systemctl','--user','stop','garage-player','garage-dsp'), timeout=2):
+def stop(state, manager=('systemctl','--user','stop','garage-dsp'), timeout=2):
     # Independent stop FIRST: never wait on a broken user manager for silence.
     with locked(state):
         path=state/'producer.json'

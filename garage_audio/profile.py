@@ -3,6 +3,7 @@ import copy
 import json
 import math
 import re
+from .hardware import FORMATS, validate_capabilities
 
 DEFAULT = {'name': 'uncalibrated', 'channels': {
     c: {'gain': 0.0, 'mute': False, 'delay_ms': 0.0, 'invert': False, 'peq': []}
@@ -82,8 +83,15 @@ def compile_profile(p, capture, playback, hardware=False):
             'mixers': {'route': {'channels': {'in': 2, 'out': playback['channels']}, 'mapping': mapping}},
             'pipeline': pipeline}
 
-def hardware_config(p, alsa):
+def hardware_config(p, alsa, capabilities=None):
     if not re.fullmatch(r'hw:CARD=[A-Za-z0-9_]+,DEV=[0-9]+',alsa):
         raise ValueError('explicit bound hw:CARD/DEV identity required; no default/plughw')
+    channels, sample_format = 20, 'S32_LE'
+    if capabilities is not None:
+        validate_capabilities(capabilities)
+        identity=capabilities['identity']
+        if alsa!=f"hw:CARD={identity['alsa_card']},DEV={identity['pcm']}":
+            raise ValueError('compiled ALSA binding differs from capability identity')
+        channels, sample_format = capabilities['channels'], FORMATS[capabilities['format']]
     return compile_profile(p, {'type': 'Stdin', 'channels': 2, 'format': 'F32_LE'},
-                           {'type': 'Alsa', 'channels': 20, 'device': alsa, 'format': 'S32_LE'}, True)
+                           {'type': 'Alsa', 'channels': channels, 'device': alsa, 'format': sample_format}, True)

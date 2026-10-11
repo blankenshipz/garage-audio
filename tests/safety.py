@@ -97,7 +97,7 @@ class RealDSP(unittest.TestCase):
     def test_concurrent_initialize_cannot_be_followed_by_old_unmute(self):
         policy=Policy(self.state,lambda:CamillaClient('127.0.0.1',1235),self.factory,self.proc)
         epoch=policy.execute({'cmd':'status'})['generation']
-        self.c.volume.set_main_volume(-40);self.c.volume.set_main_mute(False)
+        self.c.volume.set_main_volume(-60);self.c.volume.set_main_mute(True)
         writing=threading.Event();release=threading.Event();errors=[]
         def delayed(path,value):
             if value['active']!=DEFAULT:writing.set();release.wait(timeout=3)
@@ -106,18 +106,18 @@ class RealDSP(unittest.TestCase):
             try:policy.execute(payload)
             except Exception as error:errors.append(error)
         with patch('garage_audio.control.atomic',side_effect=delayed):
-            profile=threading.Thread(target=invoke,args=({'cmd':'profile','profile':self.candidate(),'generation':epoch,'attended_profile':'PRESENT-GAINS-LOW'},))
+            profile=threading.Thread(target=invoke,args=({'cmd':'profile','profile':self.candidate(),'generation':epoch},))
             profile.start();self.assertTrue(writing.wait(timeout=3))
             lifecycle=threading.Thread(target=invoke,args=({'cmd':'initialize','generation':epoch},));lifecycle.start()
             release.set();profile.join(timeout=4);lifecycle.join(timeout=4)
         self.assertFalse(errors);self.assertFalse(profile.is_alive());self.assertFalse(lifecycle.is_alive())
         self.assertTrue(self.c.volume.main_mute());self.assertEqual(self.c.volume.main_volume(),-60)
         self.assertNotEqual(policy.generation(),epoch)
-    def test_commission_deadline_ends_owned_generation_not_a_mute_guess(self):
+    def test_legacy_commission_string_cannot_grant_sound(self):
         policy=Policy(self.state,lambda:CamillaClient('127.0.0.1',1235),self.factory,self.proc)
         epoch=policy.execute({'cmd':'status'})['generation']
-        result=policy.execute({'cmd':'commission-window','channel':'left','seconds':1,'attended':'PRESENT-GAINS-LOW','generation':epoch})
-        self.assertEqual(result['state'],'DSP_STOPPED');self.assertIsNotNone(self.proc.poll())
+        with self.assertRaises(ValueError):policy.execute({'cmd':'commission-window','channel':'left','seconds':1,'attended':'PRESENT-GAINS-LOW','generation':epoch})
+        self.assertTrue(self.c.volume.main_mute());self.assertIsNone(self.proc.poll())
         self.assertEqual(store(self.state)['active'],DEFAULT)
     def test_unreachable_official_client_stops_only_owned_producer(self):
         stopped=Mock()

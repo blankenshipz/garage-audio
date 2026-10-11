@@ -1,0 +1,9 @@
+{
+  "type": "plugin",
+  "domain": "garage_speaker_control",
+  "name": "Garage Speakers control",
+  "description": "Approve a bounded listening session, then use normal MA Play, volume, Pause and Stop. Optional first check is separate.",
+  "codeowners": [],
+  "requirements": [],
+  "multi_instance": false
+}

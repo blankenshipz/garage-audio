@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Freeze working-tree application inputs, then deploy only an explicitly frozen archive.
+
+Receipts and archives are private and outside shipped artifacts. No Git commit,
+MA restart, native service operation or credential output is performed.
+"""
+import argparse
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import tarfile
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+INPUTS = ('Dockerfile.dashboard', 'compose.dashboard.yaml',
+          'requirements.txt', 'requirements.lock', 'API_CONTRACT.md', 'API_CONTRACT_ROOM.md',
+          'garage_audio', 'web', 'profiles', 'docs', 'tests', 'research', 'vendor', 'README.md',
+          'scripts/dashboard-stage', 'scripts/dashboard-status', 'scripts/dashboard-mcp',
+          'scripts/verify_room_release.py')
+
+# Executed remotely after activation; also executable against isolated local fixtures.
+# os.replace replaces the link itself, never copies through its directory target.
+RELEASE_POINTER_SCRIPT = '''import os,sys,tempfile
+from pathlib import Path
+root,release=map(Path,sys.argv[1:3])
+image=sys.argv[3]
+current=root/'dashboard-current'
+previous=root/'dashboard-previous'
+if not release.is_dir() or release.is_symlink():
+ raise SystemExit('Release must be an existing regular directory')
+for pointer in (current,previous):
+ if os.path.lexists(pointer) and not pointer.is_symlink():
+  raise SystemExit('Refusing to replace non-symlink release pointer')
+old=os.readlink(current) if current.is_symlink() else None
+with tempfile.TemporaryDirectory(prefix='.dashboard-pointers-',dir=root) as temp:
+ staging=Path(temp)
+ image_file=staging/'image-id'
+ image_file.write_text(image+'\\n')
+ os.replace(image_file,release/'image-id')
+ if old is not None and old != str(release):
+  os.symlink(old,staging/'previous')
+  os.replace(staging/'previous',previous)
+ os.symlink(str(release),staging/'current')
+ os.replace(staging/'current',current)
+'''
+
+def release_pointer_command(root, release, image):
+    return shlex.join(['python3', '-c', RELEASE_POINTER_SCRIPT, str(root), str(release), image])
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def freeze(args):
+    if not args.writers_frozen:
+        raise SystemExit('Freeze requires --writers-frozen after package-input writers are paused.')
+    receipt = Path(tempfile.mkdtemp(prefix='garage-dashboard-', dir=args.receipt_root))
+    os.chmod(receipt, 0o700)
+    inventory = []
+    with tarfile.open(receipt / 'candidate.tar', 'w') as archive:
+        paths = []
+        for name in INPUTS:
+            target = ROOT / name
+            if not target.exists():
+                raise SystemExit(f'Missing required input: {name}')
+            paths.extend(sorted(target.rglob('*')) if target.is_dir() else [target])
+        for path in sorted(paths):
+            if '__pycache__' in path.parts or path.suffix == '.pyc':
+                continue
+            if path.is_symlink():
+                raise SystemExit(f'Symlink input rejected: {path.relative_to(ROOT)}')
+            if not path.is_file():
+                continue
+            data = path.read_bytes()
+            name = str(path.relative_to(ROOT))
+            sha = hashlib.sha256(data).hexdigest()
+            inventory.append({'path': name, 'sha256': sha, 'bytes': len(data)})
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            info.mode = 0o755 if name.startswith('scripts/') else 0o644
+            archive.addfile(info, io.BytesIO(data))
+    candidate = digest(receipt / 'candidate.tar')
+    (receipt / 'inventory.json').write_text(json.dumps(inventory, indent=2) + '\n')
+    (receipt / 'candidate.sha256').write_text(candidate + '\n')
+    print(json.dumps({'receipt': str(receipt), 'candidate': candidate}))
+
+def run(receipt, name, argv):
+    with (receipt / (name + '.stdout')).open('wb') as out, (receipt / (name + '.stderr')).open('wb') as err:
+        result = subprocess.run(argv, stdout=out, stderr=err)
+    (receipt / (name + '.exit')).write_text(str(result.returncode) + '\n')
+    if result.returncode:
+        raise SystemExit(f'{name} failed ({result.returncode}); private receipts: {receipt}')
+
+def deploy(args):
+    if not args.writers_frozen or not args.contract_confirmed:
+        raise SystemExit('Deploy requires --writers-frozen and --contract-confirmed after parent approval.')
+    receipt = Path(args.deploy).resolve()
+    candidate = digest(receipt / 'candidate.tar')
+    if candidate != args.expected_digest or candidate != (receipt / 'candidate.sha256').read_text().strip():
+        raise SystemExit('Candidate digest mismatch')
+    if not re.fullmatch(r'[a-zA-Z0-9./:_-]+@sha256:[0-9a-f]{64}', args.base_image or ''):
+        raise SystemExit('--base-image must be an immutable registry digest')
+    host = args.host
+    remote = '/home/zach/garage-audio/dashboard-releases/' + candidate
+    ssh = ['ssh', '-o', 'BatchMode=yes', host]
+    run(receipt, 'prepare', ssh + [f'umask 077; mkdir -p {remote}; test ! -e {remote}/candidate.tar'])
+    run(receipt, 'upload', ['scp', '-q', str(receipt / 'candidate.tar'), host + ':' + remote + '/candidate.tar'])
+    run(receipt, 'unpack', ssh + [f'set -eu; cd {remote}; test "$(sha256sum candidate.tar | cut -d " " -f 1)" = {candidate}; tar xf candidate.tar'])
+    # Private auth/data are stable across releases. Token never enters archive/env/arguments.
+    setup = '''import os,secrets
+from pathlib import Path
+p=Path('/home/zach/garage-audio/state/dashboard')
+for n in ('data','auth'):
+ (p/n).mkdir(parents=True,exist_ok=True);os.chmod(p/n,0o700)
+t=p/'auth/dashboard-token'
+try:
+ fd=os.open(t,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+except FileExistsError:
+ assert t.is_file() and not t.is_symlink() and t.stat().st_mode & 0o777 == 0o600
+else:
+ with os.fdopen(fd,'w') as f:f.write(secrets.token_urlsafe(32)+'\\n')
+'''
+    run(receipt, 'private-state', ssh + ["python3 -c " + __import__('shlex').quote(setup)])
+    tag = 'garage-audio-dashboard:' + candidate
+    run(receipt, 'build', ssh + [f'cd {remote} && docker build --build-arg BASE_IMAGE={args.base_image} -f Dockerfile.dashboard -t {tag} .'])
+    run(receipt, 'image', ssh + [f"docker image inspect {tag} --format '{{{{.Id}}}}'"])
+    image = (receipt / 'image.stdout').read_text().strip()
+    if not re.fullmatch(r'sha256:[0-9a-f]{64}', image):
+        raise SystemExit('Invalid built image ID')
+    # Do not replace a listener owned by another service.
+    check = "if docker container inspect garage-audio-dashboard >/dev/null 2>&1; then test \"$(docker inspect garage-audio-dashboard --format '{{index .Config.Labels \"com.docker.compose.project\"}}')\" = garage-audio-dashboard; else test -z \"$(ss -H -ltn 'sport = :8098')\"; fi"
+    run(receipt, 'port-owner', ssh + [check])
+    command = f'cd {remote}; export DASHBOARD_IMAGE={image}; docker compose -p garage-audio-dashboard -f compose.dashboard.yaml config -q; docker compose -p garage-audio-dashboard -f compose.dashboard.yaml up -d --no-deps dashboard'
+    run(receipt, 'activate', ssh + ['set -eu; ' + command])
+    run(receipt, 'release-pointer', ssh + [release_pointer_command('/home/zach/garage-audio', remote, image)])
+    print(json.dumps({'candidate': candidate, 'image': image, 'receipt': str(receipt)}))
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument('--freeze', action='store_true')
+    group.add_argument('--deploy', metavar='RECEIPT_DIRECTORY')
+    p.add_argument('--receipt-root', default='/private/tmp/opencode')
+    p.add_argument('--expected-digest')
+    p.add_argument('--base-image')
+    p.add_argument('--writers-frozen', action='store_true')
+    p.add_argument('--contract-confirmed', action='store_true')
+    p.add_argument('--host', default='zach@192.168.68.74')
+    args = p.parse_args()
+    os.umask(0o077)
+    freeze(args) if args.freeze else deploy(args)
+
+if __name__ == '__main__':
+    main()

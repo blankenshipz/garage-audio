@@ -11,9 +11,10 @@ def request(payload, path=SOCKET, timeout=15):
         s.sendall(json.dumps(payload,allow_nan=False).encode()+b'\n')
         data=b''
         while not data.endswith(b'\n'):
-            data+=s.recv(4096)
+            chunk=s.recv(4096)
+            if not chunk:raise OSError('policy broker disconnected')
+            data+=chunk
             if len(data)>65536:raise ValueError('oversized control reply')
-            if not data:raise OSError('policy broker disconnected')
         reply=json.loads(data)
         if not reply['ok']:raise RuntimeError(reply['error'])
         return reply['result']

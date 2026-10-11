@@ -13,6 +13,6 @@ for f in config/garage-*.service; do
   install -m 644 "$f" "$target"
 done
 systemctl --user daemon-reload
-systemctl --user enable garage-pipewire garage-wireplumber garage-dsp garage-player
+systemctl --user disable garage-pipewire garage-wireplumber garage-dsp garage-player
 # Never start hardware automatically. Boot guards refuse missing identity.
-echo 'Definitions installed. Do not start DSP/player before attended hardware commissioning.'
+echo 'Definitions installed DISABLED. Human helper performs authenticated finite startup only; no audio started.'

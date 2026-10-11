@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+host=${GARAGE_HOST:-zach@192.168.68.74}
+exec ssh -o BatchMode=yes "$host" 'docker inspect garage-audio-dashboard --format "image={{.Image}} status={{.State.Status}} restart={{.HostConfig.RestartPolicy.Name}}"; curl --silent --max-time 5 --output /dev/null --write-out "HTTP %{http_code}\n" http://127.0.0.1:8098/; readlink /home/zach/garage-audio/dashboard-current'

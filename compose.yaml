@@ -6,12 +6,11 @@ services:
     user: "1000:1000"
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
+    # Host networking is required for Spotify/Soloist LAN DNS-SD pairing.
+    # MA UI/stream listeners are pinned to the LAN IP in persisted MA settings.
+    network_mode: host
     volumes:
       - ./state/ma:/data
       - ./state/music:/music:ro
-    ports:
-      - 127.0.0.1:8095:8095
-      - 127.0.0.1:8097:8097
-      - 127.0.0.1:3483:3483/tcp
     environment:
       LOG_LEVEL: info
