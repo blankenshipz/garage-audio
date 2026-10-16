@@ -8,6 +8,23 @@ from .audio_network import birth
 
 DATA='data/spotify_connect/spotify_connect_02_00_00_00_21_01/soloist-data'
 
+class ReceiverOwnershipError(PermissionError):
+    """Only fixed nonsecret categories; retain the native fail-closed exception boundary."""
+    def __init__(self,reason):
+        if reason not in ('owner_absent','owner_ambiguous','owner_changed','listener_changed'):
+            raise ValueError('unknown receiver ownership category')
+        self.reason=reason
+        super().__init__('receiver ownership observation failed: '+reason)
+
+def owns_socket(proc,inode):
+    # A receiver's unrelated transient FD may close between glob and readlink.
+    # Skip that FD, NOT the whole process (which may still own the pinned listener).
+    for fd in (proc/'fd').glob('*'):
+        try:target=os.readlink(fd)
+        except (FileNotFoundError,ProcessLookupError):continue
+        if target=='socket:['+inode+']':return True
+    return False
+
 def listening_sockets(pid, namespace):
     """Kernel LISTEN instance identity; Linux tcp6 uses little-endian 32-bit words."""
     records=[]
@@ -43,14 +60,20 @@ class ReceiverEndpoint:
         for proc in Path('/proc').glob('[0-9]*'):
             try:
                 if proc.stat().st_uid!=1000 or os.stat(proc/'ns/net').st_ino!=inode:continue
-                if not any(os.readlink(fd)=='socket:['+sockets[0]+']' for fd in (proc/'fd').glob('*')):continue
+                if not owns_socket(proc,sockets[0]):continue
                 executable=proc/'exe';info=executable.stat();key=(int(proc.name),birth(int(proc.name)),info.st_ino,info.st_mtime_ns,info.st_size)
                 if self.verified!=key:
                     if info.st_size>100*1024*1024 or hashlib.sha256(executable.read_bytes()).hexdigest()!=self.digest:raise PermissionError('actual public receiver binary pin differs')
                     self.verified=key
                 owners.append(key)
             except (FileNotFoundError,ProcessLookupError):continue
-        if len(owners)!=1:raise PermissionError('exact receiver listener owner required')
+        if len(owners)!=1:raise ReceiverOwnershipError('owner_absent' if not owners else 'owner_ambiguous')
+        proc=Path('/proc')/str(owners[0][0])
+        if birth(owners[0][0])!=owners[0][1] or proc.stat().st_uid!=1000 or os.stat(proc/'ns/net').st_ino!=inode:
+            raise ReceiverOwnershipError('owner_changed')
+        current=[r for r in listening_sockets(ma_pid,inode)
+                 if r['address']=='127.0.0.1' and r['port']==port and r['uid']==1000]
+        if current!=listeners:raise ReceiverOwnershipError('listener_changed')
         return {'pid':owners[0][0],'birth':owners[0][1],'port':port,'binary_sha256':self.digest,'namespace_inode':inode,'listener':listeners[0]}
     def publish(self,authority,observation):
         root=Path(authority)/'receiver';root.mkdir(mode=0o755,exist_ok=True)
