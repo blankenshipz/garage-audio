@@ -1,49 +1,166 @@
 # Garage Audio
 
-Headless Spotify playback and a shared web/MCP workspace for safe speaker routing,
-subwoofer configuration, measurement and conservative room correction.
+**A self-hosted speaker system that keeps everyday listening simple and makes the
+audio chain inspectable.**
+
+Garage Audio connects Spotify on your phone to an amplifier and speakers through
+a headless Linux server, a USB audio interface and software DSP. Alongside playback,
+it provides a web dashboard and an agent-accessible workspace for speaker routing,
+room layouts, listening profiles, measurements and experimental room correction.
+Music Assistant handles the music; CamillaDSP handles the signal processing;
+Garage Audio connects those pieces with shared controls and guarded device ownership.
+
+## Why it exists
+
+A DIY networked stereo can quickly become several unrelated systems: a music
+receiver, a DSP configuration, a room-measurement tool and a collection of scripts.
+Changing one leaves questions elsewhere: Which output is active? Which filters
+will load next time? Does this curve describe a real measurement or just a prediction?
+
+Garage Audio brings that work into one system without making it a prerequisite for
+listening. Pick the speakers in Spotify and play music. When you want to investigate
+the room or change the signal chain, use the same persistent workspace from a browser
+or an MCP-connected agent. Keep original measurements, inspect proposed changes and
+retain a path back instead of treating a promising graph as proof of better sound.
+
+This is for self-hosters and audio experimenters comfortable operating Linux, Docker
+and physical audio hardware. It is **not a turnkey receiver or an autonomous room
+calibration appliance**. The reference stereo deployment has user-reported working
+Spotify playback; newer subwoofer and correction workflows are still experimental.
+
+## The everyday experience
+
+Once the system is commissioned, the listening path is:
+
+1. Open Spotify on a phone on the same trusted Wi-Fi.
+2. Select **Garage Speakers** and press **Play**.
+3. Use Spotify to pause, resume or stop. Dashboard and MCP controls also expose
+   status and silence controls; neither is required to start ordinary listening.
+4. Close and reopen Spotify to return to the same receiver. After a reconnect with
+   stale playback state, Pause then Play creates a fresh playback transition.
+
+There is no daily terminal command, Music Assistant session button or expiring
+calibration approval to renew. Provider onboarding is a one-time setup concern;
+measurement permissions are separate from normal playback.
+
+For the reference fixed-level stereo setup, the amplifier knob is the primary
+volume control; Spotify supplies optional digital attenuation. Start with the
+amplifier turned down and raise it slowly. DSP headroom is not a safe-loudness
+guarantee. See the [Spotify quickstart](docs/spotify-only-quickstart.md).
+
+## How it fits together
+
+The audio path and the control workspace are separate:
+
+```text
+AUDIO
+Spotify phone
+    │ Spotify Connect
+    ▼
+Music Assistant + Soloist → Squeezelite → private PipeWire stream
+                                                │ PCM
+                                                ▼
+                                  guarded audio owner + CamillaDSP
+                                                │ ALSA / USB
+                                                ▼
+                                      Behringer UMC1820
+                                                │ analog outputs
+                                                ▼
+                                      amplifier → speakers
+
+CONTROL
+Web dashboard ───────────────────┐
+                                 ▼
+MCP client → SSH → MCP adapter → shared Python application → private room/profile state
+                                 │
+                                 ├→ Music Assistant API
+                                 └→ guarded audio control boundary
+```
+
+* **Music Assistant is the music backend**, providing the Spotify Connect/Soloist
+  integration and player/queue APIs. Squeezelite is the player transport, not a
+  second Spotify receiver. Spotify is the documented everyday source here; Music
+  Assistant's wider provider support is not a claim that every source is qualified.
+* **PipeWire and CamillaDSP form the audio pipeline.** A private PipeWire stream
+  feeds PCM into the owned DSP process, which handles routing, gain and filters
+  before ALSA opens the explicitly identified USB interface.
+* **Garage Audio owns the coordination and safeguards.** Device identity, playback
+  transitions and process supervision prevent an unavailable path from silently
+  switching to HDMI, internal audio or an unfiltered output. The deployed baseline
+  uses a custom Music Assistant lifecycle bridge; the Docker-first design moves
+  that coordination into dedicated audio services. These are distinct deployment
+  paths, not interchangeable Compose recipes.
+* **The web UI and MCP use one application and one set of records.** An agent can
+  create a room or calibration plan and you can inspect that same record in the
+  dashboard. MCP is authenticated stdio over SSH, not a public agent endpoint or
+  arbitrary shell. The dashboard gets neither direct DAC access nor a Docker socket.
+
+### Technology stack
+
+| Layer | Technology | Role |
+|---|---|---|
+| Application | Python 3.13+, standard-library HTTP server, JSON Schema | Shared typed operations, validation and persistent workflow state |
+| Web interface | Plain JavaScript ES modules, HTML and CSS | Dependency-free dashboard, plots, setup and measurement controls |
+| Agent interface | Official Python MCP SDK / FastMCP, SSH stdio | External agents access the same authenticated application |
+| Music backend | Music Assistant, Soloist, Squeezelite | Spotify Connect, queues and decoded audio transport |
+| Audio graph | PipeWire, WirePlumber, ALSA | Private stream routing and explicit Linux device access |
+| DSP | CamillaDSP and its Python client | Channel routing, headroom, crossover/filter graphs and offline renders |
+| Deployment | Docker Compose, Linux host device policy and service tooling | Separate application/audio roles and persistent private state |
+| Embedded agent scaffold | OpenAI Agents SDK | Local session/tool plumbing; **model and vision inference are disabled** |
+
+The stack is defined in [Python dependencies](requirements.txt), the
+[audio image](Dockerfile.audio), [Compose configuration](compose.yaml) and
+[frontend guide](web/README.md). The embedded chat scaffold is not a working AI
+assistant: it makes no model calls, even with ambient credentials. External MCP
+clients remain usable independently; Garage Audio does not require paid inference
+for listening, manual controls or measurement planning.
+
+## What you can do today
+
+**On the existing deployment:** listen through the Spotify stereo path on
+commissioned OUT3/OUT4. Shared MCP/HTTP room-state readback has also been exercised.
+This does not establish that every feature in the latest source is deployed.
+
+**In the application workspace:** organize rooms, annotated photos and listening
+positions; create independent listening profiles; import REW text responses;
+analyze them and prepare conservative, cut-only EQ proposals. Measured inputs,
+synthetic fixtures and electrical predictions remain distinct. Planning and
+importing do not play sound.
+
+**Implemented in newer source, awaiting physical acceptance:** persistent 2.1
+routing and crossover configuration, correction prepare/apply/rollback/verify,
+and a real ALSA microphone-capture adapter. Local tests and actual CamillaDSP
+file-output renders exercise these software paths, not the room. Hardware
+configuration apply remains blocked; file-only acceptance does not authorize it.
+
+No qualified live microphone, commissioned subwoofer output or successful live
+capture → correction → remeasurement result is established. UMIK-style measurement
+is intended, not hardware-qualified. There is no claim of fully automatic bass
+optimization, acoustic improvement or a clean-install production release. Query
+the running server's capabilities rather than assuming source equals deployment.
+See the [capability map](docs/publication.md) for exact boundaries.
+
+## Before installing
 
 **Never run test signals, increase amplifier gains or calibrate unattended.**
-Missing hardware, authority or verified routing fails closed; there is no default
-sound-device fallback. Original code is [MIT licensed](LICENSE); bundled software
-retains [its own terms and source provenance](THIRD_PARTY_NOTICES.md).
+Missing hardware, authority or verified routing must fail closed.
 
-## What works—and what is not yet verified
+The reference target is Linux amd64 with Docker Engine and recent Docker Compose
+(overrides use `!reset`), trusted LAN access and SSH administration. Python 3.13+
+is the application target; macOS software checks do not qualify Linux USB audio.
 
-The existing deployment has user-reported working Spotify playback after its
-focused device repair. Source adds persistent 2.1 routing, cut-only correction,
-rollback and a real ALSA microphone-capture adapter. Actual CamillaDSP FILE renders
-and local lifecycle/MCP/UI tests are software evidence, **not acoustic proof**.
+The audio configuration targets an identity-verified **Behringer UMC1820**. Its
+observed Linux playback PCM is 12-channel, S24_3LE at 48 kHz; historical 20-channel
+software templates are not evidence of the physical jack map. The commissioned
+stereo uses OUT3/OUT4. Intended 2.1 wiring adds OUT5 to a powered subwoofer's
+line/LFE input—**do not enable it before physical commissioning**. The reference
+speakers are Fosi V3 amplification, Klipsch R-28F mains and an R-12SW sub; these
+speaker models are not themselves prerequisites for other safely commissioned rigs.
 
-The deployed baseline and latest source are not interchangeable: the baseline MCP
-inventory was 34 tools, five resources and 81 operations; six lifecycle tools and
-seven operations exist in the newer candidate but await owner-aware activation.
-Always discover actual server capabilities. A built image is not an active release.
-
-No qualified microphone is currently established, subwoofer output commissioning
-and hardware apply authority remain pending, and no live capture→correction→
-remeasurement acoustic improvement is claimed. Source packaging and CI do not prove
-a clean hardware installation, physical-phone UI or recovery after a real USB fault.
-
-## Supported target and prerequisites
-
-* Linux amd64, Docker Engine and recent Docker Compose (overrides use `!reset`).
-  Python 3.13+ is the application target. macOS can run local software checks, not
-  qualify the server's USB/audio hardware.
-* Behringer UMC1820 with an explicitly verified USB identity. The observed Linux
-  playback PCM is 12-channel, S24_3LE/48 kHz; do not use historical 20-channel
-  software templates as evidence of the physical jack map.
-* Existing commissioned mains: OUT3/OUT4. Intended 2.1 wiring adds OUT5 to a powered
-  subwoofer's line/LFE input; **do not enable it before physical commissioning**.
-  The reference setup uses Fosi V3, Klipsch R-28F mains and R-12SW sub; those speaker
-  models are not inferred prerequisites for other safely commissioned systems.
-* Automated acquisition requires a compatible ALSA microphone, verified serial,
-  orientation and calibration file. UMC capture inputs alone do not establish a
-  calibrated microphone. UMIK-style USB measurement is intended but not currently
-  hardware-qualified. Laptop REW text import remains available.
-* SSH and trusted LAN access; human-owned Music Assistant onboarding, Spotify
-  provider terms/OAuth and any required provider key. No API-key inference or paid
-  model call is required. Embedded model inference is disabled.
+Music Assistant onboarding and Spotify terms, OAuth or provider-key steps belong
+to the human account owner. Automated measurement additionally needs a compatible
+ALSA microphone with verified identity, orientation and calibration—not simply an
+available capture input. REW text import is the alternative for external measurements.
 
 ## One-time setup
 
@@ -75,25 +192,6 @@ a clean hardware installation, physical-phone UI or recovery after a real USB fa
    at your configured host's port 8098 on trusted Wi-Fi only. HTTP is unencrypted;
    never publish it to the Internet or proxy the private DSP websocket.
 
-## Everyday listening
-
-After commissioning: **Spotify → Garage Speakers → Play**. Start quietly; use
-Pause/Resume and Stop in Spotify. Stop/pause/status also have dashboard/MCP paths.
-Close and reopen Spotify to reconnect to the same receiver. See
-[Spotify quickstart](docs/spotify-only-quickstart.md).
-
-Ordinary playback is separate from one-time provider onboarding and expiring
-measurement grants. A cancelled or expired test must not require daily re-enrollment
-or a new dashboard token. Do not use historical attendance-string commands to
-authorize sound. A muted/unavailable device requires the reported readiness repair,
-not fallback to HDMI, internal audio or an unfiltered bypass.
-
-For subwoofers, review [audio configuration](docs/audio-configuration.md): route only
-commissioned outputs, retain main high-pass/sub low-pass crossover and conservative
-headroom, then adjust bounded sub trim, mute or polarity deliberately. Persistent
-configuration is applied for subsequent playback; saving a route does not verify
-its cable, authorize an uncommissioned jack or demonstrate bass improvement.
-
 ## Connect an agent
 
 Use an MCP client with the SDK stdio transport over your existing SSH identity:
@@ -111,30 +209,28 @@ actionable errors and authority boundaries: [agent guide](docs/agents.md).
 
 ## Measure → improve → verify → rollback
 
-1. Read readiness, including `measurement.hardware.status` when advertised. Create
-   a quiet calibration plan with explicit channels, positions, mic orientation,
-   sample rate and calibration provenance. Planning makes no sound.
-2. Import qualified REW responses, or request `jobs.request` with `adapter:"hardware"`
-   **only when supported and ready**. Hardware capture uses root-pinned
-   `/etc/garage-audio/measurement.json` and microphone calibration, isolated device
-   ownership and a private exclusive lease. Independent human exact-manifest
-   approval, bounded output and cancellation remain mandatory; MCP cannot invent
-   presence or approve itself. Public/container human approval remains unavailable.
-3. Inspect capture QC before `calibration.capture.import`; synthetic FILE/null jobs
-   cannot be promoted to measured evidence. Analyze, propose conservative cuts,
-   prepare and read the correction. Unknown timing does not justify inferred delay.
-4. `calibration.correction.apply` accepts only a supported, exact prepared state;
-   current FILE acceptance is not hardware apply authority and never starts sound.
-   Use rollback on conflict/failure rather than overwriting a newer configuration.
-5. Obtain matching newly acquired after measurements, then
-   `calibration.correction.verify`. Pairing/configuration/provenance must match;
-   synthetic results and predicted curves are not acoustic verification. Cancel an
-   active job to stop its owned work; rollback retains original measurements.
+The correction workflow is designed around evidence, not a one-click “optimize”:
 
-See [measurement details](docs/measurement-workflow.md), [API](API_CONTRACT.md), and
-[current source capability matrix](docs/publication.md). Hardware acquisition,
-physical sub commissioning and acoustic apply/verify remain explicit acceptance
-gaps, not instructions to bypass safeguards.
+1. **Plan:** record channels, listening positions, microphone orientation and
+   calibration provenance. Read readiness before requesting acquisition.
+2. **Measure:** import qualified REW responses, or use hardware capture only when
+   the server reports it supported and ready. Capture needs a root-pinned microphone
+   policy, exclusive device ownership and independent human approval of the exact
+   bounded test. Public/container human approval is not currently available.
+   Agents cannot self-attest presence or approve their own tests.
+3. **Improve:** inspect capture quality, analyze and prepare conservative cuts.
+   Unknown timing does not justify inferred delay. Review the exact proposed change;
+   preparing it is not permission to apply it to hardware or start sound.
+4. **Verify:** compare matching, newly acquired after measurements. A predicted
+   curve or successful file render is not measured improvement.
+5. **Keep or roll back:** retain original measurements and configuration history.
+   Cancel stops owned test work; stale proposals require fresh readback and validation.
+
+Subwoofer routing follows the same principle: a saved crossover or trim does not
+verify a cable, commission a jack or prove better bass. See
+[audio configuration](docs/audio-configuration.md),
+[measurement workflow](docs/measurement-workflow.md) and the
+[API contract](API_CONTRACT.md) before using these experimental paths.
 
 ## Recovery
 
@@ -170,5 +266,21 @@ hashes and normalized source inventories, verifies required assets/vendor notice
 and rejects private state/cache inputs. Full logs belong outside release inputs.
 CI runs software-only packaging/UI tests, never opens an audio device or publishes.
 Clean-room dependency/image builds, owner-aware deployment and real hardware gates
-remain separate. Historical operational evidence lives in `docs/`, not quickstart
-commands to replay blindly. No public push or release is implied by this repository.
+remain separate. A source package is not a commissioned audio appliance.
+
+## Further reading
+
+* [Everyday Spotify listening](docs/spotify-only-quickstart.md)
+* [Installation and deployment](docs/docker-install.md) · [Container audio topology](docs/container-audio.md)
+* [Dashboard access](docs/dashboard.md) · [MCP agent guide](docs/agents.md)
+* [Room/profile API](API_CONTRACT_ROOM.md) · [Measurement workflow](docs/measurement-workflow.md)
+* [Capability and publication boundaries](docs/publication.md)
+* [Architecture and roadmap](docs/architecture-roadmap.md) · [Experimental active-control research](docs/active-control-research.md)
+
+Some operational documents retain historical deployment notes. Follow their stated
+scope; they are not commands to replay against a live installation.
+
+## License
+
+Original code is [MIT licensed](LICENSE). Bundled components retain their own
+licenses; see [third-party notices and source provenance](THIRD_PARTY_NOTICES.md).
