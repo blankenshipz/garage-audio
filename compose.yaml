@@ -10,7 +10,8 @@ services:
     # MA UI/stream listeners are pinned to the LAN IP in persisted MA settings.
     network_mode: host
     volumes:
-      - ./state/ma:/data
-      - ./state/music:/music:ro
+      # Never resolve state relative to an extracted immutable release directory.
+      - ${GARAGE_MA_STATE_DIR:-/home/zach/garage-audio/state/ma}:/data
+      - ${GARAGE_MUSIC_DIR:-/home/zach/garage-audio/state/music}:/music:ro
     environment:
       LOG_LEVEL: info

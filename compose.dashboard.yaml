@@ -5,29 +5,37 @@ services:
     container_name: garage-audio-dashboard
     restart: unless-stopped
     user: "1000:1000"
-    group_add: ["1003"] # verified garage-control GID; socket only, no DAC/audio group
+    group_add: ["1003"] # public audio control socket only, no DAC/audio device
     init: true
+    stop_grace_period: 30s # covers 15s MA operation + 5s handler read/drain
     read_only: true
     security_opt: [no-new-privileges:true]
     cap_drop: [ALL]
     pids_limit: 128
     tmpfs: ["/tmp:rw,noexec,nosuid,size=32m"]
-    ports: ["127.0.0.1:8098:8098", "192.168.68.74:8098:8098"]
-    extra_hosts: ["music-assistant:192.168.68.74"]
+    ports: ["127.0.0.1:8098:8098", "${GARAGE_LAN_IP:-192.168.68.74}:8098:8098"]
     environment:
       GARAGE_APP_BIND: 0.0.0.0
       GARAGE_APP_STATE: /state
       GARAGE_APP_TOKEN_FILE: /auth/dashboard-token
       GARAGE_APP_URL: http://127.0.0.1:8098
-      GARAGE_APP_AUTHORITIES: 127.0.0.1:8098,localhost:8098,192.168.68.74:8098
-      GARAGE_TRUSTED_LAN_AUTHORITY: 192.168.68.74:8098 # explicit user-authorized ordinary access; NOT listening approval
+      GARAGE_APP_AUTHORITIES: ${GARAGE_APP_AUTHORITIES:-127.0.0.1:8098,localhost:8098,192.168.68.74:8098}
+      GARAGE_TRUSTED_LAN_AUTHORITY: ${GARAGE_TRUSTED_LAN_AUTHORITY-192.168.68.74:8098} # ordinary access, NOT listening approval
+      GARAGE_DEPLOYMENT_MODE: docker
+      GARAGE_AUDIO_CONTROL_SOCKET: /run/garage-audio/public/control.sock
       MA_URL: http://music-assistant:8095
     volumes:
-      - /home/zach/garage-audio/state/dashboard/data:/state
-      - /home/zach/garage-audio/state/dashboard/auth:/auth:ro
-      - /run/garage-speakers/web:/run/garage-speakers/web:ro
-    networks: [music]
+      - ${GARAGE_DASHBOARD_DATA_DIR:-/home/zach/garage-audio/state/dashboard/data}:/state
+      - ${GARAGE_DASHBOARD_AUTH_DIR:-/home/zach/garage-audio/state/dashboard/auth}:/auth:ro
+      - audio-public:/run/garage-audio/public:ro
+    # Candidate MA is private-bridge bound by compose.audio.yaml. Resolve its
+    # service DNS, never silently reach the old LAN-bound MA during staging.
+    networks: [music, audio-backend]
 networks:
-  music:
-    external: true
-    name: garage-audio_default
+  # Both bridges are project-owned, including on a fresh install.
+  music: {}
+  audio-backend: {}
+volumes:
+  # Only the public silence/status socket is visible to the app. Event authority,
+  # transport sockets, raw DSP and DAC remain absent. Shared with compose.audio.yaml.
+  audio-public: {}

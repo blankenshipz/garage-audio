@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "garage-audio"
+version = "0.1.0"
+description = "Fail-closed audio control and room measurement workspace"
+readme = "README.md"
+requires-python = ">=3.13"
+license = {file = "LICENSE"}
+authors = [{name = "Zach"}]
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+include = ["garage_audio*"]
+exclude = ["tests*", "research*", "ma_provider*"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.data-files]
+"share/garage-audio/web" = ["web/*.html", "web/*.js", "web/*.css", "web/*.svg"]
+"share/garage-audio/profiles" = ["profiles/*.json"]
+"share/garage-audio" = ["THIRD_PARTY_NOTICES.md"]

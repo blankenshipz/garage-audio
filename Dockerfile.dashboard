@@ -1,9 +1,11 @@
-ARG BASE_IMAGE
+# Official Linux amd64 Bookworm base; overrides require matching reviewed metadata.
+ARG BASE_IMAGE=docker.io/library/python:3.13.16-slim-bookworm@sha256:f040863673aea2570c3ff6a5c3fb4c673a016cbc5375005ad145915922b6b78a
 FROM ${BASE_IMAGE}
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY vendor/dsp /opt/garage-audio/dsp/vendor
-RUN cd /opt/garage-audio/dsp/vendor \
+RUN test "$(dpkg --print-architecture)" = amd64 \
+ && cd /opt/garage-audio/dsp/vendor \
  && sha256sum -c SHA256SUMS \
  && mkdir -p /opt/garage-audio/dsp/lib /tmp/dsp-unpack /tmp/alsa-unpack \
  && tar xzf camilladsp-linux-amd64-v4.1.3.tar.gz -C /tmp/dsp-unpack camilladsp \
@@ -19,6 +21,7 @@ RUN cd /opt/garage-audio/dsp/vendor \
  && test "$(LD_LIBRARY_PATH=/opt/garage-audio/dsp/lib /opt/garage-audio/dsp/camilladsp --version)" = 'CamillaDSP 4.1.3 (05e9cfc)' \
  && rm -rf /tmp/dsp-unpack /tmp/alsa-unpack
 COPY requirements.lock /app/requirements.lock
+COPY LICENSE THIRD_PARTY_NOTICES.md /app/
 RUN pip install --no-cache-dir -r requirements.lock
 COPY garage_audio /app/garage_audio
 COPY profiles /app/profiles

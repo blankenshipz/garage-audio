@@ -1,0 +1,38 @@
+name: software-checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  publication:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python -m pip install build==1.2.2.post1
+      - run: python scripts/publication-check.py --output "$RUNNER_TEMP/publication"
+      - run: python -m pip install -r requirements.lock
+      - run: python -m pip install --no-deps "$RUNNER_TEMP"/publication/build-1/*.whl
+      - run: python -m pip check
+      - run: python scripts/publication-runtime-check.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node --test web/tests/*.test.js
+  dashboard-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Capacity admission
+        run: |
+          available=$(df -Pk /var/lib/docker | awk 'NR==2 {print $4}')
+          test "$available" -ge 6291456 # 2GiB reserve plus 4GiB image/build headroom
+      - run: docker build --platform linux/amd64 -f Dockerfile.dashboard -t garage-dashboard:ci .
+      - name: Isolated software runtime
+        run: |
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --tmpfs /tmp:rw,nosuid,size=64m \
+            -e PYTHONPATH=/app \
+            -v "$PWD/scripts/publication-runtime-check.py:/check.py:ro" \
+            garage-dashboard:ci python /check.py --source-layout /app
