@@ -287,15 +287,12 @@ class ReceiverState:
 
     def accept(self, value):
         kind = value.get('type')
+        was_active = self.active
         if kind == 'auth_state':
             self.logged_in = value.get('logged_in') is True
             self.active = value.get('is_active') is True
-            if not self.logged_in or not self.active:
-                self.ticket = None
         elif kind == 'device_changed':
             self.active = value.get('is_active') is True
-            if not self.active:
-                self.ticket = None
         elif kind == 'volume_changed':
             self.volume = value.get('volume')
         elif kind in ('playback_state', 'playback_changed'):
@@ -311,6 +308,13 @@ class ReceiverState:
                 self.ticket = FreshPlay(self.epoch, time.monotonic()+1.5)
         else:
             return False
+        # Soloist can report fresh Play before device activation, followed by an
+        # unchanged inactive auth snapshot. That snapshot is not a revocation of
+        # an already-active receiver. Keep only the original bounded fresh ticket;
+        # it still cannot qualify until actual active/auth/MA/worker checks pass.
+        # Real deactivation (including playback snapshots) and logout revoke it.
+        if not self.logged_in or (was_active and not self.active):
+            self.ticket = None
         self.event_sequence += 1
         self.last_received = time.monotonic()
         if self.state not in ('playing', 'paused', 'idle', 'buffering', 'unknown'):

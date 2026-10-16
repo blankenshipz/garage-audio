@@ -79,6 +79,44 @@ class ObserverTraceTests(unittest.TestCase):
         self.assertFalse(self.state.eligible(self.state.ticket))
         self.assertEqual(self.state.rejection(self.state.ticket),'inactive')
 
+    def test_fresh_inactive_play_survives_unchanged_auth_until_observed_activation(self):
+        # Retained 22:33:52Z sequence: Play inactive -> auth still inactive ->
+        # device active .3s later. Previously the middle snapshot lost the ticket.
+        self.state.accept({'type':'auth_state','logged_in':True,'is_active':False})
+        self.state.accept({'type':'playback_changed','status':'playing','volume':40,'is_active':False})
+        ticket=self.state.ticket;deadline=ticket.expires
+        for kind in ('playback_state','auth_state','device_changed'):
+            value={'type':kind,'is_active':False,'logged_in':True,'status':'playing','volume':40}
+            self.state.accept(value)
+            self.assertIs(self.state.ticket,ticket)
+            self.assertFalse(self.state.eligible(ticket))
+            self.assertEqual(ticket.expires,deadline)
+        self.state.accept({'type':'device_changed','is_active':True})
+        self.assertIs(self.state.ticket,ticket);self.assertTrue(self.state.eligible(ticket))
+
+    def test_inactive_candidate_logout_expiry_and_real_deactivation_still_revoke(self):
+        for kind in ('auth_state','device_changed','playback_state','playback_changed'):
+            with self.subTest(kind=kind):
+                state=ReceiverState('fixture')
+                state.accept({'type':'auth_state','logged_in':True,'is_active':True})
+                state.accept({'type':'playback_changed','status':'playing','volume':40,'is_active':True})
+                self.assertTrue(state.eligible(state.ticket))
+                state.accept({'type':kind,'logged_in':True,'is_active':False,'status':'playing','volume':40})
+                self.assertIsNone(state.ticket)
+        for ending in ('logout','expired'):
+            state=ReceiverState('fixture')
+            state.accept({'type':'auth_state','logged_in':True,'is_active':False})
+            state.accept({'type':'playback_changed','status':'playing','volume':40,'is_active':False})
+            ticket=state.ticket
+            if ending=='logout':
+                state.accept({'type':'auth_state','logged_in':False,'is_active':False})
+                self.assertIsNone(state.ticket)
+            else:
+                ticket.expires=time.monotonic()-1
+                state.accept({'type':'auth_state','logged_in':True,'is_active':False})
+                state.accept({'type':'device_changed','is_active':True})
+                self.assertFalse(state.eligible(ticket));self.assertEqual(state.rejection(ticket),'expired')
+
     def test_ring_preserves_first_failure_and_honest_drop_counter(self):
         self.trace.record('ipc',kind='prepare',ok=False,error='RuntimeError',ipc_error='ticket',
                           token='PRIVATE_CANARY',uri='PRIVATE_CANARY',message='PRIVATE_CANARY')
@@ -145,6 +183,32 @@ class ObserverTraceTests(unittest.TestCase):
 
 
 class DriverTraceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_observed_inactive_auth_race_activates_same_fresh_play_without_another_track(self):
+        state=ReceiverState('fixture-epoch')
+        state.accept({'type':'auth_state','logged_in':True,'is_active':False})
+        state.accept({'type':'playback_changed','status':'playing','volume':40,'is_active':False})
+        ticket=state.ticket;pending=None;consumed=asyncio.Event();calls=[]
+        async def emit(kind,token=None):
+            nonlocal pending
+            calls.append(kind)
+            if kind=='prepare':pending='fixture-worker-ticket'
+            if kind=='delta':
+                self.assertEqual(token,pending);pending=None;consumed.set()
+            return {'state':'off','pending_ticket':pending}
+        class MA:
+            async def corroborate(self,provider):return True
+        async def forbidden_pause():raise AssertionError('no receiver command')
+        task=asyncio.create_task(drive(state,MA(),'fixture',emit,forbidden_pause))
+        try:
+            await asyncio.sleep(.01)
+            state.accept({'type':'auth_state','logged_in':True,'is_active':False})
+            self.assertIs(state.ticket,ticket);self.assertNotIn('prepare',calls)
+            state.accept({'type':'device_changed','is_active':True})
+            await asyncio.wait_for(consumed.wait(),.3)
+            self.assertEqual(calls.count('delta'),1);self.assertIsNone(state.ticket)
+        finally:
+            task.cancel();await asyncio.gather(task,return_exceptions=True)
+
     async def test_exception_reports_actual_observer_function_without_payload_or_text(self):
         with tempfile.TemporaryDirectory() as tmp:
             trace=DecisionTrace(Path(tmp)/'trace.json')
