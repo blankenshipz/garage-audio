@@ -1,14 +1,14 @@
 # Garage Audio
 
-**A self-hosted speaker system that keeps everyday listening simple and makes the
-audio chain inspectable.**
+**Build a self-hosted music and DSP system—with a web workspace and agent tools
+to help configure it, understand your room and work toward better sound.**
 
-Garage Audio connects Spotify on your phone to an amplifier and speakers through
-a headless Linux server, a USB audio interface and software DSP. Alongside playback,
-it provides a web dashboard and an agent-accessible workspace for speaker routing,
-room layouts, listening profiles, measurements and experimental room correction.
-Music Assistant handles the music; CamillaDSP handles the signal processing;
-Garage Audio connects those pieces with shared controls and guarded device ownership.
+Garage Audio brings Music Assistant, CamillaDSP and Linux audio together behind
+shared web and MCP controls. Connect a server to your amplifier and speakers through
+a USB audio interface, choose your music source, then manage routing, listening
+profiles and measurements in one place. An MCP-connected agent can inspect the
+system, help prepare DSP changes and guide a measurement-and-correction workflow
+without replacing the music app you use every day.
 
 ## Why it exists
 
@@ -17,20 +17,138 @@ receiver, a DSP configuration, a room-measurement tool and a collection of scrip
 Changing one leaves questions elsewhere: Which output is active? Which filters
 will load next time? Does this curve describe a real measurement or just a prediction?
 
-Garage Audio brings that work into one system without making it a prerequisite for
-listening. Pick the speakers in Spotify and play music. When you want to investigate
-the room or change the signal chain, use the same persistent workspace from a browser
-or an MCP-connected agent. Keep original measurements, inspect proposed changes and
-retain a path back instead of treating a promising graph as proof of better sound.
+The useful part is the connection between those tasks. Ask an agent why a player
+is silent, have it read the actual readiness state, then inspect the same result in
+the dashboard. Import a room measurement, discuss the peaks and prepare a bounded
+EQ proposal while keeping the original data and a rollback path. Configuration
+becomes an inspectable workflow rather than a pile of disconnected settings.
 
-This is for self-hosters and audio experimenters comfortable operating Linux, Docker
-and physical audio hardware. It is **not a turnkey receiver or an autonomous room
-calibration appliance**. The reference stereo deployment has user-reported working
-Spotify playback; newer subwoofer and correction workflows are still experimental.
+This is for self-hosters building a garage stereo, workshop system or listening-room
+experiment who are comfortable with Linux, Docker and physical audio hardware.
+It is an early-stage integration project, **not a plug-and-play receiver or a fully
+autonomous calibration appliance**. Spotify stereo is the demonstrated playback
+path; broader provider integration and physical room correction need further work.
+
+## Why build this instead of using an AVR?
+
+The advantage is **programmability and control, not more amplifier watts or a
+promise of better sound**. A traditional audio/video receiver packages a great deal
+into one appliance. Garage Audio instead exposes the pieces so you can inspect,
+adapt and automate the supported workflow rather than stay inside one receiver's
+menus and integration choices.
+
+| What you want to control | What the open stack gives you |
+|---|---|
+| Signal routing and DSP | Inspectable channel maps, headroom, crossovers and cut-only EQ proposals; source code and configuration you can extend rather than a fixed set of presets. Hardware changes still need validation and commissioning. |
+| Music sources | A Music Assistant backend separate from the DSP chain, so provider integration does not require replacing your amplifier or EQ engine. Individual source paths still need qualification. |
+| Experiments and profiles | Retained measurements, explicit configuration revisions, proposal diffs and rollback workflows—a record of what changed and why, not just a remembered knob position. |
+| Automation and assistance | A shared API/MCP workspace where an agent can diagnose prerequisites, organize measurements and prepare changes you can review in the browser. Sound authority remains separate. |
+
+The tradeoff is that **you own the integration**: Linux maintenance, device policy,
+cabling, amplification and verification. Many AVRs already offer sophisticated
+room correction, network control and convenient calibration; this project does not
+claim to outperform them acoustically. An AVR may be the better choice for integrated
+amplification, HDMI switching/eARC, surround decoding and appliance-like operation.
+Garage Audio is **not a full home-theater AVR replacement**. Choose it when the
+ability to understand and extend your music/DSP system is itself part of the goal.
+
+## Build your own system
+
+Start with a working stereo, then add DSP experiments and measurement. You do not
+need a subwoofer, microphone or agent just to listen.
+
+| Piece | What to plan for |
+|---|---|
+| Host | Linux amd64, Docker Engine, recent Docker Compose (`!reset` support), persistent storage, trusted LAN and SSH access. Python 3.13+ is the application target. |
+| Audio interface | The implemented device policy targets a Behringer UMC1820 with a verified USB identity and channel map. Another DAC requires device-policy/routing adaptation and commissioning; arbitrary USB audio is not plug-and-play. |
+| Speakers and amplification | A compatible amplifier and passive speakers, or suitable powered speakers, with correctly matched line-level connections and accessible physical volume/mute controls. |
+| Optional subwoofer | A powered sub with a compatible line/LFE input and a separately commissioned output. Plan the main high-pass/sub low-pass crossover before enabling 2.1. |
+| Optional measurement kit | A calibrated microphone, its matching calibration file and repeatable placement. REW text import supports measurements made externally; automated ALSA capture has additional hardware/approval prerequisites. |
+
+The browser/MCP workspace, room records and REW analysis are not tied to the author's
+speaker models. **The hardware output policy is device-specific.** Treat the current
+interface and wiring as a reference integration to adopt or deliberately port, not
+as a generic sound-card autodetector.
+
+### Your path from hardware to music to DSP
+
+1. **Map the physical system.** Identify the interface, left/right outputs, amplifier
+   inputs and safe gain settings. Leave any uncommissioned sub output disabled.
+2. **Install the software and private state.** Follow [one-time setup](#one-time-setup)
+   to review host device isolation, choose matching images and connect the dashboard
+   to Music Assistant. This still needs operator setup, not just `docker compose up`.
+3. **Choose and authorize a music source.** Configure it in Music Assistant using
+   the provider's own account/consent process. Source selection and speaker-output
+   readiness are separate; a populated music library does not prove audio can play.
+4. **Establish quiet stereo playback.** Commission the exact outputs with low
+   physical gain, then verify Play, Pause, Stop and reconnect. Spotify Connect is
+   the project's demonstrated route; qualify a different provider before relying on it.
+5. **Prepare your DSP configuration.** Inspect the active routing and headroom;
+   prepare a stereo or future 2.1 proposal, review its diff and validation, and retain
+   the previous configuration. Current hardware apply restrictions still apply.
+6. **Measure before correcting.** Create a room/listening plan, import measurements,
+   analyze and propose conservative cuts. Only call a change an improvement after
+   matching new measurements—not because its predicted curve looks better.
+
+### Choose a provider, not a different DSP stack
+
+Music Assistant separates **where music comes from** from **which player receives
+it**. Its upstream [music-source catalog](https://www.music-assistant.io/music-providers/)
+includes local files, media servers such as Jellyfin/Plex, and streaming providers
+such as Spotify, Qobuz and Tidal. Configure your chosen source in Music Assistant's
+music-source/provider settings and follow the instructions for your installed version;
+subscriptions, authentication and features vary by provider.
+
+Garage Audio's output side is Squeezelite → PipeWire → CamillaDSP → ALSA. That
+separation is the integration point for other sources: you should not need a new
+EQ engine for each music service. **It is not yet a compatibility guarantee:**
+those upstream providers have not all been qualified through this project's guarded
+playback lifecycle. Adding a provider does not automatically arm the DAC or make
+agent-initiated Play available. For another source, first verify the selected MA
+player, admission/stop behavior, volume handling and reconnect on your installation.
+
+Spotify has two distinct roles in Music Assistant:
+
+* A **Spotify music source** supplies library/playback access inside Music Assistant.
+* The **Spotify Connect plugin**, using Soloist on the documented path, advertises
+  the selected MA player in the Spotify app. It is not another local audio transport;
+  Squeezelite remains the player feeding the DSP chain.
+
+The Garage Audio setup workflow focuses on the latter. Other provider onboarding
+belongs in Music Assistant; the dashboard is not a universal provider wizard.
+
+## What an agent can help you do
+
+Connect your preferred MCP-capable assistant to Garage Audio's server. Instead of
+asking it to guess a CamillaDSP file, let it discover the deployed capabilities,
+read current state and use typed operations. You can inspect its rooms, plans and
+proposals in the same web workspace and return to them after reconnecting.
+
+These are illustrative prompts for an **external MCP-connected agent**, not canned
+features of the dashboard's chat tab:
+
+| Ask your agent | Useful work through Garage Audio |
+|---|---|
+| “Inspect this installation. What is ready, and what is missing before I can listen? Don't start sound.” | Read status/capabilities and report the server's device, backend and credential prerequisites—not guess what is physically plugged in. |
+| “Explain my left/right routing and headroom. Prepare a 2.1 proposal for review, but don't apply it.” | Inspect configuration, propose supported routing/crossover changes and show validation/diffs. A proposal cannot commission an output. |
+| “There is no sound. Check the player and audio readiness before suggesting a restart.” | Read available MA/player and audio status, distinguish missing prerequisites from playback state, and recommend the next targeted check without unmuting or bypassing DSP. |
+| “Create a room plan for my workbench and listening chair. Tell me what to measure at each position.” | Create room/listening-profile records and a placement/channel guide; keep fit and held-out verification positions distinct. |
+| “Analyze these REW exports. Which peaks are candidates for conservative cuts? Keep the originals.” | Import labeled responses, analyze them, prepare cut-only proposals and explain predictions and data-quality warnings. |
+| “Show the exact correction, its prerequisites and rollback. Apply only if this deployment supports it and the required approval exists.” | Prepare/read the correction and report whether apply is available. After a supported change, guide remeasurement, verification and rollback rather than claiming success from a saved setting. |
+
+The agent coordinates the workflow; **you wire the system, place and calibrate the
+microphone, authorize accounts and attend any sound-producing test**. It cannot
+infer physical distances from a room photo, self-approve a test or turn a synthetic
+render into a room measurement. Hardware apply and end-to-end acoustic correction
+remain unaccepted; the useful planning, import and analysis work does not depend on them.
+
+The embedded OpenAI Agents SDK scaffold currently has inference disabled. Use an
+external MCP client for this assistance, or use the manual dashboard without an
+agent. See [agent connection](#connect-an-agent) for the client configuration.
 
 ## The everyday experience
 
-Once the system is commissioned, the listening path is:
+For the commissioned Spotify Connect path, the listening experience is:
 
 1. Open Spotify on a phone on the same trusted Wi-Fi.
 2. Select **Garage Speakers** and press **Play**.
@@ -115,54 +233,32 @@ assistant: it makes no model calls, even with ambient credentials. External MCP
 clients remain usable independently; Garage Audio does not require paid inference
 for listening, manual controls or measurement planning.
 
-## What you can do today
+## Reference hardware and project maturity
 
-**On the existing deployment:** listen through the Spotify stereo path on
-commissioned OUT3/OUT4. Shared MCP/HTTP room-state readback has also been exercised.
-This does not establish that every feature in the latest source is deployed.
+The reference system uses a UMC1820, Fosi V3 amplification and Klipsch R-28F mains;
+an R-12SW powered sub is the intended 2.1 addition. Stereo OUT3/OUT4 has user-reported
+working Spotify playback. OUT5 is intended for the sub's line/LFE input and is **not
+commissioned**. The observed Linux playback PCM is 12-channel S24_3LE/48 kHz;
+historical 20-channel software templates do not establish the physical jack map.
 
-**In the application workspace:** organize rooms, annotated photos and listening
-positions; create independent listening profiles; import REW text responses;
-analyze them and prepare conservative, cut-only EQ proposals. Measured inputs,
-synthetic fixtures and electrical predictions remain distinct. Planning and
-importing do not play sound.
+Room/profile storage, REW import and analysis, and shared MCP/HTTP state are
+implemented. Newer source adds persistent 2.1 configuration, a real ALSA microphone
+adapter and correction prepare/apply/rollback/verify. Local tests and actual
+CamillaDSP file renders exercise those software paths; they are not acoustic proof.
+Hardware configuration apply remains blocked, no qualified live microphone is
+established, and no live capture → correction → remeasurement improvement is claimed.
+UMIK-style capture is intended, not hardware-qualified.
 
-**Implemented in newer source, awaiting physical acceptance:** persistent 2.1
-routing and crossover configuration, correction prepare/apply/rollback/verify,
-and a real ALSA microphone-capture adapter. Local tests and actual CamillaDSP
-file-output renders exercise these software paths, not the room. Hardware
-configuration apply remains blocked; file-only acceptance does not authorize it.
-
-No qualified live microphone, commissioned subwoofer output or successful live
-capture → correction → remeasurement result is established. UMIK-style measurement
-is intended, not hardware-qualified. There is no claim of fully automatic bass
-optimization, acoustic improvement or a clean-install production release. Query
-the running server's capabilities rather than assuming source equals deployment.
-See the [capability map](docs/publication.md) for exact boundaries.
-
-## Before installing
-
-**Never run test signals, increase amplifier gains or calibrate unattended.**
-Missing hardware, authority or verified routing must fail closed.
-
-The reference target is Linux amd64 with Docker Engine and recent Docker Compose
-(overrides use `!reset`), trusted LAN access and SSH administration. Python 3.13+
-is the application target; macOS software checks do not qualify Linux USB audio.
-
-The audio configuration targets an identity-verified **Behringer UMC1820**. Its
-observed Linux playback PCM is 12-channel, S24_3LE at 48 kHz; historical 20-channel
-software templates are not evidence of the physical jack map. The commissioned
-stereo uses OUT3/OUT4. Intended 2.1 wiring adds OUT5 to a powered subwoofer's
-line/LFE input—**do not enable it before physical commissioning**. The reference
-speakers are Fosi V3 amplification, Klipsch R-28F mains and an R-12SW sub; these
-speaker models are not themselves prerequisites for other safely commissioned rigs.
-
-Music Assistant onboarding and Spotify terms, OAuth or provider-key steps belong
-to the human account owner. Automated measurement additionally needs a compatible
-ALSA microphone with verified identity, orientation and calibration—not simply an
-available capture input. REW text import is the alternative for external measurements.
+The latest source and the running deployment may differ. Discover actual capabilities
+before acting; a successful build is not a clean hardware installation or a verified
+USB-fault recovery. See the [capability map](docs/publication.md) for details.
 
 ## One-time setup
+
+**Never run test signals, increase amplifier gains or calibrate unattended.**
+Missing hardware, authority or verified routing must fail closed. For a new build,
+complete the host/device prerequisites before activating the audio stack; software
+checks on macOS do not qualify Linux hardware.
 
 1. Clone the repository and review [Docker installation](docs/docker-install.md)
    and [device isolation](docs/dac-isolation.md). Existing installations must use
@@ -187,10 +283,10 @@ available capture input. REW text import is the alternative for external measure
    Missing image variables are actionable prerequisites, not permission to use an
    unrelated cached image. Review [container topology](docs/container-audio.md)
    and hardware/boot overlays before any operator-authorized activation.
-5. Finish MA/Spotify onboarding once, verify the exact player and physical map with
-   low fixed amplifier gains, and retain a known-good rollback. Open the dashboard
-   at your configured host's port 8098 on trusted Wi-Fi only. HTTP is unencrypted;
-   never publish it to the Internet or proxy the private DSP websocket.
+5. Finish your chosen MA/provider onboarding once, verify the exact player and
+   physical map with low fixed amplifier gains, and retain a known-good rollback.
+   Open the dashboard at your configured host's port 8098 on trusted Wi-Fi only.
+   HTTP is unencrypted; never publish it to the Internet or proxy the private DSP websocket.
 
 ## Connect an agent
 
@@ -209,22 +305,31 @@ actionable errors and authority boundaries: [agent guide](docs/agents.md).
 
 ## Measure → improve → verify → rollback
 
-The correction workflow is designed around evidence, not a one-click “optimize”:
+For example, suppose bass sounds boomy at your workbench but thin at a nearby chair.
+Rather than asking an agent to “fix the bass” from that description alone:
 
-1. **Plan:** record channels, listening positions, microphone orientation and
-   calibration provenance. Read readiness before requesting acquisition.
-2. **Measure:** import qualified REW responses, or use hardware capture only when
-   the server reports it supported and ready. Capture needs a root-pinned microphone
-   policy, exclusive device ownership and independent human approval of the exact
-   bounded test. Public/container human approval is not currently available.
-   Agents cannot self-attest presence or approve their own tests.
-3. **Improve:** inspect capture quality, analyze and prepare conservative cuts.
-   Unknown timing does not justify inferred delay. Review the exact proposed change;
-   preparing it is not permission to apply it to hardware or start sound.
-4. **Verify:** compare matching, newly acquired after measurements. A predicted
-   curve or successful file render is not measured improvement.
-5. **Keep or roll back:** retain original measurements and configuration history.
-   Cancel stops owned test work; stale proposals require fresh readback and validation.
+1. **Plan the question.** Ask it to create a room record and listening plan for those
+   positions, identify the channels to measure and retain separate verification
+   positions. You confirm the physical layout and microphone placement; a photo
+   annotation is not a distance measurement.
+2. **Bring real data.** Take attended measurements with a calibrated microphone and
+   export REW text responses. Ask the agent to import each with its channel, position,
+   sample rate and calibration provenance. Inspect the same curves in the dashboard.
+   Automated capture is only an option when the server reports hardware readiness:
+   it needs root-pinned microphone policy, exclusive ownership and independent approval
+   of the exact bounded test. Public/container human approval is not currently available.
+3. **Review a correction, not a promise.** Ask for an analysis of the imported peaks
+   and conservative cut-only EQ. Inspect the proposed filters and electrical preview.
+   Do not boost a null or infer delay from data with unknown timing. A useful result
+   may be “leave this unchanged” rather than inventing an improvement.
+4. **Prepare and apply only where supported.** Have the agent show the exact prepared
+   correction, current configuration and rollback path. It must report missing
+   authority rather than treating your chat reply as a sound grant. Current file-only
+   apply acceptance does not authorize applying to your speakers or starting playback.
+5. **Remeasure and decide.** After an authorized physical change, acquire matching
+   new measurements and compare them using the verification workflow. Keep the change
+   only on actual evidence; otherwise use the supported, freshly validated rollback.
+   Originals and history remain available. Cancel stops owned test work, not history.
 
 Subwoofer routing follows the same principle: a saved crossover or trim does not
 verify a cable, commission a jack or prove better bass. See
