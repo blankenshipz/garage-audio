@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+export PIPEWIRE_RUNTIME_DIR=/run/garage-audio/pipewire
+export PIPEWIRE_REMOTE=garage-pipewire
+export XDG_RUNTIME_DIR=$PIPEWIRE_RUNTIME_DIR
+export ALSA_CONFIG_PATH=/app/audio/asound.conf
+mkdir -p "$PIPEWIRE_RUNTIME_DIR"
+chmod 0770 "$PIPEWIRE_RUNTIME_DIR"
+pipewire -c /app/audio/pipewire.conf &
+pw=$!
+trap 'kill "$pw" "${player:-$pw}" 2>/dev/null || true; wait || true' EXIT INT TERM
+for i in $(seq 1 100); do
+  [ ! -S "$PIPEWIRE_RUNTIME_DIR/garage-pipewire" ] || break
+  sleep .1
+done
+# PipeWire defaults its socket to0755: a different device-worker UID needs
+# write access. Only this private volume's fixed control group is admitted.
+chgrp 1003 "$PIPEWIRE_RUNTIME_DIR/garage-pipewire"
+chmod 0660 "$PIPEWIRE_RUNTIME_DIR/garage-pipewire"
+# A no-hardware policy manager provides ordinary client-node linking.
+export XDG_STATE_HOME=/tmp/wireplumber-state
+export XDG_CACHE_HOME=/tmp/wireplumber-cache
+dbus-run-session -- wireplumber &
+squeezelite -n "Garage Speakers FILE" -m 02:00:00:00:21:01 \
+  -s "${MA_SLIMPROTO_HOST:-music-assistant}:3483" -o garage_music \
+  -r 48000-48000 -a 80:4:32:1 &
+player=$!
+wait "$player"

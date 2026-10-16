@@ -1,0 +1,58 @@
+# Candidate private topology. LAN discovery/cutover remain unqualified.
+services:
+  music-assistant:
+    network_mode: !reset null
+    networks: [audio-backend]
+  audio-volume-init:
+    image: ${AUDIO_IMAGE:?immutable audio image required}
+    user: "0:0"
+    network_mode: none
+    restart: "no"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, DAC_OVERRIDE]
+    entrypoint: ["sh", "-c", "mkdir -p /run/garage-audio/public /run/garage-audio/events /run/garage-audio/pipewire /evidence; chown 1002:1003 /run/garage-audio/public /evidence; chown 1002:1001 /run/garage-audio/events; chown 1001:1003 /run/garage-audio/pipewire; chmod 0710 /run/garage-audio/public /run/garage-audio/events; chmod 0770 /run/garage-audio/pipewire; chmod 0750 /evidence"]
+    volumes: [audio-public:/run/garage-audio/public, audio-events:/run/garage-audio/events, audio-pipewire:/run/garage-audio/pipewire, audio-evidence:/evidence]
+  audio-transport:
+    image: ${AUDIO_IMAGE:?immutable audio image required}
+    user: "1001:1001"
+    group_add: ["1003"]
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    tmpfs: ["/tmp:rw,nosuid,size=32m"]
+    entrypoint: ["sh", "/app/audio/container-transport"]
+    volumes: [audio-pipewire:/run/garage-audio/pipewire]
+    networks: [audio-backend]
+    depends_on:
+      audio-volume-init: {condition: service_completed_successfully}
+  audio-device:
+    image: ${AUDIO_IMAGE:?immutable audio image required}
+    user: "1002:1003"
+    group_add: ["1001"]
+    init: true
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 32
+    network_mode: none
+    environment:
+      PIPEWIRE_RUNTIME_DIR: /run/garage-audio/pipewire
+      PIPEWIRE_REMOTE: garage-pipewire
+      XDG_RUNTIME_DIR: /run/garage-audio/pipewire
+    tmpfs: ["/tmp:rw,nosuid,size=16m"]
+    volumes: [audio-public:/run/garage-audio/public, audio-events:/run/garage-audio/events, audio-pipewire:/run/garage-audio/pipewire, audio-evidence:/evidence]
+    depends_on:
+      audio-volume-init: {condition: service_completed_successfully}
+  dashboard:
+    environment:
+      GARAGE_AUDIO_CONTROL_SOCKET: /run/garage-audio/public/control.sock
+    volumes: [audio-public:/run/garage-audio/public:ro]
+volumes:
+  audio-public: {}
+  audio-events: {}
+  audio-pipewire: {}
+  audio-evidence: {}
+networks:
+  audio-backend: {}

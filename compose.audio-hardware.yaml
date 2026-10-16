@@ -1,0 +1,12 @@
+# RELEASE-GATED hardware overlay. Never use for FILE CI or before exclusive quiet cutover.
+services:
+  audio-device:
+    command: ["python", "-m", "garage_audio.audio_container", "--mode", "hardware"]
+    devices:
+      - ${GARAGE_AUDIO_PCM_NODE:?bootstrap exact PCM node required}:${GARAGE_AUDIO_PCM_NODE}:rw
+      - ${GARAGE_AUDIO_CONTROL_NODE:?bootstrap exact control node required}:${GARAGE_AUDIO_CONTROL_NODE}:r
+    volumes:
+      - /dev/snd:/host-snd:ro
+      - /proc/asound:/host-asound:ro
+      - /etc/garage-audio/docker-device.json:/device-policy.json:ro
+      - /var/lib/garage-audio/device-lock:/device-lock:ro

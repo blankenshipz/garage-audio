@@ -137,6 +137,7 @@ class ConnectAdapter:
         self._monitor = None
         self._queue_task = None
         self._closed = False
+        self._pause_cancellation = None
 
     def _wrap(self, instance, name, wrapper):
         original = getattr(instance, name)
@@ -200,10 +201,19 @@ class ConnectAdapter:
                             # Persist only through the exact MA process gateway;
                             # same-UID files/local WS callers cannot replace it.
                             await self.bridge.observe_volume(receiver_volume)
+                        preparation=self.authority._token
+                        preparing=self.authority.state=='preparing'
                         fresh=self.authority.event(binding, self.sequence, event.type,
                             status=getattr(data, 'status', None),
                             logged_in=getattr(data, 'logged_in', None),
                             active=getattr(data, 'is_active', None))
+                        if (event.type=='playback_changed' and getattr(data,'status',None)=='paused'
+                                and preparing and preparation is not None and not preparation._used
+                                and self.authority._token is preparation and not self.authority._closed
+                                and self.authority._logged_in and self.authority._active
+                                and self._queue_task is not None):
+                            self._pause_cancellation=(self._queue_task,preparation,binding,
+                                                      self.authority.generation,self.sequence)
                         # Receiver Pause is conveyed BEFORE normalized MA Stop
                         # /EOF can race queue teardown. revoke() must not await
                         # a network/DSP lock; bridge owns the native Stop barrier.
@@ -298,6 +308,8 @@ class ConnectAdapter:
                     return  # stale normalized PLAYING/generic source cannot start
                 task = asyncio.current_task()
                 self._queue_task = task
+                binding=self.authority.binding
+                generation=self.authority.generation
                 try:
                     trace('source_handoff',phase='prepare_begin')
                     graph = await self.bridge.prepare(token)
@@ -316,10 +328,32 @@ class ConnectAdapter:
                         _handoff.reset(context)
                 except BaseException as error:
                     trace('source_handoff_error',error=type(error).__name__,authority=self.authority.state)
-                    self.authority.revoke()
-                    self.bridge.revoke()
+                    def owns():
+                        return (self._queue_task is task and self.authority.binding==binding
+                                and self.authority.generation==generation and self.authority._token is token)
+                    def paused_here():
+                        return (owns() and isinstance(error,asyncio.CancelledError)
+                                and self._pause_cancellation is not None
+                                and self._pause_cancellation[:4]==(task,token,binding,generation)
+                                and self._pause_cancellation[4]<=self.authority.sequence
+                                and not token._used and not self._closed and not self.authority._closed
+                                and self.authority.state=='paused' and self.authority._logged_in
+                                and self.authority._active and not self.authority._local_poison
+                                and client.connected and self._listener is not None and not self._listener.done())
+                    recover=False
+                    if paused_here():
+                        try:recover=await self.bridge.verify_preparation_pause(binding)
+                        except BaseException:recover=False
+                    # No await between the second ownership check and invalidation. A newer
+                    # event/task/epoch cannot be reopened or torn down by this stale cancellation.
+                    if owns():
+                        if recover and paused_here():self.authority.end_window(reopen=True)
+                        else:self.authority.revoke()
+                        self.bridge.revoke()
                     raise
                 finally:
+                    if self._pause_cancellation and self._pause_cancellation[0] is task:
+                        self._pause_cancellation=None
                     if self._queue_task is task:self._queue_task = None
             return wrapped
 

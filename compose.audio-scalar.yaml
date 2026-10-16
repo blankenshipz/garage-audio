@@ -1,0 +1,24 @@
+# Qualification ONLY; apply LAST. Operator must inspect the realized no-device plan.
+# No actual Spotify Play until reviewed image + FIFO/readers + stage probes are ready.
+services:
+  audio-device:
+    entrypoint: ["python", "-m", "garage_audio.audio_container"]
+    command: ["--mode", "scalar"]
+    devices: !reset []
+    device_cgroup_rules: !reset []
+    privileged: false
+    cap_add: !reset []
+    cap_drop: !override [ALL]
+    network_mode: none
+    restart: "no"
+    environment:
+      GARAGE_AUDIO_QUALIFICATION_POLICY: /qualification-policy.json
+      GARAGE_AUDIO_QUALIFICATION_STORE: /qualification
+    volumes: !override
+      - audio-public:/run/garage-audio/public
+      - audio-events:/run/garage-audio/events
+      - audio-pipewire:/run/garage-audio/pipewire
+      - audio-evidence:/evidence
+      - ${GARAGE_AUDIO_NETWORK_AUTHORITY_DIR:?actual current generation required}:/network:ro
+      - ${GARAGE_AUDIO_QUALIFICATION_POLICY:?explicit host-root-issued attempt required}:/qualification-policy.json:ro
+      - ${GARAGE_AUDIO_QUALIFICATION_STORE:?private UID1002 ledger required}:/qualification

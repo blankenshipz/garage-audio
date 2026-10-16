@@ -24,7 +24,11 @@ ROOM_TOOLS = {
     'listening_profile_guide':'listening_profiles.guide',
 }
 
+LIFECYCLE_TOOLS = {'calibration_import_capture':'calibration.capture.import',
+    **{f'calibration_correction_{op}':f'calibration.correction.{op}' for op in ('prepare','get','apply','rollback','verify')}}
+
 TOOL_INPUT_SCHEMAS = {
+    **{name:OPERATION_SCHEMAS[op] for name,op in LIFECYCLE_TOOLS.items()},
     **{name:OPERATION_SCHEMAS[op] for name,op in ROOM_TOOLS.items()},
     'garage_operation':object_schema({'operation':{'type':'string','enum':list(SCHEMAS)},'args':{'type':'object'}}),
     'garage_capabilities':object_schema({}), 'garage_status':object_schema({}),
@@ -160,6 +164,36 @@ def calibration_propose(id: str) -> dict:
 def calibration_cancel(id: str) -> dict:
     """Terminally cancel offline workflow, retaining original imports; no sound authority exists to revoke."""
     return call('calibration.cancel',{'id':id})
+
+@server.tool()
+def calibration_import_capture(job_id: str) -> dict:
+    """Import retained QC-qualified measured hardware capture; synthetic jobs cannot be promoted."""
+    return call('calibration.capture.import',{'job_id':job_id})
+
+@server.tool()
+def calibration_correction_prepare(id: str) -> dict:
+    """Bind current cut-only proposal to a FILE configuration transaction. Hardware authority is not bypassed."""
+    return call('calibration.correction.prepare',{'id':id})
+
+@server.tool()
+def calibration_correction_get(id: str) -> dict:
+    """Read durable transaction and actual runtime configuration; next-Play acceptance is not acoustic proof."""
+    return call('calibration.correction.get',{'id':id})
+
+@server.tool()
+def calibration_correction_apply(id: str) -> dict:
+    """Validate/accept a prepared FILE correction for next Play, journaling intent first; never starts sound."""
+    return call('calibration.correction.apply',{'id':id})
+
+@server.tool()
+def calibration_correction_rollback(id: str) -> dict:
+    """Restore prior FILE configuration only if the current revision still belongs to this transaction."""
+    return call('calibration.correction.rollback',{'id':id})
+
+@server.tool()
+def calibration_correction_verify(id: str, after_id: str | None = None) -> dict:
+    """Compare paired correction-bound acquired magnitudes. Synthetic fixtures cannot prove acoustic improvement."""
+    return call('calibration.correction.verify',{'id':id,**({'after_id':after_id} if after_id is not None else {})})
 
 @server.resource('garage://capabilities')
 def capabilities_resource() -> str:

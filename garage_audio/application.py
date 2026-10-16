@@ -11,14 +11,16 @@ import time
 import uuid
 from urllib.parse import urlsplit
 from jsonschema import Draft202012Validator
-from . import calibration, ipc, rew, measurement, measurement_route
+from . import calibration, ipc, rew, measurement, measurement_route, measurement_hardware
 from .profile import DEFAULT, number, validate
 from .human_authority import HumanVerifier
 from .measurement_jobs import Jobs, JobFailure
 from .room_profiles import Store as RoomProfileStore, DomainFailure, SCHEMAS as ROOM_SCHEMAS, OPERATION_SCHEMAS as ROOM_OPERATION_SCHEMAS
 from .agent_harness import Store as AgentStore, AgentFailure, SCHEMAS as AGENT_SCHEMAS, OPERATION_SCHEMAS as AGENT_OPERATION_SCHEMAS
 from . import commissioning_proof
-from . import offline_candidate
+from . import offline_candidate, private_records, setup, audio_public, spotify_setup
+from . import calibration_lifecycle
+from . import runtime_readback
 
 SCHEMAS = {
     'status':([],[]), 'capabilities':([],[]), 'sessions.list':([],[]),
@@ -37,6 +39,7 @@ SCHEMAS = {
     **{f'calibration.{op}':(['id'],[]) for op in ('get','analyze','propose','cancel')},
     'jobs.request':(['session_id','position','channel'],['adapter']),
     'jobs.list':([],[]), **{f'jobs.{op}':(['id'],[]) for op in ('get','execute','cancel')},
+    'measurement.hardware.status':([],[]),
 }
 
 def object_schema(properties, required=None):
@@ -78,6 +81,14 @@ SCHEMAS.update(commissioning_proof.SCHEMAS)
 OPERATION_SCHEMAS.update(commissioning_proof.OPERATION_SCHEMAS)
 SCHEMAS.update(offline_candidate.SCHEMAS)
 OPERATION_SCHEMAS.update(offline_candidate.OPERATION_SCHEMAS)
+SCHEMAS.update(setup.SCHEMAS)
+OPERATION_SCHEMAS.update(setup.OPERATION_SCHEMAS)
+SCHEMAS.update(audio_public.SCHEMAS)
+OPERATION_SCHEMAS.update(audio_public.OPERATION_SCHEMAS)
+SCHEMAS.update(spotify_setup.SCHEMAS)
+OPERATION_SCHEMAS.update(spotify_setup.OPERATION_SCHEMAS)
+SCHEMAS.update(calibration_lifecycle.SCHEMAS)
+OPERATION_SCHEMAS.update(calibration_lifecycle.OPERATION_SCHEMAS)
 
 MAX_RECORD_BYTES = 4 * 1024 * 1024
 MAX_STORAGE_BYTES = 32 * 1024 * 1024
@@ -100,7 +111,8 @@ def private_token(path):
 class Application:
     def __init__(self, root, broker=ipc.request, *, human_reference=None, job_options=None):
         self.root = Path(root)
-        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with private_records.directory(self.root,create=True):
+            pass  # Validate root before any child store can mutate state.
         self.broker = broker
         self.lock = threading.RLock()
         self.human_approval_available = False
@@ -117,11 +129,15 @@ class Application:
 
     def read(self, collection, identifier):
         p = self.path(collection,identifier)
-        if not p.is_file() or p.is_symlink():
+        try:
+            with private_records.directory(self.root, collection) as fd:
+                return private_records.read(fd, p.name, MAX_RECORD_BYTES)
+        except FileNotFoundError:
             raise Requirement('not_found','Record not found',[])
-        if p.stat().st_size > MAX_RECORD_BYTES:
-            raise Requirement('storage_limit','Record exceeds bounded retrieval limit',['Operator must archive oversized state; no content is silently truncated'])
-        return json.loads(p.read_text())
+        except private_records.RecordLimit:
+            raise Requirement('storage_limit','Record exceeds bounded retrieval limit',['Operator must archive oversized state; no content is silently truncated']) from None
+        except (OSError, ValueError):
+            raise Requirement('storage_invalid','Private record unavailable',['Inspect private storage ownership, permissions and record bounds; originals retained']) from None
 
     def session_view(self, record):
         """Revision-gated public projection; private originals are not rewritten."""
@@ -171,38 +187,71 @@ class Application:
             payloads.append((self.path('profile-manifests',record['id']),json.dumps(manifest,allow_nan=False).encode('utf-8')))
         if any(len(data)>MAX_RECORD_BYTES for _,data in payloads):
             raise Requirement('storage_limit','Session or record size limit reached',['Maximum detailed record is 4 MiB; start another session or archive state; originals are never truncated'])
-        current = sum(f.stat().st_size for directory in ('sessions','session-manifests','profiles','profile-manifests') for f in (self.root/directory).glob('*.json') if f.is_file())
-        replaced = sum(target.stat().st_size for target,_ in payloads if target.exists())
-        if current - replaced + sum(len(data) for _,data in payloads) > MAX_STORAGE_BYTES:
+        current = 0
+        replaced = 0
+        for collection_name in ('sessions','session-manifests','profiles','profile-manifests'):
+            with private_records.directory(self.root, collection_name) as fd:
+                for name in os.listdir(fd):
+                    if not name.endswith('.json'): continue
+                    info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    private_records.check(info)
+                    current += info.st_size
+                    if any(target.parent.name == collection_name and target.name == name for target,_ in payloads):
+                        replaced += info.st_size
+        if current - replaced + sum(len(data) for _,data in payloads) + 256 > MAX_STORAGE_BYTES:
             raise Requirement('storage_limit','Aggregate storage limit reached',['Maximum application record storage is 32 MiB; operator archive required; originals are never silently deleted'])
         for target,data in payloads:
+            if target.parent.name in ('session-manifests','profile-manifests'):
+                with private_records.directory(self.root,collection) as fd:
+                    source_stat = os.stat(p.name,dir_fd=fd,follow_symlinks=False)
+                    private_records.check(source_stat)
+                projection = json.loads(data)
+                projection['_record_identity'] = {'inode':source_stat.st_ino,
+                    'mtime_ns':source_stat.st_mtime_ns,'size':source_stat.st_size}
+                data = json.dumps(projection,allow_nan=False).encode('utf-8')
+            if target.exists() and self.read(target.parent.name,target.stem) == json.loads(data):
+                continue
             self.write_atomic(target,data)
         if session_changed and hasattr(self,'jobs'):
             self.jobs.invalidate_session(record['id'])
         return self.session_view(record) if collection == 'sessions' else record
 
     def write_atomic(self, p, data):
-        p.parent.mkdir(mode=0o700,exist_ok=True)
-        temp = p.with_suffix('.tmp')
-        fd = os.open(temp,os.O_CREAT|os.O_TRUNC|os.O_WRONLY,0o600)
-        with os.fdopen(fd,'wb') as f:
-            f.write(data); f.flush(); os.fsync(f.fileno())
-        os.replace(temp,p)
+        if p.parent.parent != self.root or not re.fullmatch(r'[a-f0-9]{32}\.json',p.name):
+            raise ValueError('Invalid record path')
+        with private_records.directory(self.root, p.parent.name) as fd:
+            private_records.write(fd, p.name, data)
 
     def count(self, collection):
-        return sum(1 for p in (self.root/collection).glob('*.json') if p.is_file() and not p.is_symlink())
+        with private_records.directory(self.root, collection) as fd:
+            names = [name for name in os.listdir(fd) if name.endswith('.json')]
+            for name in names: private_records.check(os.stat(name,dir_fd=fd,follow_symlinks=False))
+            return len(names)
 
     def records(self, collection):
         directory = self.root / collection
         result = []
-        paths = sorted(directory.glob('*.json'))
+        with private_records.directory(self.root, collection) as fd:
+            paths = [directory/name for name in sorted(os.listdir(fd)) if name.endswith('.json')]
+            source_identities = {}
+            for p in paths:
+                info = os.stat(p.name,dir_fd=fd,follow_symlinks=False)
+                private_records.check(info)
+                source_identities[p.stem] = {'inode':info.st_ino,'mtime_ns':info.st_mtime_ns,'size':info.st_size}
         if collection == 'sessions' and len(paths) > MAX_SESSIONS:
             raise Requirement('storage_limit','Session list exceeds bounded migration limit',['Operator archive required; maximum 128 sessions'])
         for p in paths:
             if collection in ('sessions','profiles'):
                 manifest_collection = 'session-manifests' if collection == 'sessions' else 'profile-manifests'
                 manifest = self.path(manifest_collection,p.stem)
-                needs_refresh = not manifest.exists() or manifest.stat().st_mtime_ns < p.stat().st_mtime_ns
+                # Exact source identity detects interrupted pair commits without parsing
+                # full REW originals on normal lightweight lists; manifest mtime is not authority.
+                try:
+                    projected = self.read(manifest_collection,p.stem)
+                    needs_refresh = projected.get('_record_identity') != source_identities[p.stem]
+                except Requirement as error:
+                    if error.code != 'not_found': raise
+                    needs_refresh = True
                 if collection == 'sessions' and not needs_refresh:
                     needs_refresh = self.read(manifest_collection,p.stem).get('projection_version') != 1
                 if needs_refresh:
@@ -210,6 +259,7 @@ class Application:
                     # does not call this path or parse any measurement records.
                     self.save(collection,self.read(collection,p.stem))
                 value = self.read(manifest_collection,p.stem)
+                value.pop('_record_identity',None)
                 result.append(self.session_view(value) if collection == 'sessions' else value)
             else:
                 record = self.read(collection,p.stem)
@@ -217,6 +267,11 @@ class Application:
         return result
 
     def policy(self, payload):
+        if audio_public.deployment_mode() == 'docker':
+            if payload['cmd'] not in ('status','mute'):
+                raise Requirement('docker_audio_operation_unavailable','Docker public audio allows silence and status only',
+                                  ['No playback start, DSP apply, volume increase or legacy-native fallback is available'])
+            return audio_public.request('audio.status' if payload['cmd']=='status' else 'audio.stop')
         try:
             if payload['cmd'] not in ('status','mute'):
                 # Explicitly mute first; no restore-unmute authority is forwarded.
@@ -235,16 +290,43 @@ class Application:
                 raise ValueError('missing or unknown argument fields')
             if not Draft202012Validator(OPERATION_SCHEMAS[operation]).is_valid(args):
                 raise ValueError('argument schema violation')
-            with self.lock, (self.root/'application.lock').open('a') as lock:
-                fcntl.flock(lock,fcntl.LOCK_EX)
-                result = self._execute(operation,args)
+            if operation in ('audio.stop','audio.pause'):
+                # Silence-only IPC has no store writes. It must not wait behind
+                # chat, migrations, file jobs or the application persistence lock.
+                return {'ok':True,'result':self._execute(operation,args),'error':None}
+            with self.lock, private_records.directory(self.root) as root_fd:
+                lock_fd = os.open('application.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK,0o600,dir_fd=root_fd)
+                try:
+                    private_records.check(os.fstat(lock_fd))
+                except Exception:
+                    os.close(lock_fd)
+                    raise
+                with os.fdopen(lock_fd,'a') as lock:
+                    fcntl.flock(lock,fcntl.LOCK_EX)
+                    result = self._execute(operation,args)
                 if operation in ('capabilities','status'):
                     result['agent'] = self.agent_harness.status()
                     result.update(measurement_route.readiness())
                     result['human_approval_available'] = self.human_approval_available
                     result['human_approval_unavailable_reason'] = None if self.human_approval_available else self.human_approval_unavailable_reason
+            if operation == 'agent.run':
+                # Persist the user turn under the normal short store boundary,
+                # but NEVER retain the application/flock lock across SDK work.
+                from . import agent_runtime
+                configuration = self.execute('agent.config.get', {})
+                if not configuration['ok']:
+                    return configuration
+                def credential_reader(reference):
+                    if reference != 'application-agent': raise ValueError('unknown credential reference')
+                    return private_token(os.environ['GARAGE_AGENT_TOKEN_FILE'])
+                try:
+                    result['runner'] = asyncio.run(agent_runtime.run_configured(
+                        self, configuration['result'], credential_reader, args['message']))
+                except AgentFailure as error:
+                    if error.code != 'inference_disabled': raise
+                    result['runner'] = {'state':'inference_disabled','provider_called':False}
             return {'ok':True,'result':result,'error':None}
-        except (Requirement,JobFailure,DomainFailure,AgentFailure) as e:
+        except (Requirement,JobFailure,DomainFailure,AgentFailure,audio_public.AudioFailure,spotify_setup.SetupFailure) as e:
             return {'ok':False,'result':None,'error':{'code':e.code,'message':e.message,'requirements':e.requirements}}
         except (ValueError,TypeError,KeyError,OverflowError):
             return {'ok':False,'result':None,'error':{'code':'invalid_arguments','message':'Arguments failed strict validation','requirements':['Use the documented operation schema and bounded supported inputs']}}
@@ -252,6 +334,20 @@ class Application:
             return {'ok':False,'result':None,'error':{'code':'service_unavailable','message':'Operation could not complete','requirements':['Inspect private service diagnostics; no successful hardware action is claimed']}}
 
     def _execute(self, op, a):
+        if op == 'audio.config.get':
+            if audio_public.deployment_mode() != 'docker':
+                raise Requirement('docker_audio_required','Public audio operations require Docker deployment mode',[])
+            return runtime_readback.configuration()
+        if op in calibration_lifecycle.SCHEMAS: return calibration_lifecycle.execute(op,a,self)
+        if op == 'measurement.hardware.status': return measurement_hardware.readiness()
+        if op in spotify_setup.SCHEMAS:
+            return spotify_setup.execute(op,a,self)
+        if op in audio_public.SCHEMAS:
+            if audio_public.deployment_mode() != 'docker':
+                raise Requirement('docker_audio_required','Public audio operations require Docker deployment mode',[])
+            return audio_public.request(op,a)
+        if op in setup.SCHEMAS:
+            return setup.execute(op,a,self)
         if op in offline_candidate.SCHEMAS:
             return offline_candidate.execute(a,self)
         if op in commissioning_proof.SCHEMAS:
@@ -305,11 +401,20 @@ class Application:
         if op == 'capabilities':
             return {'operations':{k:{'required':v[0],'optional':v[1],'input_schema':OPERATION_SCHEMAS[k]} for k,v in SCHEMAS.items()},'attended_authority':False,'calibration':'versioned offline plans, magnitude analysis and cut-only proposals; no capture or acoustic verification','measurement':{'version':1,'sound_disabled':True,'capture_available':False,'prerequisites':measurement.PREREQUISITES},'playback':{'adapter':'official MA client','media_url_semantics':'Official MA play_media with QueueOption.REPLACE; this application never fetches supplied URLs','requirements':['Operator MA credential and allowlisted commissioned GARAGE_MA_PLAYER_ID','Independent trusted human attended authority, bounded duration and revocation (not implemented)'],'sound_actions_available':False}}
         if op == 'status':
+            mode = audio_public.deployment_mode()
+            audio = None
             try:
-                dsp = {'available':True,'readback':self.policy({'cmd':'status'})}
-            except Requirement as e:
+                readback = self.policy({'cmd':'status'})
+                if mode == 'docker':
+                    audio = {'available':True,'readback':readback,'error':None}
+                    dsp = {'available':False,'worker_private':True,'mute':'unknown'}
+                else:
+                    dsp = {'available':True,'readback':readback}
+            except (Requirement,audio_public.AudioFailure) as e:
                 dsp = {'available':False,'error':{'code':e.code,'message':e.message,'requirements':e.requirements},'mute':'unknown'}
-            return {'dsp':dsp,'calibration':{'state':'unverified','sessions':self.count('sessions'),
+                if mode == 'docker': audio = {'available':False,'readback':None,'error':dsp['error']}
+            return {'dsp':dsp,'audio':audio,'deployment_mode':mode,
+                    'calibration':{'state':'unverified','sessions':self.count('sessions'),
                     'analysis_revision':measurement.ANALYSIS_REVISION,'derived_results_validity':'revision-gated read/list; no acoustic verification'},
                     'playback':{'configured':bool(os.environ.get('MA_TOKEN_FILE')),'verified':False},'attended_authority':False}
         if op == 'playback.play_url':

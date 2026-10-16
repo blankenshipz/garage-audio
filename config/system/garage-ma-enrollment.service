@@ -1,0 +1,23 @@
+[Unit]
+Description=Garage human-only MA enrollment private installer
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/garage-audio/ma-enrollment/admission.json
+
+[Service]
+Type=simple
+User=root
+Group=1000
+UMask=0077
+UnsetEnvironment=PYTHONPATH PYTHONHOME PYTHONSTARTUP
+WorkingDirectory=@BOOTSTRAP@
+ExecStart=/usr/bin/python3 -B -m garage_audio.ma_enrollment_installer --config /etc/garage-audio/ma-enrollment/admission.json
+Restart=no
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/run/garage-ma-enrollment /home/zach/garage-audio/state/ma-enrollment
+StandardOutput=null
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

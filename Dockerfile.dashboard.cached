@@ -1,0 +1,15 @@
+# Deployment derivative, NOT a fresh-install base. See docker-install.md.
+# Parent dependencies/provenance must match the snapshot preflight before build.
+ARG BASE_IMAGE=garage-audio-dashboard@sha256:44038332e66f37ddca6a49e049a9c818e3392c06b8f073e29cedaed3e28b82f6
+FROM ${BASE_IMAGE}
+ARG SOURCE_REVISION
+LABEL org.opencontainers.image.description="garage-audio cached-dependency deployment derivative; not fresh-install proof" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      org.garage-audio.parent="sha256:44038332e66f37ddca6a49e049a9c818e3392c06b8f073e29cedaed3e28b82f6"
+COPY --chown=0:0 garage_audio /app/garage_audio
+COPY --chown=0:0 web /app/web
+COPY --chown=0:0 profiles /app/profiles
+COPY --chown=0:0 --chmod=0444 image-provenance.json /app/image-provenance.json
+USER 1000:1000
+EXPOSE 8098
+CMD ["python", "-m", "garage_audio.webserver"]

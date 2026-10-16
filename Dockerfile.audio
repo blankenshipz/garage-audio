@@ -1,0 +1,29 @@
+# Reuse a reviewed Bookworm dashboard/DSP base by immutable digest, not latest.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pipewire pipewire-alsa wireplumber squeezelite dbus \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -g 1001 garage-transport && groupadd -g 1003 garage-control \
+    && useradd -u 1001 -g 1001 -G 1003 -M garage-transport \
+    && useradd -u 1002 -g 1003 -M garage-device
+COPY --chmod=0444 garage_audio/audio_container.py /app/garage_audio/audio_container.py
+COPY --chmod=0444 garage_audio/audio_config.py /app/garage_audio/audio_config.py
+COPY --chmod=0444 garage_audio/audio_qualification.py /app/garage_audio/audio_qualification.py
+COPY --chmod=0444 garage_audio/audio_observer.py /app/garage_audio/audio_observer.py
+COPY --chmod=0444 garage_audio/audio_device.py /app/garage_audio/audio_device.py
+COPY --chmod=0444 garage_audio/audio_child.py /app/garage_audio/audio_child.py
+COPY --chmod=0444 garage_audio/audio_boot_wait.py /app/garage_audio/audio_boot_wait.py
+COPY --chmod=0444 garage_audio/audio_zero_check.py /app/garage_audio/audio_zero_check.py
+COPY --chmod=0444 garage_audio/audio_scalar.py garage_audio/audio_receiver.py garage_audio/audio_boot.py garage_audio/audio_network.py /app/garage_audio/
+COPY --chmod=0444 config/pipewire.conf /app/audio/pipewire.conf
+COPY --chmod=0444 config/asound.conf /app/audio/asound.conf
+COPY --chmod=0555 scripts/container-transport /app/audio/container-transport
+RUN chmod 0555 /app/audio
+COPY --chmod=0444 config/wireplumber-container.lua /etc/wireplumber/main.lua.d/51-garage-private.lua
+RUN chmod 0555 /etc/wireplumber /etc/wireplumber/main.lua.d
+COPY --chmod=0444 config/wireplumber-container-bluetooth.lua /etc/wireplumber/bluetooth.lua.d/51-garage-private.lua
+RUN chmod 0555 /etc/wireplumber/bluetooth.lua.d
+USER 1002:1003
+CMD ["python", "-m", "garage_audio.audio_container"]

@@ -31,6 +31,9 @@ def worker(directory, behavior, expected_parent, control_fd, epoch):
     guard()
     manifest = json.loads(artifacts.read(directory,'manifest.json',262144))
     if manifest['server_epoch'] != epoch: raise RuntimeError('epoch mismatch')
+    if manifest.get('adapter') == 'hardware':
+        from .measurement_hardware import capture
+        return capture(directory,manifest,guard)
     spec = manifest['signal']
     if behavior == 'crash': os._exit(17)
     if behavior in ('hang','slow'):

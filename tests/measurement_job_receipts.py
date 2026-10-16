@@ -12,7 +12,10 @@ def retain_jobs(app, label):
         target = root/job['id']; target.mkdir(mode=0o700,exist_ok=True)
         path = target/'public-job.json'; path.write_text(json.dumps(job,sort_keys=True,allow_nan=False)); path.chmod(0o600)
         source = app.jobs.directory(job['id'])
-        for name in ('manifest.json','excitation.wav','capture.wav','evidence.json','guardian-exit.json','child.stdout','child.stderr'):
+        for name in ('manifest.json','excitation.wav','capture.wav','evidence.json','guardian-exit.json','child.stdout','child.stderr',
+                     'microphone.raw','output.raw','record.stderr','play.stderr','hardware-exit.json','hardware-admission.json','microphone-calibration.txt','parent-reap.json'):
             if (source/name).is_file(): shutil.copy2(source/name,target/name)
         for path in source.glob('native*'):
+            if path.is_file(): shutil.copy2(path,target/path.name)
+        for path in source.glob('correction*'):
             if path.is_file(): shutil.copy2(path,target/path.name)

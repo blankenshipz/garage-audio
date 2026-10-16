@@ -1,0 +1,3 @@
+# Recreate only the private socket DIRECTORY before normal Docker startup.
+# Never age/remove credentials, journals, socket contents or reader directories.
+d /run/garage-ma-enrollment 0710 root 1000 -

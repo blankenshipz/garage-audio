@@ -1,0 +1,173 @@
+{
+  "base_image": "ghcr.io/music-assistant/server@sha256:28023f8c0d96ca2496391f3218a6d70d7ef3ba84db846b3a3f3cd9ce7ef8aedc",
+  "mode": "volume_mode=spotify_authoritative",
+  "patch_sha256": "2c3530213db3fa11d84ed7240bed5c5ca4e39ea579e52e28004cc5408384d252",
+  "pr_url": null,
+  "public_diff_files": [
+    "music_assistant/providers/spotify_connect/provider.py",
+    "music_assistant/providers/spotify_connect/soloist/README.md",
+    "music_assistant/providers/spotify_connect/soloist/__init__.py",
+    "music_assistant/providers/spotify_connect/soloist/backend.py",
+    "music_assistant/providers/spotify_connect/strings.json",
+    "music_assistant/translations/en.json",
+    "tests/providers/spotify_connect/test_provider.py",
+    "tests/providers/spotify_connect/test_spotify_authoritative_volume.py"
+  ],
+  "runtime_files": {
+    "music_assistant/providers/spotify_connect/provider.py": {
+      "base": "ff9cf0bf8ebc7c6c456bbc66f637cf496770fc45e2c697ff110b0ae4d31f1404",
+      "hunk_positions": [
+        {
+          "new": 52,
+          "old": 52
+        },
+        {
+          "new": 93,
+          "old": 92
+        },
+        {
+          "new": 170,
+          "old": 168
+        },
+        {
+          "new": 456,
+          "old": 452
+        },
+        {
+          "new": 606,
+          "old": 599
+        },
+        {
+          "new": 791,
+          "old": 782
+        },
+        {
+          "new": 967,
+          "old": 952
+        },
+        {
+          "new": 1010,
+          "old": 990
+        },
+        {
+          "new": 1036,
+          "old": 998
+        },
+        {
+          "new": 1075,
+          "old": 1043
+        },
+        {
+          "new": 1210,
+          "old": 1176
+        },
+        {
+          "new": 1253,
+          "old": 1205
+        },
+        {
+          "new": 1276,
+          "old": 1226
+        }
+      ],
+      "result": "f05c1fbd127de18f0c124a062a9bc3e0ada2a791ca0b3919c3818bf638eb07d3"
+    },
+    "music_assistant/providers/spotify_connect/soloist/README.md": {
+      "base": "9c6f23c2e6938fb1bbd1df3b922b1dc54bfc2934f8e29634ea68859af13f19a9",
+      "hunk_positions": [
+        {
+          "new": 77,
+          "old": 77
+        }
+      ],
+      "result": "ab025dc2b58261fd8f2c1f2e0987cd32794ac874aff07facb36bb6b5d828238e"
+    },
+    "music_assistant/providers/spotify_connect/soloist/__init__.py": {
+      "base": "6613f75c7f8e3521ba40b125b5c4cacd5d001412d94413431767d62cf9cd85e6",
+      "hunk_positions": [
+        {
+          "new": 1,
+          "old": 1
+        },
+        {
+          "new": 20,
+          "old": 19
+        }
+      ],
+      "result": "5c1c54bd9091158aab0d9aca416927857b5039a623f5aa40b03765db386cf634"
+    },
+    "music_assistant/providers/spotify_connect/soloist/backend.py": {
+      "base": "57176b27125b0bc3065685e39b0e96e464b7ac0aae2bf7c033bdee8987942adc",
+      "hunk_positions": [
+        {
+          "new": 81,
+          "old": 81
+        },
+        {
+          "new": 161,
+          "old": 160
+        },
+        {
+          "new": 211,
+          "old": 209
+        },
+        {
+          "new": 426,
+          "old": 421
+        },
+        {
+          "new": 747,
+          "old": 740
+        },
+        {
+          "new": 762,
+          "old": 751
+        },
+        {
+          "new": 851,
+          "old": 825
+        },
+        {
+          "new": 897,
+          "old": 835
+        },
+        {
+          "new": 948,
+          "old": 881
+        },
+        {
+          "new": 986,
+          "old": 911
+        },
+        {
+          "new": 1002,
+          "old": 922
+        }
+      ],
+      "result": "dec27f43fc5627728c60b28783a6d6a0fd54de16b71aa964f7aca7bc197f1b70"
+    },
+    "music_assistant/providers/spotify_connect/strings.json": {
+      "base": "b2d93de3c37ca12fc65bec981f8d1454a30e1bf6e3e1f66f12559fbdfcc6e7e6",
+      "hunk_positions": [
+        {
+          "new": 29,
+          "old": 29
+        }
+      ],
+      "result": "f359f31110cc18b124f24890b1357263258bff0c609e46a443f5ba29eb3b0bbb"
+    },
+    "music_assistant/translations/en.json": {
+      "base": "e71975ad5003bac5b977c6b2be37edfb37a85f309357609c11dcae2cc50feb1e",
+      "hunk_positions": [
+        {
+          "new": 2399,
+          "old": 2399
+        }
+      ],
+      "result": "541f896a677343f5aade4862cc5d381a66cc46dcd6541c97b3d204d81a99764b"
+    }
+  },
+  "runtime_qualified": false,
+  "temporary_pending_release": true,
+  "upstream_commit": "e531b4ffcb9ebabd94e41b5611b816424fe03723"
+}

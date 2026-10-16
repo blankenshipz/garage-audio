@@ -1,8 +1,8 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {STAGES,stageForTarget,stageGuidance} from '../journey.js';
-test('five explicit stages retain existing deep-link IDs',()=>{
-  assert.deepEqual(STAGES,['connect','check','calibration','improve','verify']);assert.equal(stageForTarget('jobs'),'calibration');assert.equal(stageForTarget('profiles'),'check');assert.equal(stageForTarget('diagnostics'),'check');assert.equal(stageForTarget('arbitrary'),null);
+test('chat-first stages retain deep links and separate setup from advanced controls',()=>{
+  assert.deepEqual(STAGES,['connect','setup','check','calibration','improve','verify','advanced']);assert.equal(stageForTarget('jobs'),'calibration');assert.equal(stageForTarget('profiles'),'improve');assert.equal(stageForTarget('diagnostics'),'advanced');assert.equal(stageForTarget('arbitrary'),null);
 });
 test('room and import deep links reveal the correct existing stage',()=>{assert.equal(stageForTarget('room-workspace'),'check');assert.equal(stageForTarget('measurement-import'),'calibration');});
 test('stage guidance never equates copying or navigation with agent connection',()=>{

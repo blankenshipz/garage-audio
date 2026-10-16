@@ -1,0 +1,9 @@
+# Focused no-build FILE check using existing reviewed image plus exact inventoried sources.
+# Never activate with production mounts or the hardware overlay.
+services:
+  audio-device:
+    volumes:
+      - ./garage_audio/audio_container.py:/app/garage_audio/audio_container.py:ro
+      - ./garage_audio/audio_child.py:/app/garage_audio/audio_child.py:ro
+      - ./garage_audio/audio_device.py:/app/garage_audio/audio_device.py:ro
+      - ./garage_audio/audio_observer.py:/app/garage_audio/audio_observer.py:ro

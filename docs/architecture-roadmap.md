@@ -1,9 +1,25 @@
 # Review and Docker-first, chat-first roadmap
 
-October 11, 2026. **Review and plan only: no migration or inference enablement.**
-Music Assistant (MA) retention, paid provider/model and spending budget are still
-open decisions. Existing working music, user accounts, queues, private state and
-the acoustic workspace must survive any later migration.
+October 11, 2026. **Implementation authorized; migration gates pending; inference disabled.**
+Shared intent `garage-audio-docker-chat`, revision 3 selects hidden Music Assistant
+(MA) as the retained Docker playback backend, chat-first UI and app-owned setup.
+Implement configurable agent integration, but make no application inference calls,
+even with ambient credentials. Existing music, accounts, queues, private state,
+acoustic workspace and rollback must survive the staged migration.
+
+**Checkpoint221e7a7 remains historical, not production-ready.** Revision2 user
+authorization permits preparing/testing/submitting the upstream opt-in volume PR
+and using its identical pinned narrow patch locally pending release. Owners are
+active again; affected patch/network/app inputs require a new inventory/refreeze
+after pause. Real DHCP allocation was obtained and released; use fresh renewable
+leases, never the old address. M0/M5/U1 still require actual patch/namespace/receiver
+qualification and clean-install/runtime inputs. No PR acceptance/merge, safe cold
+Play or production readiness is inferred from approval or prior FILE/UI proof.
+Revision3 now explicitly prioritizes deploying the new version: complete essential
+volume/identity/private-boundary/exclusive-owner/candidate/rollback gates, then
+cut over quietly. Do not spend that journey on optional old-stack repairs. A verified
+immutable cached-project derivative is an allowed existing-target build route;
+fresh-install availability/reproducibility claims remain separate and truthful.
 
 ## What exists, rather than a new greenfield app
 
@@ -12,11 +28,12 @@ the acoustic workspace must survive any later migration.
 * `garage_audio.application.Application.execute` is the strict typed operation
   boundary. HTTP and the official Python MCP SDK stdio server share it and its
   persistent state. Existing SSH MCP needs no new public agent listener.
-* `web/` is a dependency-free frontend. Its current home is Connect → Check →
-  Measure → Improve → Verify, not chat. Rooms/photos/annotations, independent
+* `web/` is a dependency-free frontend. The legacy home was Connect → Check →
+  Measure → Improve → Verify; this source now has chat-primary and direct setup.
+  Production still retains its original image. Rooms/photos/annotations, independent
   listening profiles, REW imports, analysis and offline proposals already exist.
-* `agent_harness.py` uses the official OpenAI Agents SDK, bounded local sessions
-  and a read-only room-planner seam. Production inference is unconditionally
+* `agent_harness.py`/`agent_runtime.py` use the official OpenAI Agents SDK, bounded
+  local sessions and shared typed tools/streaming/cancellation. Inference is unconditionally
   disabled. `agent.run` records a message and an honest disabled result, not an
   assistant answer. The deterministic measurement prompt is not model inference.
 * Hardware microphone capture and correction application are not implemented by
@@ -47,12 +64,12 @@ carry forward as a permanent user-facing control surface.
 | A. Keep MA as an internal Docker backend | Retains official Spotify Connect/Soloist integration, source providers, queues, upstream volume/pause control and a path to other sources/players. Existing account and queue state can remain intact. | Another service and state store; version-coupled current hooks. App-owned setup needs supported APIs or a clearly identified provider-owned authorization handoff. Replacing the custom bridge requires an equivalent supported lifecycle boundary, not just moving its page. |
 | B. Direct Spotify receiver → DSP | Could remove MA, Squeezelite and perhaps PipeWire for a single Spotify-only room; phone Spotify remains the daily music UI. Smaller potential runtime and fewer service interactions. | Must qualify a maintained receiver (for example a librespot-based candidate), its supported authentication/account requirements, Spotify compatibility/terms, discovery, volume mapping, stream clocks and event semantics. No direct-receiver implementation or live proof exists here. Our device worker still needs correct cold-start/stop/reconnect enforcement. |
 
-MA is useful if source/library/queue management, additional rooms or other media
-matter. It is not inherently needed for DSP or a single Spotify receiver. For a
-strictly single-room Spotify target, **evaluate B before committing to MA-heavy
-migration**. If broader sources/rooms matter or B cannot meet playback proof,
-choose A as the lower-disruption route. Do not remove the live MA service while
-this comparison is unresolved.
+**Selected: A, hidden MA.** B remains architectural context, not an assigned
+implementation or release dependency in this phase. Keep official Spotify Connect,
+retained MA account/queue state and Spotify-only ordinary playback. Replace the
+custom control-plugin dependency with supported container audio/lifecycle
+integration; hiding its UI alone does not satisfy that requirement. Do not remove
+the live integration before the replacement passes its assigned gates.
 
 For either option, evaluate actual first cold Play, Pause/Resume, Stop, seek and
 position ownership, receiver discovery, reconnect, guest/cross-account use and
@@ -66,9 +83,11 @@ volume control. A direct receiver must feed the DSP, never bypass it to the DAC.
 
 1. Open the app: **chat is the primary page**, with actual connection/readiness
    state, retained conversation and a persistent independent Stop control.
-2. Ask for a useful action. A real agent reads current capabilities/state,
-   explains prerequisites and proposes typed operations. Responses stream from
-   the chosen provider; tool cards show real server acknowledgements/readbacks.
+2. Retain the user's message and show truthful disabled-inference state, never a
+   canned assistant answer. Direct setup/manual actions remain usable and show
+   real server acknowledgements/readbacks. The configurable streaming/tool/cancel
+   integration is implemented behind disabled policy; real provider responses
+   require future authorization and are not acceptance in this phase.
 3. Missing setup opens inline UI cards/forms: device identity and readiness,
    provider credential references/authorization, room/photo labeling or plan
    selection. Advanced details are secondary, not a page of raw MCP JSON.
@@ -103,7 +122,7 @@ ART/Dirac equivalence follows from a friendlier UI.
 * **Agent worker:** bounded real inference/tool loop with cancellation, streaming,
   retained session and explicit operation allowlist. Shares app operations, not
   independent stores or shell tools. Readiness and approvals remain server-owned.
-* **Playback backend:** hidden MA/official Connect (A), or qualified receiver (B).
+* **Playback backend:** selected hidden MA/official Connect (A), not receiver B.
   LAN discovery may require host networking for this specific service; that does
   not justify host networking for every service or exposing all listeners.
 * **Audio engine/device worker:** fixed DSP graph, identity-bound USB access,
@@ -150,13 +169,14 @@ no model, vision or billing calls.
 
 | Gate / lane | User-visible journey and required evidence | Dependency |
 |---|---|---|
-| M0 / product + packaging | Choose A/B and provider/budget. Inventory real installed source/image/config mounts without credentials; reconcile clean setup, required docs/assets and disk/RAM capacity. | Decisions; preserve live installation and rollback state. |
-| M1 / app + agent | Real chat request → allowed typed useful operation → visible server result → cancel/Stop → return/reconnect. Same state read back through real MCP and HTTP/UI. Include denied/missing prerequisites and real provider failures. | Explicit paid-call authorization; isolated app first, no live audio migration. |
-| M2 / audio lifecycle | Candidate container stream → real Camilla FILE output, fixed gain/routing/unused outputs, pause/resume/stop, clocks, stale-event rejection, owner-loss/deadline shutdown and restart. | Chosen backend and redesigned enforcement; synthetic receiver seams stay labeled synthetic. |
-| M3 / target device | Attended UMC exclusive ownership and identity mapping; no fallback/dual owner. Verify device unplug/reconnect, cold start and independent stop/fault guards on target Linux. | M2; explicit attended scope; reserve space for growth/receipts. |
-| M4 / real listening | Genuine phone Spotify cold Play → audible stereo/progress → Pause/Resume without rewind/paused-time jump → Stop → fresh return/reconnect. Also actual second-phone guest/account/takeover checks appropriate to the chosen receiver. | M3 and genuine user observations; desktop/simulator/FILE proof is not phone proof. |
-| M5 / UI | Actual desktop and 390px rendered geometry, keyboard focus/selection/navigation, setup cards, streaming/error/cancel/Stop and retained state after reload. | Real app/backend; unit tests or screen mockups do not prove appearance. |
-| M6 / cutover + rollback | Freeze input inventory/candidate digest; retain private matching backups. Stop old DAC owner before candidate takes it. Verify journey, then exercise rollback without dual ownership or restored stale sound grants. | M1–M5; matching backend/platform, capacity and user-visible interruption plan. |
+| M0 / audio + packaging | Credential-free deployed/config inventory, supported hidden-MA container topology, required assets/pins, Linux device/platform/capacity and retained rollback; document narrow host bootstrap. | Live inventory; no production edit during investigation. |
+| M1 / app + agent | Chat-primary persisted conversation; truthful disabled inference, direct manual/setup actions and configurable bounded streaming/tool/cancel implementation sharing typed operations. | Local executable checks; no provider calls, fake answers or ambient-key bypass. |
+| M2 / audio lifecycle | Actual isolated Docker MA/transport/device worker/Camilla FILE: OFF→fresh start→PCM, Pause/Resume/volume/Stop/restart, snapshot denial/loss watchdog; fixed -6 dB full-range OUT3/4, spare outputs zero. | Local executable software proof; label synthetic receiver seams; no custom MA control plugin. |
+| M3 / app + integration | App-owned setup and real SSH MCP initialize/list/status→useful quiet mutation→same-state MCP and HTTP/UI readback, structured credential/device failures; retain room/photo/profile/calibration provenance. | Live transport, server-owned capabilities; no new token ceremony/public MCP listener or agent sound grant. |
+| M4 / UI | Actual desktop and 390px chat-first geometry, keyboard focus, selected/navigation/setup/error/disabled/cancel/Stop states and reload/reconnect persistence. | Real rendered app/backend; unit checks are not appearance proof. |
+| M5 / audio + integration | Freeze inventoried candidate and matching backend/platform/capacity; quiet exclusive UMC Docker cutover, private raw DSP, restart/no-autoplay, identity/watchdog/recovery/rollback without native app service dependencies. | Paused package writers; M0–M4 relevant gates, narrow host bootstrap, reserve for growth; preserve old deployment and other projects. |
+| M6 / user + root | Real user phone Spotify-only cold Play audible OUT3/4→Pause/Resume correct position→Stop→return/reconnect; second account where accessible. No MA plugin/session/button prerequisite. | M5 and user-performed physical phone/sound observations; FILE/HTTP/browser proof cannot substitute. |
+| U1 / upstream + audio + packaging | Opt-in Spotify-authoritative volume preserves defaults, scoped old-bug/event/grace/echo/reconnect regression proof, focused public PR URL/commit, identical pinned local patch/provenance and actual receiver qualification. | User approved PR/local narrow patch; no private garage material published, no claim merged, no production agent Play. |
 
 Keep old playback available until candidate proof warrants a scoped switch. An
 off-device container may test FILE first without taking the live DAC. Preserve
@@ -164,6 +184,34 @@ failed logs outside shipped artifacts; never relabel old proofs after input chan
 Disk/cache growth is a deployment prerequisite, not permission to prune private
 receipts, MA accounts/cache or unrelated services. The separate existing playback
 task still owns its pending physical-phone acceptance; this review does not close it.
+
+Latest bounded checkpoints, with original identities retained:
+
+* Actual garage MA2.10.5 app-owned Soloist protocol: status/begin/backend selection,
+  terms unchecked, identical MCP/HTTP flow readback and abort passed. No consent,
+  key, download, authentication or provider creation occurred. Source13e30891;
+  `app-spotify-real-protocol-sdegbput`, private
+  `/private/tmp/opencode/garage-spotify-protocol.Wufy7q/result.json`. FILE stayed
+  OFF/closed/no children. Owned app/MA stop required timeout termination; clean
+  app/MA shutdown/restart is not proven by that fixture.
+* New UI web3d38be09 passed actual desktop/390px missing-credential rendering,
+  focus/selected navigation/reload and disabled-flow/Stop availability. The later
+  real authenticated unchecked-terms sandbox also passed desktop/390px refresh,
+  checkbox/nav focus, independent FILE Stop and Cancel; no terms acceptance/key/
+  provider creation. Its original source/frozen identities remain separate. Private render:
+  `/private/tmp/opencode/garage-chat-ui.ngpUH5/spotify-setup-HNj090`.
+  Earlier real FILE-success UI stays attached to original web7851, not relabeled.
+* Changed audio ticket/child wrappers passed actual MA/transport/Camilla FILE at
+  inputs87b8a2a9 on source-mounted cached imageece60bd7; receiver/WAV seam synthetic.
+  `/private/tmp/opencode/garage-audio-audio-next-r1/handoff.md`. Hardware identity,
+  exclusivity/bootstrap code is implemented and metadata checked, but unactivated:
+  no hardware open, unplug/replug, cutover or sound proof.
+* Public source research found the initial MA volume push/three-second grace still
+  present in2.10.6/nightly/dev, capable of raising lower Spotify volume. No supported
+  fix found; holding output OFF does not prevent the upstream slider write. Canonical
+  `/private/tmp/opencode/garage-audio-volume-research/findings.md`. The user now
+  approved upstream PR plus the identical local pinned narrow patch;
+  no zero-volume ritual, second gesture or connect-only guard shortcut substitutes.
 
 ## Review register and bounded validation
 
@@ -177,18 +225,19 @@ and caches do not. The separate acoustic-copilot-gym repository is unchanged.
 
 | ID | State | Finding, evidence and next action |
 |---|---|---|
-| R1 | Open / deployment | Local `compose.yaml` lacks the installed read-only provider/bridge mounts described by `docs/normal-listening.md`. Do not apply it to production. Reconcile a credential-free installed inventory before a migration candidate. |
-| R2 | Open / clean setup | `compose.dashboard.yaml` requires external `garage-audio_default`; host-network MA Compose does not create it. Existing deployment can have a retained network. Define/test one explicit clean-install network topology in M0, not a blind live network edit. |
-| R3 | Open / backend | Custom MA runtime uses private upstream seams. Replace only after A's supported lifecycle interface or B's receiver meets M2–M4. Removing only its UI does not eliminate that dependency. |
+| R1 | Partial / revision2 integration active | Legacy MA/image/state/rollback retained. Real isolated DHCP allocation/release verified; renewable carrier/loss/discovery/private management path still needs qualification. User approved upstream PR+same local pinned patch; exact artifacts awaited. Baseline Compose must not overwrite production. Clean-install config/cutover remain M0/M5 gates. |
+| R2 | Implemented / isolated topology and IPC verified | Dashboard bridges are project-owned, not external `garage-audio_default`; candidate MA uses service DNS, not the stale LAN override. Authorized 8098 bindings remain. App sees only read-only public IPC (UID1000/GID1003), no native/event/transport/DAC mounts. Real r13 FILE topology and staged target app/public IPC passed. Clean production installation/discovery is not inferred from test topology; no production network edit performed. |
+| R3 | Partial / approved upstream patch work | Prior actual FILE replacement proof retains inputs87b8a2a9 and synthetic receiver/WAV label. Current stable/nightly/dev retain upward startup overwrite; user approved focused upstream PR and identical local narrow patch pending release. Upstream owner implements/tests/publishes; audio owner pins/tests identical patch. PR URL/commit/patch SHA and actual Soloist volume/clock remain U1/M0/M5/M6 work. B remains deferred. |
 | R4 | Resolved / docs | Historical README/normal-listening/DAC setup now clearly labeled; latest recorded Connect source set `b81fbf71` is not claimed as phone acceptance. Local authority/adapter/runtime SHA256 prefixes match the recorded deployed set: `52fc05aa`, `1c994a24`, `5d800758`. |
-| R5 | Resolved / checkpoint | Immediate dependency omissions avoided by including project-owned modules, scripts, tests, web and vendor inputs in one coherent source checkpoint. No migration edits to authority/gain architecture. |
+| R5 | Resolved / historical checkpoint, new manifests pending | Historical archive221e7a7 and old component identities retained. Revision2 resumes affected writers; discovered Dockerfile/Compose plus recursive module/config/scripts/vendor/docs inputs avoid silent new-asset omission. Required patch/carrier/apt/official-base manifests must reconcile before strict release-input gate/refreeze. No current new candidate is frozen or deployed. |
 | R6 | Resolved / test environment | Reused local environment had MCP2.x, causing four FastMCP failures. Retained failures; isolated MCP1.30.0/SDK0.23.1 environment passed affected checks. Do not upgrade project MCP implicitly. |
-| R7 | Open / bootstrap | Native builder still requires ignored `tools/` downloads/wheels and Ubuntu library assets; dashboard vendors Bookworm FILE dependencies separately. A Git checkout is not a complete offline native installer. M0 must pin/document matching platform prerequisites; no fresh installation/build proof here. |
-| R8 | Open / storage hardening | Legacy Application session/profile writes use path-based `.tmp` replacement without directory fsync, unlike anchored room/photo/job stores. Private owner-controlled state is assumed. Before broadening writers/import trust, review crash durability and symlink/race handling with focused tests. |
-| R9 | Open / live evidence | Native Linux process/device enforcement, deployed SSH MCP, actual UI geometry and phone/acoustic behavior not rerun here. No production acceptance inferred from local checks. |
+| R7 | Partial / final enrollment app image built; live app/audio cutover open | Original capacity failure retained; specifically authorized existingLV/ext4 +4GiB completed online to104GiB with observederrors0/no deletion/restart. Final backend216bb79a+UIgen6 appa83582fe source990f8baa:88hashes/importsUID1000, full86-file admission map inclprivate_records;4layers803548B/physicalgrowth5283840B, free4395323392B retains2GiB+256MiBreceiver+512MiBtests. No apt/pip/pull/coldcache/newMA/audio build. MAa7af/audio5c62 original1f3 matchingFILE/quietUMCzero receipts reused at original identities. New app-only enrollment/root bootstrap/assets reconciled for final freeze; actual admittedwebserverpeer/negativeHTTP/render/restart/phone and ordinaryaudio credentials/receivergain/exclusivecutover remain open. Fresh-install apt availability separate; see ma-enrollment-deploy and external candidate receipts. |
+| R8 | Implemented / source hardening, bounded evidence | Current Application reads/writes use `private_records` anchored directory FDs, no-follow/private-owner/regular-single-link checks, exclusive temporary creation, file fsync, relative replace and directory fsync; the historical path-based write finding no longer describes this source. App-owner focused storage evidence remains its original checkpoint; staged setup persistence is additional quiet evidence, not comprehensive crash/race certification. Reconcile matching storage receipts at final release. |
+| R9 | Partial / bounded setup/render and clean app lifecycle | Original source13e30891/frozen221e7a7 sandbox identities retained; web3d38 unchanged. App lifecycle scopedbdae7860/webf5959ba6 sourcebound fixture passed pending drain/independent FILEStop/exit0/cancelledchat+uncheckedterms restart/abort; stock official MA separately exit0. Dashboard init retained/grace30s with targeted Compose check; prior137/143/failed runner receipts retained, not relabeled. No consent/key/download/provider creation, patchedMA restart, new immutable candidate, physical activation/Safari/phone/sound proof. |
 | R10 | Accepted / upstream license | Staged whitespace checking flags original spaces/EOF in `vendor/dsp/licenses/ALSA-LGPL-COPYING`. Preserve the upstream license bytes; project-owned files pass the check with that exact license excluded. |
 
-Review depth: all 210 initial repository inputs inventoried/hashed and scanned for
+Historical review-stage evidence (not relabeled as current candidate gates):
+all 210 initial repository inputs inventoried/hashed and scanned for
 common private-key/provider-key/JWT/credential-URL patterns (no hits); all111 Python
 files parsed, JSON syntax checked, all six vendor archive/package hashes verified.
 Focused source reading covered shared operation/auth/HTTP boundaries, disabled

@@ -47,6 +47,7 @@ class Bridge:
     async def pulse(self,*args):return True
     def revoke(self):self.stops+=1
     def pause(self):self.pauses+=1
+    async def verify_preparation_pause(self,binding):return True
 
 class Tests(unittest.IsolatedAsyncioTestCase):
     async def test_trace_private_bounded_and_does_not_record_payloads(self):
@@ -70,7 +71,9 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         self.adapter=adapter.ConnectAdapter(NS(_client=self.client),self.provider,self.daemon,self.bridge)
         self.adapter.install()
         self.seen=[]
-        async def normalized(event):self.seen.append(event.type)
+        async def normalized(event):
+            self.seen.append(event.type)
+            if getattr(self,'seen_callback',None):await self.seen_callback(event)
         self.listener=asyncio.create_task(self.client.listen_events(normalized))
         await asyncio.sleep(0)
         await self.event('auth_state',logged_in=True,is_active=True)
@@ -85,6 +88,123 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         await self.event('playback_state',status='playing',is_active=True)
         await self.provider._deferred_play_media_fire(self.daemon)
         self.assertEqual(self.bridge.preparations,0);self.assertEqual(self.provider.queues,0)
+    async def test_receiver_pause_cancels_actual_queue_then_fresh_play(self):
+        started=asyncio.Event()
+        async def held(token):
+            self.bridge.preparations+=1;started.set();await asyncio.Future()
+        self.bridge.prepare=held
+        await self.play()
+        queue=asyncio.create_task(self.provider._deferred_play_media_fire(self.daemon))
+        await started.wait()
+        # Drive the installed raw listener and normalized callback's real queue cancellation.
+        async def cancel_on_pause(event):
+            if event.type=='playback_changed' and event.data.status=='paused':queue.cancel()
+        # The fixture's normalized callback can model upstream scheduling without replacing adapter.
+        self.seen_callback=cancel_on_pause
+        await self.event('playback_changed',status='paused',is_active=True)
+        with self.assertRaises(asyncio.CancelledError):await queue
+        self.assertFalse(self.adapter.authority._closed)
+        self.assertIsNone(self.adapter.authority._token)
+        await self.event('playback_state',status='playing',is_active=True)
+        await self.provider._deferred_play_media_fire(self.daemon)
+        self.assertEqual(self.provider.queues,0)
+        await self.event('playback_changed',status='paused',is_active=True)
+        await self.event('playback_changed',status='playing',is_active=True)
+        async def fresh(token):self.bridge.preparations+=1;return 'new-fixture-zero'
+        self.bridge.prepare=fresh
+        await self.provider._deferred_play_media_fire(self.daemon)
+        self.assertEqual(self.provider.queues,1)
+    async def preparing_queue(self):
+        started=asyncio.Event()
+        async def held(token):started.set();await asyncio.Future()
+        self.bridge.prepare=held
+        await self.play()
+        task=asyncio.create_task(self.provider._deferred_play_media_fire(self.daemon))
+        await started.wait()
+        return task
+    async def test_unknown_cancellation_remains_terminal(self):
+        task=await self.preparing_queue();task.cancel()
+        with self.assertRaises(asyncio.CancelledError):await task
+        self.assertTrue(self.adapter.authority._closed)
+        await self.play();self.assertIsNone(self.adapter.authority._token)
+    async def paused_verification(self):
+        task=await self.preparing_queue();entered=asyncio.Event();release=asyncio.Event()
+        async def verify(binding):entered.set();await release.wait();return True
+        self.bridge.verify_preparation_pause=verify
+        async def cancel(event):
+            if event.type=='playback_changed' and event.data.status=='paused':task.cancel()
+        self.seen_callback=cancel
+        await self.event('playback_changed',status='paused',is_active=True)
+        await entered.wait()
+        return task,release
+    async def test_paused_snapshot_during_verification_never_grants(self):
+        task,release=await self.paused_verification()
+        await self.event('playback_state',status='paused',is_active=True)
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):await task
+        self.assertFalse(self.adapter.authority._closed);self.assertIsNone(self.adapter.authority._token)
+        with self.assertRaises(PermissionError):await self.client._send_command('play')
+    async def test_auth_loss_during_cancellation_does_not_reopen(self):
+        task,release=await self.paused_verification()
+        await self.event('auth_state',logged_in=False,is_active=False);release.set()
+        with self.assertRaises(asyncio.CancelledError):await task
+        self.assertFalse(self.adapter.authority._logged_in);await self.play()
+        self.assertIsNone(self.adapter.authority._token)
+    async def test_socket_loss_during_cancellation_remains_closed(self):
+        task,release=await self.paused_verification();self.client.wire.closed=True;release.set()
+        with self.assertRaises(asyncio.CancelledError):await task
+        self.assertTrue(self.adapter.authority._closed)
+    async def test_shutdown_during_verification_remains_closed(self):
+        task,release=await self.paused_verification()
+        # Current pending verification was already called; raise at its await boundary.
+        self.adapter._closed=True;release.set()
+        with self.assertRaises(asyncio.CancelledError):await task
+        self.assertTrue(self.adapter.authority._closed)
+    async def test_daemon_verification_failure_remains_closed(self):
+        task=await self.preparing_queue()
+        async def verify(binding):raise ConnectionResetError('isolated protected daemon loss')
+        self.bridge.verify_preparation_pause=verify
+        await self.event('playback_changed',status='paused',is_active=True);task.cancel()
+        with self.assertRaises(asyncio.CancelledError):await task
+        self.assertTrue(self.adapter.authority._closed)
+    async def test_stale_cancel_cannot_revoke_newer_remote_token(self):
+        task,release=await self.paused_verification()
+        await self.event('playback_changed',status='playing',is_active=True)
+        fresh=self.adapter.authority._token;self.assertIsNotNone(fresh)
+        stops=self.bridge.stops;release.set()
+        with self.assertRaises(asyncio.CancelledError):await task
+        self.assertIs(self.adapter.authority._token,fresh);self.assertFalse(self.adapter.authority._closed)
+        self.assertEqual(self.bridge.stops,stops)
+    async def test_replay_during_cancellation_remains_closed(self):
+        task,release=await self.paused_verification();a=self.adapter.authority
+        with self.assertRaises(PermissionError):a.event(a.binding,a.sequence,'playback_changed',status='playing')
+        release.set()
+        with self.assertRaises(asyncio.CancelledError):await task
+        self.assertTrue(a._closed)
+    async def test_displaced_binding_not_reopened_by_stale_cancel(self):
+        task,release=await self.paused_verification();a=self.adapter.authority
+        new=authority.ReceiverBinding('other-fixture',(2,3,'boot','sha'),2)
+        a.attach(new,port_protected=True,daemon_alive=True);release.set()
+        with self.assertRaises(asyncio.CancelledError):await task
+        self.assertEqual(a.binding,new);self.assertFalse(a._logged_in)
+        self.assertIsNone(a._token);self.assertEqual(a.sequence,0)
+    async def test_pause_cancel_after_token_consumption_not_recoverable(self):
+        entered=asyncio.Event()
+        async def original(daemon):entered.set();await asyncio.Future()
+        # Replace only upstream callback under a new adapter installation.
+        await self.adapter.close()
+        self.client=Client();self.provider=Provider(self.client)
+        self.provider._deferred_play_media_fire=original
+        self.bridge=Bridge();self.adapter=adapter.ConnectAdapter(NS(_client=self.client),self.provider,self.daemon,self.bridge)
+        self.adapter.install()
+        async def normalized(event):pass
+        self.listener=asyncio.create_task(self.client.listen_events(normalized));await asyncio.sleep(0)
+        await self.event('auth_state',logged_in=True,is_active=True);await self.play()
+        task=asyncio.create_task(self.provider._deferred_play_media_fire(self.daemon));await entered.wait()
+        self.assertTrue(self.adapter.authority._token._used)
+        await self.event('playback_changed',status='paused',is_active=True);task.cancel()
+        with self.assertRaises(asyncio.CancelledError):await task
+        self.assertTrue(self.adapter.authority._closed)
     async def test_pending_never_prepares_and_direct_pause_stop_cancels(self):
         await self.event('auth_state',logged_in=True,is_active=False)
         await self.event('playback_changed',status='playing')

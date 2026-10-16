@@ -1,0 +1,892 @@
+diff --git a/music_assistant/providers/spotify_connect/provider.py b/music_assistant/providers/spotify_connect/provider.py
+index 8d12a78..a78d0f4 100644
+--- a/music_assistant/providers/spotify_connect/provider.py
++++ b/music_assistant/providers/spotify_connect/provider.py
+@@ -53,6 +53,7 @@ from .helpers import get_go_librespot_binary
+ from .models import BackendEventType
+ from .soloist import (
+     VOLUME_MODE_PLAYER_ONLY,
++    VOLUME_MODE_SPOTIFY_AUTHORITATIVE,
+     VOLUME_MODE_SYNC_SPOTIFY,
+     SoloistBackend,
+     SoloistBinaryManager,
+@@ -93,6 +94,7 @@ AUDIO_QUALITY_VALUES: Final = {option.value for option in AUDIO_QUALITY_OPTIONS}
+ VOLUME_MODE_OPTIONS: Final = [
+     ConfigValueOption(VOLUME_MODE_PLAYER_ONLY),
+     ConfigValueOption(VOLUME_MODE_SYNC_SPOTIFY),
++    ConfigValueOption(VOLUME_MODE_SPOTIFY_AUTHORITATIVE),
+ ]
+ 
+ SUPPORTED_FEATURES = {ProviderFeature.AUDIO_SOURCE}
+@@ -169,6 +171,8 @@ class _PlayerDaemon:
+     pending_pause_stop_task: asyncio.Task[None] | None = None
+     last_session_active_time: float = 0
+     last_volume_sent: int | None = None
++    receiver_volume: int | None = None
++    volume_generation: int = 0
+     # Last context/track URIs seen on the event stream. Used to take playback
+     # back (make ourselves the active Spotify device) when the user switched
+     # the active device away in the Spotify app and then presses play in MA.
+@@ -452,6 +456,9 @@ class SpotifyConnectProvider(PluginProvider):
+         daemon.active_player_id = active_player_id
+         self.logger.debug("Active player set to: %s", active_player_id)
+ 
++        if self._resolve_volume_mode() == VOLUME_MODE_SPOTIFY_AUTHORITATIVE:
++            await self._apply_receiver_volume(daemon, active_player_id)
++
+         # If a different player was consuming the source, kick it out (the source
+         # is exclusive).
+         if prev_player_id:
+@@ -599,6 +606,8 @@ class SpotifyConnectProvider(PluginProvider):
+         daemon = self._daemons.get(source_id)
+         if daemon is None:
+             return
++        if self._resolve_volume_mode() == VOLUME_MODE_SPOTIFY_AUTHORITATIVE:
++            return
+         if not daemon.playing and not daemon.spotify_session_active:
+             raise self._not_active_error(daemon)
+         # Prevent ping-pong: only push if the value actually changed from what we
+@@ -782,10 +791,16 @@ class SpotifyConnectProvider(PluginProvider):
+ 
+     def _resolve_volume_mode(self) -> str:
+         """Return the configured volume mode (the provider options page is the only source)."""
+-        return cast(
++        mode = cast(
+             "str",
+             self.config.get_value(CONF_VOLUME_MODE) or VOLUME_MODE_PLAYER_ONLY,
+         )
++        if (
++            mode == VOLUME_MODE_SPOTIFY_AUTHORITATIVE
++            and self.get_setup_value(CONF_BACKEND) != BACKEND_SOLOIST
++        ):
++            return VOLUME_MODE_PLAYER_ONLY
++        return mode
+ 
+     def _resolve_crossfade_ms(self) -> int:
+         """Return the configured crossfade duration in milliseconds (0 = disabled)."""
+@@ -952,6 +967,11 @@ class SpotifyConnectProvider(PluginProvider):
+             return
+         if not daemon.playing or daemon.in_use_by_player:
+             return
++        if (
++            self._resolve_volume_mode() == VOLUME_MODE_SPOTIFY_AUTHORITATIVE
++            and daemon.receiver_volume is None
++        ):
++            return
+         # an explicitly selected player wins, else the daemon's own connected player
+         target_player_id = daemon.active_player_id or daemon.player_id
+         self.logger.info(
+@@ -990,6 +1010,24 @@ class SpotifyConnectProvider(PluginProvider):
+                 )
+             )
+ 
++    def _handle_connection_lost(self, daemon: _PlayerDaemon) -> None:
++        """Invalidate state owned by a lost backend session."""
++        # The backend's Spotify session is gone (e.g. daemon exit). Reset
++        # session state so a dead/restarting backend isn't treated as active
++        # and controllable; a fresh 'active' event re-establishes it.
++        daemon.playing = False
++        daemon.spotify_session_active = False
++        # stale options must not outlive the session they belong to
++        daemon.last_playback_options = None
++        if self._resolve_volume_mode() == VOLUME_MODE_SPOTIFY_AUTHORITATIVE:
++            daemon.receiver_volume = None
++            daemon.volume_generation += 1
++            self._cancel_pending_play_media(daemon)
++            prev_player_id = daemon.active_player_id
++            self._clear_active_player(daemon)
++            if prev_player_id:
++                self._schedule_pause_stop(daemon, prev_player_id)
++
+     async def _handle_backend_event(self, daemon: _PlayerDaemon, event: BackendEvent) -> None:
+         """Dispatch a single normalized event received from a daemon's backend."""
+         if daemon.stop_called:
+@@ -998,13 +1036,7 @@ class SpotifyConnectProvider(PluginProvider):
+             # late event of its dying backend
+             return
+         if event.type is BackendEventType.CONNECTION_LOST:
+-            # The backend's Spotify session is gone (e.g. daemon exit). Reset
+-            # session state so a dead/restarting backend isn't treated as active
+-            # and controllable; a fresh 'active' event re-establishes it.
+-            daemon.playing = False
+-            daemon.spotify_session_active = False
+-            # stale options must not outlive the session they belong to
+-            daemon.last_playback_options = None
++            self._handle_connection_lost(daemon)
+             return
+         if event.type is BackendEventType.FATAL_ERROR:
+             self._handle_fatal_error(daemon, event)
+@@ -1043,6 +1075,8 @@ class SpotifyConnectProvider(PluginProvider):
+         elif event.type is BackendEventType.SESSION_INACTIVE:
+             self.logger.info("Spotify Connect session inactive for %s", daemon.publish_name)
+             daemon.spotify_session_active = False
++            daemon.receiver_volume = None
++            daemon.volume_generation += 1
+             # stale options must not outlive the session they belong to
+             daemon.last_playback_options = None
+             prev_player_id = daemon.active_player_id
+@@ -1176,6 +1210,20 @@ class SpotifyConnectProvider(PluginProvider):
+         :param daemon: The daemon the volume change originates from.
+         :param volume: The reported volume as a 0-100 percentage.
+         """
++        if self._resolve_volume_mode() == VOLUME_MODE_SPOTIFY_AUTHORITATIVE:
++            if not 0 <= volume <= 100:
++                raise AudioError("Invalid Spotify receiver volume")
++            daemon.receiver_volume = volume
++            try:
++                await self._apply_receiver_volume(
++                    daemon, daemon.in_use_by_player or daemon.active_player_id or daemon.player_id
++                )
++            except Exception:
++                daemon.receiver_volume = None
++                daemon.volume_generation += 1
++                raise
++            self._schedule_play_media(daemon)
++            return
+         # Ignore our own echo: the backend emits a 'volume' event for the value we
+         # just pushed in on_volume_change; re-applying it would ping-pong.
+         if volume == daemon.last_volume_sent:
+@@ -1205,6 +1253,8 @@ class SpotifyConnectProvider(PluginProvider):
+         :param daemon: The daemon to push the volume to.
+         :param player_id: The MA player whose volume to push.
+         """
++        if self._resolve_volume_mode() == VOLUME_MODE_SPOTIFY_AUTHORITATIVE:
++            return
+         player = self.mass.players.get_player(player_id)
+         if player is None:
+             return
+@@ -1226,6 +1276,27 @@ class SpotifyConnectProvider(PluginProvider):
+         except Exception as err:
+             self.logger.debug("Failed to sync player volume to Spotify: %s", err)
+ 
++    async def _apply_receiver_volume(self, daemon: _PlayerDaemon, player_id: str) -> None:
++        """Apply and verify a fresh receiver level before a source may stream."""
++        volume = daemon.receiver_volume
++        generation = daemon.volume_generation
++        if volume is None:
++            raise AudioError("Spotify receiver volume is not known")
++        player = self.mass.players.get_player(player_id)
++        if player is None:
++            raise AudioError("Spotify volume target is not available")
++        await self.mass.players.cmd_volume_set(player_id, volume)
++        level = player.state.volume_level
++        if level is None:
++            level = player.state.group_volume
++        if (
++            generation != daemon.volume_generation
++            or volume != daemon.receiver_volume
++            or level is None
++            or level != volume
++        ):
++            raise AudioError("Spotify receiver volume could not be verified")
++
+     async def _push_volume_to_backend(self, daemon: _PlayerDaemon, volume: int) -> None:
+         """
+         Send an absolute 0-100 volume to the backend.
+diff --git a/music_assistant/providers/spotify_connect/soloist/README.md b/music_assistant/providers/spotify_connect/soloist/README.md
+index 553c2d1..0d8c0e4 100644
+--- a/music_assistant/providers/spotify_connect/soloist/README.md
++++ b/music_assistant/providers/spotify_connect/soloist/README.md
+@@ -78,6 +78,48 @@ a FIFO. The daemon is spawned with `PULSE_SERVER`/`PULSE_SINK` pointing at its s
+ 
+ ## Volume modes
+ 
++The provider's `volume_mode` option defaults to `player_only`. Existing saved options
++and defaults are unchanged; the additional option does not require a data migration.
++
++### Spotify-authoritative volume (opt-in)
++
++Set `volume_mode` to **`spotify_authoritative`** ("Spotify app controls volume").
++Music Assistant never writes the Spotify slider in this mode, including at device
++activation, source selection, receiver-volume adoption, or a local MA volume change.
++Receiver reports are cached before the source is claimed. Before activation they
++are candidates only: inactive or unconfirmed snapshots cannot authorize playback.
++Device activation requests a fresh `get_state` snapshot; a snapshot explicitly
++reporting `is_active: true` with a volume confirms the current receiver session.
++An explicit active snapshot may also arrive before the device event. Early level
++reports are never promoted merely because a later device event says active; MA
++waits for this confirmation without requiring another user volume gesture.
++There is no player-wins
++startup grace period or echo-value filter. Before serving a source, MA commands the
++receiver's reported level on the consuming player and checks its reported logical
++volume (or group volume). Unknown volume, failed commands, or a mismatched readback
++refuse source selection rather than falling back to the restored player level.
++
++The capture sink starts muted. On each volume report it is muted while the player
++adopts the level, then uses the same cubic reciprocal compensation as `sync_spotify`.
++Failure leaves it muted and invokes the existing capture recovery. Pause retains
++the session volume. Device/session loss, daemon loss, and control-websocket loss
++invalidate it. Auth reports expose no account identifier, so each auth report also
++invalidates the cached level and requests a fresh playback snapshot when active.
++Volume-before-claim and playing-before-device events are supported; playback waits
++for a level. A local MA volume change does not write the receiver and the next
++receiver report/source selection adopts the receiver level again.
++
++This is a volume ownership policy, **not a guarantee against transition artifacts**:
++the receiver can change PCM attenuation before its asynchronous volume event arrives,
++while the old reciprocal sink gain is still applied. Muting during adoption cannot
++eliminate that earlier window. The existing `sync_spotify` artifact warning also
++applies here. A fresh receiver snapshot is current receiver state, not proof that a
++particular human chose that value. Tests use isolated fakes and check static gain
++algebra and ordering; they do not qualify real Soloist audio, hardware volume readback,
++or account-transfer behavior. These require separate receiver/capture qualification.
++
++### Existing modes
++
+ - **`player_only` (default, quality-first)**: the daemon is pinned at 100% so unity-gain
+   PCM reaches the FIFO; the MA player owns the audible volume. Off-100 reports from the
+   daemon (user dragging the app slider) re-pin it; a failed pin marks the cached volume
+diff --git a/music_assistant/providers/spotify_connect/soloist/__init__.py b/music_assistant/providers/spotify_connect/soloist/__init__.py
+index 6d95bed..758bf3f 100644
+--- a/music_assistant/providers/spotify_connect/soloist/__init__.py
++++ b/music_assistant/providers/spotify_connect/soloist/__init__.py
+@@ -2,6 +2,7 @@
+ 
+ from .backend import (
+     VOLUME_MODE_PLAYER_ONLY,
++    VOLUME_MODE_SPOTIFY_AUTHORITATIVE,
+     VOLUME_MODE_SYNC_SPOTIFY,
+     SoloistBackend,
+ )
+@@ -20,6 +21,7 @@ from .runtime import (
+ 
+ __all__ = [
+     "VOLUME_MODE_PLAYER_ONLY",
++    "VOLUME_MODE_SPOTIFY_AUTHORITATIVE",
+     "VOLUME_MODE_SYNC_SPOTIFY",
+     "BuildExpiredError",
+     "ConsentRequiredError",
+diff --git a/music_assistant/providers/spotify_connect/soloist/backend.py b/music_assistant/providers/spotify_connect/soloist/backend.py
+index 563e059..bf47aec 100644
+--- a/music_assistant/providers/spotify_connect/soloist/backend.py
++++ b/music_assistant/providers/spotify_connect/soloist/backend.py
+@@ -82,6 +82,7 @@ if TYPE_CHECKING:
+ # How Spotify-side volume changes are handled (see set_volume).
+ VOLUME_MODE_PLAYER_ONLY: Final = "player_only"
+ VOLUME_MODE_SYNC_SPOTIFY: Final = "sync_spotify"
++VOLUME_MODE_SPOTIFY_AUTHORITATIVE: Final = "spotify_authoritative"
+ 
+ # Bounded soloist playback cache (docs: 0 = unlimited, otherwise at least 100 MB).
+ CACHE_SIZE_MB: Final = 512
+@@ -161,7 +162,8 @@ class SoloistBackend(SpotifyConnectBackend):
+             binary from Spotify's CDN.
+         :param volume_mode: VOLUME_MODE_PLAYER_ONLY to let MA/the player own the
+             volume exclusively, VOLUME_MODE_SYNC_SPOTIFY to mirror the Spotify
+-            app's volume onto the MA player.
++            app's volume onto the MA player, or VOLUME_MODE_SPOTIFY_AUTHORITATIVE
++            to adopt receiver levels without writing its slider.
+         :param crossfade_ms: Crossfade duration between tracks in milliseconds
+             (0 disables crossfade).
+         :param loudness_normalization: Whether Spotify's loudness normalization
+@@ -210,6 +212,9 @@ class SoloistBackend(SpotifyConnectBackend):
+         self._repeat_lock = asyncio.Lock()
+         # last volume reported by the daemon (None until the first event)
+         self._spotify_volume: int | None = None
++        self._receiver_session_active = False
++        self._receiver_volume_confirmed = False
++        self._receiver_volume_candidate: int | None = None
+         # guards the player_only 100%-pin so overlapping resets are not issued
+         self._pin_in_flight: bool = False
+         self._last_context_uri: str | None = None
+@@ -422,6 +427,8 @@ class SoloistBackend(SpotifyConnectBackend):
+         :param volume: Absolute volume as a 0-100 percentage. In player-only
+             mode the value is ignored and the daemon stays pinned at 100%.
+         """
++        if self._volume_mode == VOLUME_MODE_SPOTIFY_AUTHORITATIVE:
++            return
+         assert self._client is not None
+         if self._volume_mode == VOLUME_MODE_SYNC_SPOTIFY:
+             # the daemon echoes the change back as a volume_changed event; the
+@@ -741,9 +748,13 @@ class SoloistBackend(SpotifyConnectBackend):
+         # stale reciprocal sink compensation from before a crash would amplify
+         # and clip the captured audio (sync_spotify mode)
+         async with self._volume_lock:
+-            self._spotify_volume = 100
++            authoritative = self._volume_mode == VOLUME_MODE_SPOTIFY_AUTHORITATIVE
++            self._spotify_volume = None if authoritative else 100
++            self._receiver_session_active = False
++            self._receiver_volume_confirmed = False
++            self._receiver_volume_candidate = None
+             try:
+-                await sink.set_volume(100)
++                await sink.set_volume(0 if authoritative else 100)
+             except Exception as err:
+                 # fail closed: a stale reciprocal gain may still be active on
+                 # the sink — recreate sink and daemon rather than clipping
+@@ -752,6 +763,21 @@ class SoloistBackend(SpotifyConnectBackend):
+                 )
+                 await self._recover_sink()
+ 
++    async def _invalidate_receiver_volume(self) -> None:
++        """Mute capture and invalidate the provider's receiver-level receipt."""
++        async with self._volume_lock:
++            self._spotify_volume = None
++            self._receiver_session_active = False
++            self._receiver_volume_confirmed = False
++            self._receiver_volume_candidate = None
++            if self._sink is not None:
++                try:
++                    await self._sink.set_volume(0)
++                except Exception:
++                    self.logger.warning("Failed to mute capture sink; recreating capture sink")
++                    await self._recover_sink()
++        await self._event_callback(BackendEvent(BackendEventType.CONNECTION_LOST))
++
+     async def _refresh_expired_binary(self) -> bool:
+         """
+         Replace the expired soloist build before the next daemon restart.
+@@ -826,8 +852,44 @@ class SoloistBackend(SpotifyConnectBackend):
+                 # but unlike a connection drop it has to surface loudly
+                 self.logger.exception("Unexpected error while handling soloist events")
+             if not self._stop_called:
++                if self._volume_mode == VOLUME_MODE_SPOTIFY_AUTHORITATIVE:
++                    await self._invalidate_receiver_volume()
+                 await asyncio.sleep(RESTART_DELAY_S)
+ 
++    async def _prepare_authoritative_event(self, event: SoloistEvent) -> bool:
++        """Require active-session confirmation before promoting a receiver level."""
++        data = event.data
++        if isinstance(data, (SoloistAuthState, SoloistDeviceChanged)):
++            active = data.is_active and (not isinstance(data, SoloistAuthState) or data.logged_in)
++            if isinstance(data, SoloistAuthState) or not active:
++                # Auth has no account ID: it cannot preserve a prior account's receipt.
++                await self._invalidate_receiver_volume()
++            if active and not self._receiver_session_active:
++                self._receiver_session_active = True
++                if self._client is not None:
++                    await self._client.get_state()
++            return True
++        if isinstance(data, SoloistPlaybackState):
++            if data.is_active is False:
++                await self._invalidate_receiver_volume()
++                self._receiver_volume_candidate = data.volume
++                return False
++            if data.is_active is True:
++                if not self._receiver_session_active:
++                    self._receiver_session_active = True
++                    await self._event_callback(self._make_event(BackendEventType.SESSION_ACTIVE))
++                    if data.volume is None and self._client is not None:
++                        await self._client.get_state()
++                if data.volume is not None:
++                    self._receiver_volume_confirmed = True
++            if not self._receiver_volume_confirmed:
++                self._receiver_volume_candidate = data.volume
++                return False
++        if isinstance(data, SoloistVolumeChanged) and not self._receiver_volume_confirmed:
++            self._receiver_volume_candidate = data.volume
++            return False
++        return True
++
+     async def _handle_event(self, event: SoloistEvent) -> None:
+         """Adapt a raw soloist event and emit its normalized counterpart."""
+         self.logger.debug("Received %s event [%s]", event.type, self.name)
+@@ -836,6 +898,11 @@ class SoloistBackend(SpotifyConnectBackend):
+         # (The endpoint files the events runner polls can be stale leftovers
+         # from a previous run, so the reset cannot happen on wait_until_ready.)
+         self._restart_error_count = 0
++        if (
++            self._volume_mode == VOLUME_MODE_SPOTIFY_AUTHORITATIVE
++            and not await self._prepare_authoritative_event(event)
++        ):
++            return
+         if isinstance(event.data, SoloistVolumeChanged):
+             await self._handle_volume_changed(event.data.volume)
+             return
+@@ -882,8 +949,16 @@ class SoloistBackend(SpotifyConnectBackend):
+         :param volume: The reported volume as a 0-100 percentage.
+         """
+         async with self._volume_lock:
++            if self._volume_mode == VOLUME_MODE_SPOTIFY_AUTHORITATIVE and not (
++                self._receiver_session_active and self._receiver_volume_confirmed
++            ):
++                self._receiver_volume_candidate = volume
++                return
+             self._spotify_volume = volume
+-            if self._volume_mode != VOLUME_MODE_SYNC_SPOTIFY:
++            if self._volume_mode not in (
++                VOLUME_MODE_SYNC_SPOTIFY,
++                VOLUME_MODE_SPOTIFY_AUTHORITATIVE,
++            ):
+                 # player_only: MA/the player owns the volume. Keep the daemon
+                 # pinned at 100% so the captured PCM stays at unity gain, and
+                 # never forward VOLUME events (they would fight the MA volume).
+@@ -912,6 +987,11 @@ class SoloistBackend(SpotifyConnectBackend):
+                 # explicit zero handling: no reciprocal exists, silence the sink
+                 sink_pct = 0.0 if volume <= 0 else round(10000 / volume, 2)
+                 try:
++                    if self._volume_mode == VOLUME_MODE_SPOTIFY_AUTHORITATIVE:
++                        await self._sink.set_volume(0)
++                        await self._event_callback(
++                            self._make_event(BackendEventType.VOLUME, volume=volume)
++                        )
+                     await self._sink.set_volume(sink_pct)
+                 except Exception as err:
+                     # fail closed: the compensation state is now unknown, so
+@@ -923,6 +1003,8 @@ class SoloistBackend(SpotifyConnectBackend):
+                     )
+                     await self._recover_sink()
+                     return
++            if self._volume_mode == VOLUME_MODE_SPOTIFY_AUTHORITATIVE:
++                return
+             await self._event_callback(
+                 self._make_event(BackendEventType.VOLUME, volume=max(0, volume))
+             )
+diff --git a/music_assistant/providers/spotify_connect/strings.json b/music_assistant/providers/spotify_connect/strings.json
+index 5247e21..3504b5c 100644
+--- a/music_assistant/providers/spotify_connect/strings.json
++++ b/music_assistant/providers/spotify_connect/strings.json
+@@ -30,10 +30,11 @@
+     },
+     "volume_mode": {
+       "label": "Spotify app volume behavior",
+-      "description": "'Player volume only' keeps the volume slider in the Spotify app pinned at 100% so the audio always arrives untouched; you control the volume on the Music Assistant player instead. 'Sync Spotify app volume' keeps the Spotify app's volume slider and the player volume in sync, so you can use either. Note: with volume sync, a large upward volume jump in the Spotify app can cause a very brief loud artifact while the volume correction catches up.",
++      "description": "'Player volume only' keeps the volume slider in the Spotify app pinned at 100% so the audio always arrives untouched; you control the volume on the Music Assistant player instead. 'Sync Spotify app volume' keeps the Spotify app's volume slider and the player volume in sync, so you can use either. 'Spotify app controls volume' never writes the Spotify slider from Music Assistant and waits for a fresh receiver level and matching player readback before streaming. Local Music Assistant volume changes are not sent to Spotify. Note: both Spotify volume modes use capture compensation; a large upward volume jump in the Spotify app can cause a very brief loud artifact before the volume correction catches up.",
+       "options": {
+         "player_only": "Player volume only (quality-first, default)",
+-        "sync_spotify": "Sync Spotify app volume"
++        "sync_spotify": "Sync Spotify app volume",
++        "spotify_authoritative": "Spotify app controls volume (no slider writes from MA)"
+       }
+     },
+     "crossfade_duration": {
+diff --git a/music_assistant/translations/en.json b/music_assistant/translations/en.json
+index 911b9a4..d8cd00e 100644
+--- a/music_assistant/translations/en.json
++++ b/music_assistant/translations/en.json
+@@ -2550,9 +2550,10 @@
+   "provider.spotify_connect.config_entries.soloist_api_key.label": "Soloist API key",
+   "provider.spotify_connect.config_entries.soloist_api_key_hint.label": "An API key is already configured. Leave the field below empty to keep using it.",
+   "provider.spotify_connect.config_entries.soloist_download_consent.label": "I understand the above, and I allow Music Assistant to download, run, keep and automatically update Spotify Soloist from Spotify's servers",
+-  "provider.spotify_connect.config_entries.volume_mode.description": "'Player volume only' keeps the volume slider in the Spotify app pinned at 100% so the audio always arrives untouched; you control the volume on the Music Assistant player instead. 'Sync Spotify app volume' keeps the Spotify app's volume slider and the player volume in sync, so you can use either. Note: with volume sync, a large upward volume jump in the Spotify app can cause a very brief loud artifact while the volume correction catches up.",
++  "provider.spotify_connect.config_entries.volume_mode.description": "'Player volume only' keeps the volume slider in the Spotify app pinned at 100% so the audio always arrives untouched; you control the volume on the Music Assistant player instead. 'Sync Spotify app volume' keeps the Spotify app's volume slider and the player volume in sync, so you can use either. 'Spotify app controls volume' never writes the Spotify slider from Music Assistant and waits for a fresh receiver level and matching player readback before streaming. Local Music Assistant volume changes are not sent to Spotify. Note: both Spotify volume modes use capture compensation; a large upward volume jump in the Spotify app can cause a very brief loud artifact before the volume correction catches up.",
+   "provider.spotify_connect.config_entries.volume_mode.label": "Spotify app volume behavior",
+   "provider.spotify_connect.config_entries.volume_mode.options.player_only": "Player volume only (quality-first, default)",
++  "provider.spotify_connect.config_entries.volume_mode.options.spotify_authoritative": "Spotify app controls volume (no slider writes from MA)",
+   "provider.spotify_connect.config_entries.volume_mode.options.sync_spotify": "Sync Spotify app volume",
+   "provider.spotify_connect.errors.not_active_device": "'{0}' is not the active Spotify playback device. Open the Spotify app, select it as the playback device, and try again.",
+   "provider.spotify_connect.errors.soloist_api_key_invalid": "This does not look like a complete API key. Copy the entire key from the Spotify page and paste it again.",
+diff --git a/tests/providers/spotify_connect/test_provider.py b/tests/providers/spotify_connect/test_provider.py
+index 7f100ac..f9cd24a 100644
+--- a/tests/providers/spotify_connect/test_provider.py
++++ b/tests/providers/spotify_connect/test_provider.py
+@@ -144,6 +144,8 @@ def _volume_sync_provider(
+     """
+     provider = object.__new__(SpotifyConnectProvider)
+     provider.mass = MagicMock()
++    provider.config = MagicMock()
++    provider.config.get_value.return_value = "player_only"
+     provider.mass.players.get_audio_source_session.return_value = MagicMock(
+         playback_session_id="playback-session"
+     )
+diff --git a/tests/providers/spotify_connect/test_spotify_authoritative_volume.py b/tests/providers/spotify_connect/test_spotify_authoritative_volume.py
+new file mode 100644
+index 0000000..293d834
+--- /dev/null
++++ b/tests/providers/spotify_connect/test_spotify_authoritative_volume.py
+@@ -0,0 +1,406 @@
++"""Spotify-authoritative policy tests; no receiver, audio, or network is used."""
++
++import time
++from pathlib import Path
++from typing import Any
++from unittest.mock import AsyncMock, MagicMock, patch
++
++import pytest
++from music_assistant_models.config_entries import ConfigEntry
++from music_assistant_models.enums import ConfigEntryType
++from music_assistant_models.errors import AudioError
++
++from music_assistant.providers.spotify_connect.go_librespot.backend import GoLibrespotBackend
++from music_assistant.providers.spotify_connect.models import BackendEvent, BackendEventType
++from music_assistant.providers.spotify_connect.provider import CONF_BACKEND, CONF_VOLUME_MODE
++from music_assistant.providers.spotify_connect.soloist.backend import SoloistBackend
++from music_assistant.providers.spotify_connect.soloist.runtime import (
++    SoloistAuthState,
++    SoloistDeviceChanged,
++    SoloistPlaybackState,
++)
++from tests.providers.spotify_connect.test_provider import (
++    _make_daemon,
++    _provider_with_stored_config,
++    _volume_sync_provider,
++)
++from tests.providers.spotify_connect.test_soloist_backend import (
++    _event,
++    _FakeSink,
++    _make_backend,
++    _volume_event,
++)
++
++
++def _policy_provider(volume: int) -> tuple[Any, Any, AsyncMock]:
++    """Build an authoritative provider with dynamically configured test doubles."""
++    provider: Any
++    provider, daemon, set_volume = _volume_sync_provider(volume)
++    provider.config.get_value.return_value = "spotify_authoritative"
++    provider.get_setup_value = MagicMock(return_value="soloist")
++    return provider, daemon, set_volume
++
++
++def _policy_backend() -> tuple[Any, list[BackendEvent]]:
++    """Build an authoritative backend with dynamically configured test doubles."""
++    backend: Any
++    backend, events = _make_backend(volume_mode="spotify_authoritative")
++    backend._receiver_session_active = True
++    backend._receiver_volume_confirmed = True
++    return backend, events
++
++
++@pytest.mark.parametrize(
++    ("backend_choice", "mode", "expected_mode"),
++    [
++        ("soloist", "spotify_authoritative", "spotify_authoritative"),
++        ("go_librespot", "spotify_authoritative", "player_only"),
++        (None, "spotify_authoritative", "player_only"),
++        ("soloist", "player_only", "player_only"),
++        ("soloist", "sync_spotify", "sync_spotify"),
++        (None, None, "player_only"),
++        ("go_librespot", "sync_spotify", "sync_spotify"),
++    ],
++)
++def test_backend_construction_uses_stored_choice_without_dev_only_property(
++    tmp_path: Path,
++    backend_choice: str | None,
++    mode: str | None,
++    expected_mode: str,
++) -> None:
++    """Construct the complete provider's backend with real stored-config accessors."""
++    setup_data = {CONF_BACKEND: backend_choice} if backend_choice is not None else {}
++    provider = _provider_with_stored_config(setup_data, tmp_path)
++    if mode is not None:
++        provider.config.values[CONF_VOLUME_MODE] = ConfigEntry(
++            key=CONF_VOLUME_MODE, type=ConfigEntryType.STRING, value=mode
++        )
++    backend = provider._create_backend(_make_daemon(), "Test Player")
++    assert provider._resolve_volume_mode() == expected_mode
++    if backend_choice == "soloist":
++        assert isinstance(backend, SoloistBackend)
++        assert backend._volume_mode == expected_mode
++    else:
++        assert isinstance(backend, GoLibrespotBackend)
++
++
++async def test_lower_receiver_level_is_applied_before_claim_without_slider_write() -> None:
++    """A fresh 20% report wins over a restored 80% MA player even before its claim."""
++    provider, daemon, set_volume = _policy_provider(80)
++    provider.config.get_value.return_value = "spotify_authoritative"
++    daemon.playing = True
++    player = provider.mass.players.get_player.return_value
++
++    async def apply(_player_id: str, volume: int) -> None:
++        player.state.volume_level = volume
++
++    provider.mass.players.cmd_volume_set = AsyncMock(side_effect=apply)
++    with patch.object(provider, "_schedule_play_media"):
++        await provider._handle_volume_event(daemon, 20)
++        await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.SESSION_ACTIVE))
++    await provider.on_source_selected("player1", "player1", "player1", "stream1")
++    assert player.state.volume_level == 20
++    set_volume.assert_not_awaited()
++
++
++@pytest.mark.parametrize("playing_first", [False, True])
++async def test_device_and_play_order_waits_for_late_volume(playing_first: bool) -> None:
++    """Either event ordering waits for a fresh level before firing the stream."""
++    provider, daemon, set_volume = _policy_provider(80)
++    provider.config.get_value.return_value = "spotify_authoritative"
++    provider.mass.player_queues.play_media = AsyncMock()
++    daemon.audio_source = MagicMock()
++    player = provider.mass.players.get_player.return_value
++
++    async def apply(_player_id: str, volume: int) -> None:
++        player.state.volume_level = volume
++
++    provider.mass.players.cmd_volume_set = AsyncMock(side_effect=apply)
++    events = [BackendEventType.SESSION_ACTIVE, BackendEventType.PLAYING]
++    if playing_first:
++        events.reverse()
++    with patch.object(provider, "_schedule_play_media"):
++        for event_type in events:
++            await provider._handle_backend_event(daemon, BackendEvent(event_type))
++        await provider._deferred_play_media_fire(daemon)
++        provider.mass.player_queues.play_media.assert_not_awaited()
++        await provider._handle_volume_event(daemon, 20)
++        await provider._deferred_play_media_fire(daemon)
++    provider.mass.player_queues.play_media.assert_awaited_once()
++    assert player.state.volume_level == 20
++    set_volume.assert_not_awaited()
++
++
++async def test_echo_grace_and_local_ma_change_never_write_spotify_slider() -> None:
++    """Receiver downchanges are not dropped during the legacy player-wins window."""
++    provider, daemon, set_volume = _policy_provider(80)
++    provider.config.get_value.return_value = "spotify_authoritative"
++    daemon.spotify_session_active = True
++    daemon.in_use_by_player = "player1"
++    daemon.last_session_active_time = time.time()
++    daemon.last_volume_sent = 20
++    player = provider.mass.players.get_player.return_value
++
++    async def apply(_player_id: str, volume: int) -> None:
++        player.state.volume_level = volume
++        await provider.on_volume_change("player1", volume)
++
++    provider.mass.players.cmd_volume_set = AsyncMock(side_effect=apply)
++    with patch.object(provider, "_schedule_play_media"):
++        await provider._handle_volume_event(daemon, 20)
++        await provider._handle_volume_event(daemon, 10)
++    await provider.on_volume_change("player1", 90)
++    assert player.state.volume_level == 10
++    set_volume.assert_not_awaited()
++
++
++@pytest.mark.parametrize(
++    "event_type", [BackendEventType.SESSION_INACTIVE, BackendEventType.CONNECTION_LOST]
++)
++async def test_session_loss_invalidates_volume(event_type: BackendEventType) -> None:
++    """A replacement/reconnect cannot reuse the last account's level."""
++    provider, daemon, set_volume = _policy_provider(20)
++    provider.config.get_value.return_value = "spotify_authoritative"
++    daemon.receiver_volume = 20
++    with patch.object(provider, "_schedule_play_media"):
++        await provider._handle_backend_event(daemon, BackendEvent(event_type))
++        await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.SESSION_ACTIVE))
++    daemon.playing = True
++    with pytest.raises(AudioError, match="volume"):
++        await provider.on_source_selected("player1", "player1", "player1", "stream2")
++    set_volume.assert_not_awaited()
++
++
++async def test_pause_keeps_volume_for_resume() -> None:
++    """A pause is not an account/session boundary."""
++    provider, daemon, _set_volume = _policy_provider(20)
++    provider.config.get_value.return_value = "spotify_authoritative"
++    daemon.receiver_volume = 20
++    await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.PAUSED))
++    assert daemon.receiver_volume == 20
++
++
++async def test_readback_failure_refuses_first_stream() -> None:
++    """A successful command dispatch alone is not a volume verification."""
++    provider, daemon, _set_volume = _policy_provider(80)
++    provider.config.get_value.return_value = "spotify_authoritative"
++    provider.mass.players.cmd_volume_set = AsyncMock()
++    with pytest.raises(AudioError, match="verified"):
++        await provider._handle_volume_event(daemon, 20)
++    assert daemon.receiver_volume is None
++
++
++async def test_session_replacement_during_adoption_rejects_old_level() -> None:
++    """A source-selection command completing after session loss cannot open a stream."""
++    provider, daemon, _set_volume = _policy_provider(80)
++    provider.config.get_value.return_value = "spotify_authoritative"
++    player = provider.mass.players.get_player.return_value
++
++    async def apply(_player_id: str, volume: int) -> None:
++        await provider._handle_backend_event(daemon, BackendEvent(BackendEventType.CONNECTION_LOST))
++        player.state.volume_level = volume
++
++    provider.mass.players.cmd_volume_set = AsyncMock(side_effect=apply)
++    with pytest.raises(AudioError, match="verified"):
++        await provider._handle_volume_event(daemon, 20)
++    assert daemon.receiver_volume is None
++
++
++async def test_saved_soloist_mode_does_not_change_other_backend() -> None:
++    """Switching engines cannot activate the Soloist-only policy on go-librespot."""
++    provider, daemon, set_volume = _policy_provider(80)
++    provider.config.get_value.return_value = "spotify_authoritative"
++    provider.get_setup_value.return_value = "go_librespot"
++    await provider._sync_player_volume_to_spotify(daemon, "player1")
++    set_volume.assert_awaited_once_with(80)
++
++
++@pytest.mark.parametrize("volume", [0, 1, 10, 20, 50, 100])
++async def test_compensation_remains_cubic_inverse_and_follows_adoption(volume: int) -> None:
++    """Static headroom algebra and mute/adopt/unmute ordering, not measured audio."""
++    backend, _events = _policy_backend()
++    sink = _FakeSink()
++    backend._sink = sink
++    backend._client = MagicMock()
++    backend._client.set_volume = AsyncMock()
++
++    async def adopted(_event_data: BackendEvent) -> None:
++        assert sink.volumes == [0]
++
++    backend._event_callback = adopted
++    await backend._handle_event(_volume_event(volume))
++    expected = 0 if volume == 0 else round(10000 / volume, 2)
++    assert sink.volumes == [0, expected]
++    if volume:
++        # Pulse software gain and Spotify attenuation both use a cubic curve.
++        assert (volume / 100) ** 3 * (expected / 100) ** 3 == pytest.approx(1, rel=0.001)
++    backend._client.set_volume.assert_not_awaited()
++
++
++async def test_failed_adoption_never_unmutes_capture() -> None:
++    """A failed player readback cannot leave reciprocal capture gain active."""
++    backend, _events = _policy_backend()
++    sink = _FakeSink()
++    backend._sink = sink
++    backend._recover_sink = AsyncMock()
++    backend._event_callback = AsyncMock(side_effect=AudioError("readback failed"))
++    await backend._handle_event(_volume_event(20))
++    assert sink.volumes == [0]
++    backend._recover_sink.assert_awaited_once()
++
++
++async def test_spawn_stays_silent_until_fresh_snapshot() -> None:
++    """The daemon's initial 100 is not a cached receiver-level fallback."""
++    backend, events = _policy_backend()
++    sink = _FakeSink()
++    backend._sink = sink
++    await backend._reset_volume_state(sink)
++    assert backend._spotify_volume is None
++    assert sink.volumes == [0]
++    await backend._handle_event(
++        _event("playback_state", SoloistPlaybackState(status="playing", volume=20, is_active=True))
++    )
++    assert [event.type for event in events] == [
++        BackendEventType.SESSION_ACTIVE,
++        BackendEventType.VOLUME,
++        BackendEventType.PLAYING,
++    ]
++    assert sink.volumes == [0, 0, 500]
++
++
++async def test_auth_report_invalidates_old_account_and_requests_fresh_state() -> None:
++    """Auth has no account ID, so even an active auth report invalidates cached gain."""
++    backend, events = _policy_backend()
++    sink = _FakeSink()
++    backend._sink = sink
++    backend._spotify_volume = 20
++    backend._client = MagicMock()
++    backend._client.get_state = AsyncMock()
++    await backend._handle_event(
++        _event("auth_state", SoloistAuthState(logged_in=True, is_active=True))
++    )
++    assert backend._spotify_volume is None
++    assert sink.volumes == [0]
++    assert [event.type for event in events] == [
++        BackendEventType.CONNECTION_LOST,
++        BackendEventType.SESSION_ACTIVE,
++    ]
++    backend._client.get_state.assert_awaited_once()
++
++
++async def test_failed_invalidation_mute_recovers_and_invalidates_provider() -> None:
++    """A failed mute must not kill the event loop leaving stale compensation live."""
++    backend, events = _policy_backend()
++    sink = _FakeSink()
++    sink.set_volume_error = OSError("capture unavailable")
++    backend._sink = sink
++    backend._recover_sink = AsyncMock()
++    await backend._invalidate_receiver_volume()
++    backend._recover_sink.assert_awaited_once()
++    assert backend._spotify_volume is None
++    assert [event.type for event in events] == [BackendEventType.CONNECTION_LOST]
++
++
++async def test_unknown_receiver_level_refuses_source_selection() -> None:
++    """No persisted player level or backend initial default may authorize a stream."""
++    provider, daemon, set_volume = _policy_provider(80)
++    provider.config.get_value.return_value = "spotify_authoritative"
++    daemon.playing = True
++    with pytest.raises(AudioError, match="volume"):
++        await provider.on_source_selected("player1", "player1", "player1", "stream1")
++    set_volume.assert_not_awaited()
++
++
++async def test_inactive_snapshot_cannot_authorize_later_activation() -> None:
++    """Inactive volume is only a candidate; activation needs a fresh active snapshot."""
++    backend, events = _policy_backend()
++    sink = _FakeSink()
++    backend._sink = sink
++    backend._client = MagicMock()
++    backend._client.get_state = AsyncMock()
++    backend._client.set_volume = AsyncMock()
++    await backend._handle_event(_event("device_changed", SoloistDeviceChanged(is_active=False)))
++    await backend._handle_event(
++        _event("playback_state", SoloistPlaybackState(status="paused", volume=80, is_active=False))
++    )
++    await backend._handle_event(_event("device_changed", SoloistDeviceChanged(is_active=True)))
++    assert not [event for event in events if event.type is BackendEventType.VOLUME]
++    assert all(volume == 0 for volume in sink.volumes)
++    backend._client.get_state.assert_awaited_once()
++    await backend._handle_event(
++        _event("playback_state", SoloistPlaybackState(status="playing", volume=20, is_active=True))
++    )
++    assert [event.volume for event in events if event.type is BackendEventType.VOLUME] == [20]
++    assert sink.volumes[-1] == 500
++    backend._client.set_volume.assert_not_awaited()
++
++
++@pytest.mark.parametrize("device_first", [False, True])
++async def test_early_report_orders_require_active_confirmation(device_first: bool) -> None:
++    """Early reports remain candidates regardless of device/play ordering."""
++    backend, events = _policy_backend()
++    sink = _FakeSink()
++    backend._sink = sink
++    backend._client = MagicMock()
++    backend._client.get_state = AsyncMock()
++    await backend._reset_volume_state(sink)
++    device = _event("device_changed", SoloistDeviceChanged(is_active=True))
++    if device_first:
++        await backend._handle_event(device)
++    await backend._handle_event(_volume_event(80))
++    await backend._handle_event(
++        _event("playback_state", SoloistPlaybackState(status="playing", volume=80))
++    )
++    if not device_first:
++        await backend._handle_event(device)
++    assert backend._receiver_volume_candidate == 80
++    assert backend._spotify_volume is None
++    assert not [event for event in events if event.type is BackendEventType.VOLUME]
++    assert all(volume == 0 for volume in sink.volumes)
++    backend._client.get_state.assert_awaited_once()
++    await backend._handle_event(
++        _event("playback_state", SoloistPlaybackState(status="playing", volume=20, is_active=True))
++    )
++    assert [event.volume for event in events if event.type is BackendEventType.VOLUME] == [20]
++    assert sink.volumes[-1] == 500
++
++
++@pytest.mark.parametrize("auth_reset", [False, True])
++async def test_auth_or_control_reset_needs_new_active_confirmation(auth_reset: bool) -> None:
++    """A post-reset level-only event cannot revive prior active-session eligibility."""
++    backend, events = _policy_backend()
++    sink = _FakeSink()
++    backend._sink = sink
++    backend._client = MagicMock()
++    backend._client.get_state = AsyncMock()
++    if auth_reset:
++        await backend._handle_event(
++            _event("auth_state", SoloistAuthState(logged_in=True, is_active=True))
++        )
++    else:
++        await backend._invalidate_receiver_volume()
++        await backend._handle_event(_event("device_changed", SoloistDeviceChanged(is_active=True)))
++    await backend._handle_event(_volume_event(80))
++    assert not [event for event in events if event.type is BackendEventType.VOLUME]
++    assert all(volume == 0 for volume in sink.volumes)
++    await backend._handle_event(
++        _event("playback_state", SoloistPlaybackState(status="playing", volume=20, is_active=True))
++    )
++    assert [event.volume for event in events if event.type is BackendEventType.VOLUME] == [20]
++
++
++async def test_active_snapshot_before_device_confirms_without_reusing_candidate() -> None:
++    """An explicit active snapshot is itself confirmation when it arrives first."""
++    backend, events = _policy_backend()
++    sink = _FakeSink()
++    backend._sink = sink
++    backend._client = MagicMock()
++    backend._client.get_state = AsyncMock()
++    await backend._reset_volume_state(sink)
++    await backend._handle_event(_volume_event(80))
++    await backend._handle_event(
++        _event("playback_state", SoloistPlaybackState(status="playing", volume=20, is_active=True))
++    )
++    await backend._handle_event(_event("device_changed", SoloistDeviceChanged(is_active=True)))
++    assert [event.volume for event in events if event.type is BackendEventType.VOLUME] == [20]
++    backend._client.get_state.assert_not_awaited()

@@ -1,0 +1,15 @@
+# Local audited derivative; caller must verify/export/load the exact base image ID.
+# This path deliberately installs no packages and is NOT the fresh apt recipe.
+ARG AUDIO_CACHED_BASE=garage-audio-audio:gaudio-m2-r13
+FROM ${AUDIO_CACHED_BASE}
+USER root
+COPY --chmod=0444 garage_audio/audio_container.py garage_audio/audio_observer.py garage_audio/audio_device.py garage_audio/audio_child.py garage_audio/audio_boot_wait.py garage_audio/audio_zero_check.py garage_audio/audio_scalar.py garage_audio/audio_receiver.py garage_audio/audio_boot.py garage_audio/audio_network.py garage_audio/audio_qualification.py /app/garage_audio/
+COPY --chmod=0444 config/pipewire.conf config/asound.conf /app/audio/
+COPY --chmod=0555 scripts/container-transport /app/audio/container-transport
+COPY --chmod=0444 config/wireplumber-container.lua /etc/wireplumber/main.lua.d/51-garage-private.lua
+COPY --chmod=0444 config/wireplumber-container-bluetooth.lua /etc/wireplumber/bluetooth.lua.d/51-garage-private.lua
+COPY --chmod=0444 config/audio-runtime.lock.json /app/audio/runtime-inputs.json
+COPY --chmod=0444 scripts/audio-runtime-inventory.py /app/audio/runtime-inventory.py
+RUN python /app/audio/runtime-inventory.py > /tmp/runtime-observed.json && python -c 'import json; a=json.load(open("/app/audio/runtime-inputs.json")); b=json.load(open("/tmp/runtime-observed.json")); assert a==b, "cached runtime fingerprint changed"'
+USER 1002:1003
+CMD ["python", "-m", "garage_audio.audio_container"]

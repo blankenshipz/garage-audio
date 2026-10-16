@@ -10,12 +10,14 @@ import os
 import re
 from pathlib import Path
 import secrets
+import signal
 import threading
 import time
 from urllib.parse import urlsplit, unquote
 from .application import Application, private_token
 from .measurement_jobs import JobFailure
 from .speaker_controller import request as speaker_request
+from . import audio_public
 
 def credential_equal(candidate, expected):
     # compare_digest(str,str) raises on non-ASCII. Reject rather than crash a
@@ -44,6 +46,16 @@ def validate_authority(authority):
             raise ValueError('only RFC1918 private IPv4 authorities are supported')
 
 class Server(ThreadingHTTPServer):
+    # Drain bounded request handlers before releasing pinned stores. Daemon
+    # threads would allow SIGTERM to discard a pending durable mutation.
+    daemon_threads = False
+    block_on_close = True
+
+    def get_request(self):
+        connection, address = super().get_request()
+        connection.settimeout(5)
+        return connection, address
+
     def __init__(self, address, app, token, web, allowed_authorities=None, *, trusted_lan_authority=None):
         super().__init__(address, Handler)
         self.app, self.token, self.web = app, token, Path(web).resolve()
@@ -70,7 +82,31 @@ class Server(ThreadingHTTPServer):
         # The SDK store pins a private directory descriptor; release it on HTTP
         # teardown. No model/provider or sound operation is involved.
         harness = getattr(getattr(self,'app',None),'agent_harness',None)
-        if harness is not None: harness.close()
+        try:
+            jobs = getattr(getattr(self,'app',None),'jobs',None)
+            if jobs is not None: jobs.invalidate_all('application_shutdown')
+        finally:
+            if harness is not None: harness.close()
+
+def serve_until_signal(server):
+    """SIGTERM/SIGINT stop admission, drain handlers, then close owned state.
+
+    HTTPServer.shutdown must run outside its serve_forever thread. No model or
+    public audio command is started by lifecycle teardown; ordinary playback
+    remains independent. Existing measurement grants are invalidated.
+    """
+    stopping = threading.Event()
+    def stop(signum, frame):
+        if not stopping.is_set():
+            stopping.set()
+            threading.Thread(target=server.shutdown,daemon=True).start()
+    previous = {sig:signal.signal(sig,stop) for sig in (signal.SIGTERM,signal.SIGINT)}
+    try:
+        server.serve_forever(poll_interval=.1)
+    finally:
+        try: server.server_close()
+        finally:
+            for sig,handler in previous.items(): signal.signal(sig,handler)
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -145,8 +181,14 @@ class Handler(BaseHTTPRequestHandler):
             if not session: self.error(401,'authentication_required','Enter the private bootstrap token'); return
             if self.path == '/api/session': self.send(200,{'ok':True,'result':{'csrf':session['csrf'],'role':'automation','access_mode':'trusted-lan' if self.trusted_lan() else 'token'},'error':None},cookie)
             elif self.path == '/api/speakers/status':
+                if audio_public.deployment_mode() == 'docker':
+                    result = self.server.app.execute('audio.status',{})
+                    self.send(200 if result['ok'] else 409,result);return
                 try:self.send(200,{'ok':True,'result':speaker_request({'cmd':'status','cookie':self.speaker_cookie()}),'error':None})
                 except (OSError,RuntimeError,ValueError,PermissionError):self.error(409,'speakers_unavailable','Speaker controller or browser session unavailable')
+            elif self.path == '/api/setup/ma/status':
+                from . import ma_enrollment
+                self.send(200,{'ok':True,'result':ma_enrollment.status(),'error':None})
             elif self.path == '/api/status': self.send(200,self.server.app.execute('status',{}))
             else: self.error(404,'not_found','Unknown endpoint')
             return
@@ -165,6 +207,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         if not self.boundary(True): return
+        if self.path == '/api/setup/ma/enroll':
+            self.ma_enroll_post();return
         if self.path.startswith('/api/human/') and not self.human_local():
             self.error(403,'confidential_origin_required','Human authority disabled on shared/wildcard/container listener; do not send human credentials'); return
         try:
@@ -193,8 +237,12 @@ class Handler(BaseHTTPRequestHandler):
             # Narrow speaker cookie is not sent to /api/logout. The automation
             # session remembers only its own associated possession for revoke.
             if session.get('speaker_cookie'):
-                try:speaker_request({'cmd':'revoke','cookie':session['speaker_cookie']})
-                except (OSError,RuntimeError,PermissionError,ValueError):
+                try:
+                    if audio_public.deployment_mode() == 'docker':
+                        audio_public.request('audio.stop')
+                    else:
+                        speaker_request({'cmd':'revoke','cookie':session['speaker_cookie']})
+                except (OSError,RuntimeError,PermissionError,ValueError,audio_public.AudioFailure):
                     self.error(409,'speaker_revocation_unverified','Logout not completed: keep dashboard open and press Stop.');return
             self.server.app.jobs.invalidate_all('automation_logout')
             with self.server.session_lock:
@@ -207,6 +255,47 @@ class Handler(BaseHTTPRequestHandler):
         if set(body) != {'operation','args'}:
             self.error(400,'invalid_request','Expected operation and args');return
         self.send(200,self.server.app.execute(body['operation'],body['args']))
+
+    def ma_enroll_post(self):
+        """Human browser-only credential boundary, checked BEFORE body processing.
+
+        The configured trusted LAN HTTP origin is explicitly authorized for MA
+        enrollment, NOT for measurement-human authentication or sound approval.
+        Token bootstrap/MCP sessions cannot use this route.
+        """
+        from . import ma_enrollment
+        if not self.trusted_lan():
+            self.error(403,'ma_enrollment_origin_required','Use the configured garage LAN dashboard');return
+        session=self.session()
+        if not session or session.get('access_mode')!='trusted-lan':
+            self.error(401,'ma_enrollment_session_required','Open the garage dashboard first');return
+        if len(self.headers.get_all('X-CSRF-Token',[]))!=1 or not credential_equal(self.headers.get('X-CSRF-Token',''),session['csrf']):
+            self.error(403,'csrf_rejected','CSRF token required');return
+        def unique(pairs):
+            value={}
+            for key,item in pairs:
+                if key in value:raise ValueError()
+                value[key]=item
+            return value
+        body={}
+        try:
+            if len(self.headers.get_all('Content-Length',[]))!=1 or self.headers.get('Transfer-Encoding'):
+                raise ValueError()
+            length=int(self.headers['Content-Length'])
+            if not 0<length<=16384 or self.headers.get('Content-Type','').split(';')[0]!='application/json':raise ValueError()
+            body=json.loads(self.rfile.read(length),object_pairs_hook=unique,
+                            parse_constant=lambda _:(_ for _ in ()).throw(ValueError()))
+            if not isinstance(body,dict):raise ValueError()
+            result=ma_enrollment.enroll(self.server.app.root,body)
+        except ma_enrollment.EnrollmentFailure as error:
+            self.error(error.status,error.code,'Music Assistant enrollment did not complete; no playback authority granted');return
+        except (ValueError,UnicodeError):
+            self.error(400,'invalid_enrollment_request','Bounded enrollment object required');return
+        except Exception:
+            self.error(503,'ma_installer_unavailable','Music Assistant enrollment is unavailable');return
+        finally:
+            if isinstance(body,dict):body.clear()
+        self.send(200,{'ok':True,'result':result,'error':None})
 
     def speaker_cookie(self):
         raw=self.headers.get('Cookie','')
@@ -221,6 +310,11 @@ class Handler(BaseHTTPRequestHandler):
         command=self.path.removeprefix('/api/speakers/')
         if command not in ('session','setup','stop','action','enable') or set(body)!=({'action'} if command=='enable' else set()):
             self.error(400,'invalid_request','Exact speaker operation required');return
+        if audio_public.deployment_mode() == 'docker':
+            if command != 'stop':
+                self.error(409,'legacy_speaker_operation_unavailable','Docker playback is Spotify-owned; manual legacy enable/session is unavailable');return
+            result = self.server.app.execute('audio.stop',{})
+            self.send(200 if result['ok'] else 409,result);return
         try:
             cookie=None
             if command=='session':
@@ -317,7 +411,7 @@ def main():
     a = p.parse_args()
     token = private_token(os.environ['GARAGE_APP_TOKEN_FILE'])
     authorities = os.environ.get('GARAGE_APP_AUTHORITIES')
-    Server((a.bind,a.port),Application(a.state),token,a.web,authorities.split(',') if authorities else None,
-           trusted_lan_authority=os.environ.get('GARAGE_TRUSTED_LAN_AUTHORITY')).serve_forever()
+    serve_until_signal(Server((a.bind,a.port),Application(a.state),token,a.web,authorities.split(',') if authorities else None,
+           trusted_lan_authority=os.environ.get('GARAGE_TRUSTED_LAN_AUTHORITY')))
 
 if __name__ == '__main__': main()

@@ -1,0 +1,19 @@
+# Explicit partial app-only phase; NOT an ordinary audio-stack deployment.
+# No legacy-native audio fallback. Current retained MA endpoint is operator-bound.
+services:
+  dashboard:
+    environment:
+      MA_URL: ${GARAGE_ENROLLMENT_MA_URL:?exact current retained MA http endpoint8095 required}
+      MA_TOKEN_FILE: /auth-ma/token
+    volumes:
+      - type: bind
+        source: /home/zach/garage-audio/state/ma-enrollment/app
+        target: /auth-ma
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: /run/garage-ma-enrollment
+        target: /run/garage-ma-enrollment
+        read_only: true
+        bind: {create_host_path: false}
+    networks: !override [music]

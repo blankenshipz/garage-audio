@@ -8,22 +8,74 @@ These synthetic tests do not establish connected hardware or live browser accept
 
 The dashboard now displays **one active stage** at a time. Existing section/form
 IDs remain, but integration tests must navigate the matching stage before clicking
-controls. Sidebar anchors retain `#connect`, `#check`, `#calibration`, `#improve`,
-`#verify`, expose `aria-current="step"` and support Arrow keys/Home/End; Enter/Tab
+controls. Sidebar anchors retain `#connect` (Chat), `#check` (Rooms),
+`#calibration` (Measure), `#improve` (Profiles), `#verify` (Evidence), and add
+`#setup` and `#advanced`. They expose `aria-current="step"` and support Arrow keys/Home/End; Enter/Tab
 remain native. Navigation changes no server state and does not recreate forms.
-Persistent summary shows current stage, next action, hardware/no-sound boundary
-and actual human-readiness limitation. `#journey-cancel-job` cancels the selected
-active job from any stage, including while its Measure workspace is hidden.
+Chat is the default entry. It calls actual `agent.session.create/list/get`,
+`agent.run` and `agent.cancel` typed operations. Server-held messages persist;
+browser storage contains only the conversation ID, never credentials or content.
+Inference remains disabled: saved user messages do not generate canned assistant
+responses, provider calls, tool execution or sound authority. Setup surfaces actual
+device/credential prerequisites and allows display-name and bounded disabled-agent
+configuration changes through `setup.*` / `agent.config.*`. Provider keys are not
+accepted by these forms. Setup/manual controls remain useful without AI.
+
+The old deterministic journey summary is hidden, not a chat reply. Job cancellation
+remains in the preserved advanced FILE workspace. `#speakers-stop` is in a sticky
+bar outside every workspace; it is not gated by chat, setup or dashboard busy state.
+Dashboard authentication still applies. A request acknowledgement is not hardware
+silence proof, and local rendering is not physical phone/Safari acceptance.
+Docker mode reads `audio.status` and sends `audio.stop` through the shared typed
+operation boundary; it never creates a legacy speaker session. Only explicit
+server-reported `legacy-native` mode exposes the old diagnostic controls. Stop
+errors/readback are visible beside the independent Stop button. Setup distinguishes
+FILE-worker readiness from physical device verification. Everyday wiring is
+full-range stereo OUT3/4 with no subwoofer path; legacy offline profile editing
+is retained in the secondary profile workspace.
+`setup.spotify.*` adds the direct official Soloist begin/reconfigure, owned-flow
+read/submit/cancel and literal advertised-name forms. Reload reads server status
+and the retained app-owned flow ID; no raw MA flow IDs or credentials are stored.
+Terms default false and require an explicit user's checkbox; Premium and Spotify
+terms warnings are displayed. Key handoff accepts only the fixed private server
+reference or an explicitly reported stored key, never a key/password input.
+Expired or aborted setup cannot gate ordinary playback or independent Stop.
+Missing MA credentials now have a phone-first **Connect Music Assistant** form in
+Setup: existing MA username/password, explicit service-token/inherited-permissions
+disclosure and trusted-LAN unencrypted HTTP warning. It uses the normal dashboard
+session and CSRF with dedicated `POST /api/setup/ma/enroll`, exactly
+`{username,password,request_id,confirm:true}`, never operations/MCP/measurement
+human routes. `GET /api/setup/ma/status` is authoritative; only `state:ready`,
+`scope_verified:true` and an enrollment identity show connected. Both private
+credential copies must have been verified by the backend. Unavailable installer
+state remains unavailable; no token input, secret link or terminal prerequisite.
+Only a pending random request ID is saved in sessionStorage. Credentials are never
+component state, URLs, events, chat, console or browser storage; both inputs clear
+on submit, completion, cancel, lock, navigation and page exit. Cancel clears inputs
+but cannot undo an already sent issuance request. Lost replies/interrupted issuance
+disable new Connect requests pending verified readiness or operator reconciliation;
+there is no automatic issuance retry. Isolated tests prove UI code only; actual
+matching-backend form rendering and real phone-user enrollment are separate gates.
+No enrollment action accepts Spotify terms, creates a provider, grants measurement
+authority, starts audio or enables inference. Authenticated provider setup still
+requires the approved private integration and retained public setup safeguards.
+Setup status now distinguishes provider setup, required Soloist/Spotify-authoritative
+policy availability, stored-policy mismatch and runtime qualification. A stored
+policy is never described as qualified playback. The volume mode remains server-owned;
+the configuration form still sends only the advertised device name. An actual MA
+restart can return retained `last_flow.type:interrupted`; it is terminal, displays
+the server notice and allows Start/Review, never old consent/key continuation.
+Offline errors preserve the cached flow instead of inventing interruption or completion.
 
 Measure leads with the selected job when one exists; `#measurement-workspace`
 then holds the preserved plan/import UI (default closed after job selection).
 Open `#plan-preparation` for the plan form, `#measurement-import` for
 imports, `#measurement-comparison` for plots, `#job-request-details` for job
 preparation, `#job-authority-details` for native human controls when available,
-and `#job-history-details` for history. Check retains diagnostics and advanced
-profiles behind actual details disclosures. Raw MCP JSON, brief, manifest,
+and `#job-history-details` for history. Advanced retains diagnostics and manual
+output controls; Profiles retains the offline library. Raw MCP JSON, brief, manifest,
 format/policy bounds, event history, quality checks and per-channel plots default
-closed. Copy setup/brief remain prominent in Connect. No hidden-button clicks
+closed. External SSH MCP setup/brief are secondary in Advanced. No hidden-button clicks
 count as journey verification; scripts must open these real disclosures.
 When revision2 data is returned, the existing job card reads actual
 `manifest.native_file_route` and `evidence.native_file_render`: bound version and
@@ -80,11 +132,12 @@ The copyable agent task brief is only a safe template for the user's own MCP cli
 not LLM inference, embedded chat, a verified agent connection or sound consent.
 Configuration details are secondary to the copy action, with manual-copy fallback.
 
-The primary navigation is **Connect → Check → Measure → Improve → Verify**.
-Connect provides a token-free SSH MCP configuration and clipboard/manual selection
-fallback for trusted-LAN HTTP. Copying never claims agent connection. Check reads
+The primary navigation is **Chat / Setup / Rooms / Measure / Profiles / Evidence / Advanced**.
+Advanced provides a token-free SSH MCP configuration and clipboard/manual selection
+fallback for trusted-LAN HTTP. Copying never claims agent connection. Rooms reads
 published capabilities and separates dashboard authentication from unavailable DSP,
-microphone/output discovery and human sound authority. No embedded paid chat exists.
+microphone/output discovery and human sound authority. Embedded conversations are
+real saved records with inference disabled, not simulated assistant conversations.
 
 Measure creates `calibration.plan` records through the existing authenticated
 operation envelope (only when advertised by capabilities). Select a session and

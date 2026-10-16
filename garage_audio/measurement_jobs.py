@@ -1,4 +1,4 @@
-"""Persisted one-use, exact-manifest offline jobs. Hardware execution is HARD disabled."""
+"""Persisted one-use exact-manifest jobs; hardware requires immutable admission."""
 from contextlib import contextmanager
 from dataclasses import asdict
 import fcntl
@@ -18,9 +18,10 @@ from .human_authority import HumanIdentity
 from .measurement_signal import excitation, sha
 from .profile import DEFAULT
 from . import measurement_route
+from . import measurement_hardware
+from . import measurement_correction
 from . import measurement_artifacts as artifacts
 
-HARDWARE_ENABLED = False
 MAX_JOBS = 24
 MAX_JOB_BYTES = 262144
 MAX_FILES_BYTES = 32*1024*1024
@@ -80,7 +81,7 @@ class Jobs:
         size = sum(p.stat().st_size for p in self.root.glob('*/*') if p.is_file() and not p.is_symlink())
         existing = (directory/'job.json').stat().st_size if (directory/'job.json').exists() else 0
         if size-existing+len(data) > MAX_FILES_BYTES: raise JobFailure('storage_limit','Job artifact limit reached',['Operator archive required'])
-        self.app.write_atomic(directory/'job.json',data)
+        artifacts.replace_json(directory,'job.json',data)
         return job
 
     def _transition(self, job, state, reason):
@@ -95,10 +96,18 @@ class Jobs:
         if digest(self.app.read('sessions',job['session_id'])) != job['manifest']['session_revision']: return False
         directory = self.directory(job['id'])
         try:
+            if job['manifest']['adapter'] == 'hardware':
+                return (measurement_hardware.admission() == job['manifest']['hardware_admission'] and
+                    measurement_correction.snapshot() == job['manifest']['correction_render']['binding'] and
+                    hashlib.sha256(artifacts.read(directory,'correction-config.json',65536)).hexdigest() == job['manifest']['correction_render']['config_sha256'] and
+                    hashlib.sha256(artifacts.read(directory,'excitation.wav',400000)).hexdigest() == job['manifest']['signal']['excitation_sha256'] and
+                    hashlib.sha256(artifacts.read(directory,'manifest.json',MAX_JOB_BYTES)).hexdigest() == job['manifest_file_sha256'] and
+                    hashlib.sha256(artifacts.read(directory,'microphone-calibration.txt',262144)).hexdigest() == job['manifest']['hardware_admission']['policy']['calibration_sha256'] and
+                    json.loads(artifacts.read(directory,'hardware-admission.json',32768)) == job['manifest']['hardware_admission'])
             return (hashlib.sha256(artifacts.read(directory,'excitation.wav',400000)).hexdigest() == job['manifest']['signal']['excitation_sha256'] and
                     hashlib.sha256(artifacts.read(directory,'manifest.json',MAX_JOB_BYTES)).hexdigest() == job['manifest_file_sha256'] and
                     hashlib.sha256(artifacts.read(directory,'native-config.json',65536)).hexdigest() == job['manifest']['native_file_route']['config_sha256'])
-        except (OSError,ValueError): return False
+        except (OSError,ValueError,KeyError,TypeError,measurement_correction.audio_public.AudioFailure): return False
 
     def _grant_current(self, job):
         if not self.app.human_approval_available: return False
@@ -116,7 +125,7 @@ class Jobs:
             value['journal_repair_required'] = True
         value['next_action'] = {'awaiting_human':'Human reviews exact manifest through separate fresh human login',
             'approved':'measurement_execute', 'running':'measurement_read or measurement_cancel',
-            'completed':'Inspect explicitly synthetic evidence; hardware capture remains unavailable'}.get(value['state'],'Review history; request a fresh job if needed')
+            'completed':'Inspect retained source/QC; capture completion does not prove acoustic improvement'}.get(value['state'],'Review history; request a fresh job if needed')
         if value.get('journal_repair_required'): value['next_action'] = 'Restore journal availability and retry measurement_cancel; old authority remains revoked'
         value['progress'] = {'stage':value['state'],'terminal':value['state'] in TERMINAL}
         try: provisioned = bool(self.verifier.load()[0])
@@ -131,7 +140,8 @@ class Jobs:
         return value
 
     def request(self, session_id, position, channel, adapter='file-null'):
-        if adapter != 'file-null': raise JobFailure('hardware_disabled','Hardware adapter is unconditionally disabled',['No audio device opens or live signal execution are authorized'])
+        if adapter == 'hardware': return self.request_hardware(session_id, position, channel)
+        if adapter != 'file-null': raise JobFailure('adapter_invalid','Unknown measurement adapter')
         with self.transaction():
             if len(self._records()) >= MAX_JOBS: raise JobFailure('storage_limit','Job limit reached',['Operator archive required'])
             session = self.app.read('sessions',session_id)
@@ -157,7 +167,7 @@ class Jobs:
                     'policy':{'volume_ceiling_db':-20,'startup_master_db':-60,'muted':True,
                               'profile_sha256':digest(DEFAULT),'dsp_generation':'unverified-file-null-not-native-DSP',
                               'receipt_sha256':digest({'file-null':True,'native_dsp_exercised':False})}}
-                self.app.write_atomic(directory/'manifest.json',canonical(manifest))
+                artifacts.write(directory,'manifest.json',canonical(manifest))
                 now = time.time()
                 job = {'id':identifier,'session_id':session_id,'epoch':self.epoch,'state':'awaiting_human',
                     'source':'synthetic','hardware_enabled':False,'sound_disabled':True,'adapter':'file-null',
@@ -166,6 +176,41 @@ class Jobs:
                     '_grant':None,'authority_consumed':False,'history':[{'state':'awaiting_human','at':now,'reason':'offline excitation generated; no devices opened'}]}
                 self._save(job)
                 return self._public(job)
+            except BaseException:
+                for path in directory.iterdir(): path.unlink()
+                directory.rmdir(); raise
+
+    def request_hardware(self, session_id, position, channel):
+        # Readiness/preparation never opens devices and cannot authorize execution.
+        with self.transaction():
+            if len(self._records()) >= MAX_JOBS: raise JobFailure('storage_limit','Job history full')
+            session = self.app.read('sessions',session_id); plan = session.get('plan',{})
+            if session.get('state') == 'cancelled' or plan.get('target') != 'server-umik-umc' or position not in plan.get('positions',[]) or channel not in plan.get('channels',[]):
+                raise JobFailure('plan_required','Active server measurement plan required')
+            identifier = uuid.uuid4().hex; directory = self.directory(identifier); directory.mkdir(mode=0o700)
+            try:
+                spec = excitation(directory/'excitation.wav',plan['sample_rate'],channel)
+                try:
+                    bound = measurement_hardware.prepare(directory,channel,spec,plan['orientation'])
+                    correction = measurement_correction.prepare(directory,measurement_correction.snapshot(),channel,bound['policy']['outputs'][channel])
+                except (OSError,ValueError,KeyError,TypeError,measurement_correction.audio_public.AudioFailure):
+                    raise JobFailure('hardware_prerequisites_required','Calibrated microphone/commissioned route admission failed',measurement_hardware.readiness().get('requirements',[])) from None
+                try: realm = self.verifier.load()[0]['realm']
+                except (OSError,ValueError,TypeError): realm = 'unprovisioned-human-realm'
+                manifest = {'version':4,'realm':realm,'server_epoch':self.epoch,'adapter':'hardware','correction_render':correction,
+                    'session_id':session_id,'session_revision':digest(session),'position':position,'channel':channel,
+                    'source':'measured','hardware_enabled':True,'sound_disabled':False,'hardware_admission':bound,
+                    'signal':spec,'budgets':{'setup_seconds':2,'analysis_seconds':20,'shutdown_seconds':3,'total_seconds':30},
+                    'policy':{'output_peak_dbfs':bound['policy']['peak_dbfs'],'output_isolation':'single-commissioned-branch',
+                        'independent_attended_approval_required':True,'raw_capture_retained':True}}
+                artifacts.write(directory,'manifest.json',canonical(manifest))
+                now = time.time()
+                job = {'id':identifier,'session_id':session_id,'epoch':self.epoch,'state':'awaiting_human',
+                    'source':'measured','hardware_enabled':True,'sound_disabled':False,'adapter':'hardware',
+                    'manifest':manifest,'manifest_sha256':digest(manifest),'manifest_file_sha256':sha(directory/'manifest.json'),
+                    'created_at':now,'updated_at':now,'approval':{'approved':False,'reason':'separate fresh attended approval required'},
+                    '_grant':None,'authority_consumed':False,'history':[{'state':'awaiting_human','at':now,'reason':'metadata admitted; no devices opened'}]}
+                self._save(job); return self._public(job)
             except BaseException:
                 for path in directory.iterdir(): path.unlink()
                 directory.rmdir(); raise
@@ -183,7 +228,7 @@ class Jobs:
             job['_grant'] = {'identity':asdict(identity),'manifest_sha256':manifest_hash,'expires_at':expires,
                              'expires_monotonic':min(identity.authenticated_monotonic+300,time.monotonic()+60),'consumed':False}
             job['state'] = 'approved'; job['approval'] = {'approved':True,'user':identity.user,'credential_version':identity.version,'expires_at':expires,'manifest_sha256':manifest_hash}
-            job['history'].append({'state':'approved','at':time.time(),'reason':'separate fresh human approved exact file/null manifest'})
+            job['history'].append({'state':'approved','at':time.time(),'reason':'separate fresh human approved exact manifest'})
             return self._public(self._save(job))
 
     def get(self, identifier):
@@ -242,10 +287,13 @@ class Jobs:
             if job['state'] != 'approved':
                 raise JobFailure('human_approval_required','Current one-use exact-manifest human approval required',
                     ['Separate human must review current manifest through fresh independent human login; agent/bootstrap strings cannot grant approval'])
-            if job['manifest'].get('version') != 2:
+            if job['manifest'].get('version') not in (2,4):
                 raise JobFailure('manifest_superseded','Legacy file-only manifest cannot execute; request a version2 native FILE job')
             directory = self.directory(identifier)
-            artifacts.admit(directory,measurement_route.RENDER_FRESH+('child.stdout','child.stderr','guardian-exit.json','parent-reap.json'),measurement_route.RENDER_EXISTING)
+            hardware = job['manifest']['adapter'] == 'hardware'
+            fresh = measurement_hardware.FRESH if hardware else measurement_route.RENDER_FRESH
+            existing = measurement_hardware.EXISTING if hardware else measurement_route.RENDER_EXISTING
+            artifacts.admit(directory,fresh+('child.stdout','child.stderr','guardian-exit.json','parent-reap.json'),existing)
             # Rescue reaper remains outside the owned process group. Never wait on
             # unrelated children: the monitor uses waitpid(-owned_pgid) only.
             if sys.platform.startswith('linux'):
@@ -348,10 +396,10 @@ class Jobs:
                     evidence['evidence_sha256'] = digest(evidence)
                     job['evidence'] = evidence
                 if code == 0 and job['state'] == 'running' and path.is_file() and path.stat().st_size <= MAX_JOB_BYTES and self._fresh(job):
-                    self._transition(job,'completed','owned file/null child completed; deterministic synthetic evidence')
+                    self._transition(job,'completed','owned child completed; inspect source and QC; not improvement proof')
                     self._save(job)
                 elif job['state'] == 'running':
-                    job['error'] = {'code':'child_or_quality_failed','message':'Owned file/null child failed quality checks or deadline','child_exit_status':code,
+                    job['error'] = {'code':'child_or_quality_failed','message':'Owned measurement child failed quality checks or deadline','child_exit_status':code,
                                     'requirements':['Inspect bounded evidence/history; request a new job and separate approval; no hardware success is claimed']}
                     self._transition(job,'failed','child failed or guardian deadline expired; no hardware success')
                 else: self._save(job)

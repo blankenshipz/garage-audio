@@ -20,6 +20,7 @@ from agents import Agent, Runner, RunConfig, function_tool, set_tracing_disabled
 from agents.exceptions import MaxTurnsExceeded
 from agents.models.interface import Model
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from . import private_records
 
 set_tracing_disabled(True)
 SDK_VERSION = '0.23.1'
@@ -28,6 +29,9 @@ MAX_SESSIONS = 128
 MAX_ITEMS = 128
 SCHEMAS = {
     'agent.status': ([], []),
+    'agent.session.list': ([], []),
+    'agent.config.get': ([], []),
+    'agent.config.set': (['provider', 'model', 'credential_ref', 'max_turns', 'timeout_seconds'], []),
     'agent.session.create': ([], ['name', 'room_id']),
     'agent.session.get': (['id'], []),
     'agent.run': (['id', 'expected_version', 'message'], []),
@@ -41,8 +45,16 @@ _TYPES = {'id': _ID, 'room_id': _ID,
 OPERATION_SCHEMAS = {
     op: {'type': 'object', 'properties': {k: _TYPES[k] for k in required + optional},
          'required': required, 'additionalProperties': False}
-    for op, (required, optional) in SCHEMAS.items()
+    for op, (required, optional) in SCHEMAS.items() if op != 'agent.config.set'
 }
+OPERATION_SCHEMAS['agent.config.set'] = {
+    'type': 'object', 'additionalProperties': False,
+    'required': SCHEMAS['agent.config.set'][0], 'properties': {
+        'provider': {'const': 'openai'},
+        'model': {'type': 'string', 'pattern': '^[a-zA-Z0-9][a-zA-Z0-9._-]{0,79}$'},
+        'credential_ref': {'const': 'application-agent'},
+        'max_turns': {'type': 'integer', 'minimum': 1, 'maximum': 8},
+        'timeout_seconds': {'type': 'integer', 'minimum': 1, 'maximum': 30}}}
 READ_OPERATIONS = frozenset(('rooms.list', 'rooms.get', 'listening_profiles.list',
                              'listening_profiles.get', 'listening_profiles.guide'))
 
@@ -152,8 +164,12 @@ def build_agent(application, model=None):
 class Store:
     """Bounded anchored JSON storage; caller owns Application thread/process lock."""
     def __init__(self, root):
+        self.root = Path(root)
         self.fd = None
-        root_fd = os.open(Path(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            root_fd = private_records.open_root(root)
+        except (OSError, ValueError):
+            raise AgentFailure('storage_invalid', 'Private agent storage unavailable') from None
         try:
             try:
                 os.mkdir('agent-sessions', 0o700, dir_fd=root_fd)
@@ -219,21 +235,10 @@ class Store:
         data = json.dumps(record, allow_nan=False).encode()
         if len(data) > MAX_BYTES or len(record['items']) > MAX_ITEMS:
             raise AgentFailure('storage_limit', 'Conversation limit reached; start another session')
-        temp = uuid.uuid4().hex + '.tmp'
-        fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                     0o600, dir_fd=self.fd)
         try:
-            with os.fdopen(fd, 'wb') as f:
-                f.write(data)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(temp, record['id'] + '.json', src_dir_fd=self.fd, dst_dir_fd=self.fd)
-            os.fsync(self.fd)
-        finally:
-            try:
-                os.unlink(temp, dir_fd=self.fd)
-            except FileNotFoundError:
-                pass
+            private_records.write(self.fd, record['id'] + '.json', data)
+        except (OSError, ValueError):
+            raise AgentFailure('storage_invalid', 'Private agent storage unavailable') from None
         return copy.deepcopy(record)
 
     def execute(self, operation, args, application):
@@ -243,6 +248,23 @@ class Store:
             raise ValueError('Invalid agent operation arguments')
         if operation == 'agent.status':
             return self.status()
+        if operation in ('agent.config.get', 'agent.config.set'):
+            with private_records.directory(self.root, 'agent-config') as fd:
+                if operation == 'agent.config.set':
+                    private_records.write(fd, 'config.json', json.dumps(args,allow_nan=False).encode())
+                try:
+                    config = private_records.read(fd, 'config.json', 4096)
+                except FileNotFoundError:
+                    config = {'provider': 'openai', 'model': 'gpt-4.1-mini',
+                              'credential_ref': 'application-agent', 'max_turns': 4, 'timeout_seconds': 20}
+            if not Draft202012Validator(OPERATION_SCHEMAS['agent.config.set']).is_valid(config):
+                raise AgentFailure('storage_invalid', 'Agent configuration unavailable')
+            return {**config, 'inference_enabled': False, 'state': 'inference_disabled'}
+        if operation == 'agent.session.list':
+            names = [name for name in os.listdir(self.fd) if re.fullmatch(r'[a-f0-9]{32}\.json',name)]
+            if len(names) > MAX_SESSIONS:
+                raise AgentFailure('storage_limit', 'Agent session limit reached')
+            return sorted([self.read(name[:-5]) for name in names],key=lambda r:r['updated_at'],reverse=True)
         if operation == 'agent.session.create':
             if len(os.listdir(self.fd)) >= MAX_SESSIONS:
                 raise AgentFailure('storage_limit', 'Agent session limit reached')
@@ -265,6 +287,9 @@ class Store:
             record['state'] = 'inference_disabled'
             record['items'].append({'role': 'user', 'content': args['message']})
             record['last_result'] = self.status()
+            record.setdefault('runs', []).append({'id': uuid.uuid4().hex,
+                'state': 'inference_disabled', 'created_at': time.time(),
+                'provider_called': False, 'events': [{'type': 'policy', 'state': 'inference_disabled'}]})
         else:
             record['state'] = 'cancelled'
             record['pending_proposals'] = None

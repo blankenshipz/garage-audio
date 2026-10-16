@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""Prepare a thin runtime snapshot, not a final release freeze or deployment.
+
+Consumes private sanitized live parent metadata; never discovers credentials,
+downloads dependencies, prunes data, starts services or admits a build itself.
+"""
+import argparse
+import hashlib
+import io
+import json
+from pathlib import Path
+import re
+import tarfile
+
+PARENT='sha256:44038332e66f37ddca6a49e049a9c818e3392c06b8f073e29cedaed3e28b82f6'
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--receipt', type=Path, required=True,
+                        help='Existing private directory with parent-metadata.json, parent-image.json and camilladsp-direct-url.json')
+    parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
+    args=parser.parse_args()
+    root=args.root.resolve(); receipt=args.receipt.resolve()
+    if not receipt.is_dir() or receipt.is_relative_to(root):
+        raise SystemExit('Receipt must be an existing private directory outside source inputs')
+    if (receipt/'context.tar').exists():
+        raise SystemExit('Retain existing snapshots; use a new receipt directory')
+    sha=lambda data:hashlib.sha256(data).hexdigest()
+    old=json.loads((receipt/'parent-metadata.json').read_text())
+    image=json.loads((receipt/'parent-image.json').read_text())
+    official=json.loads((root/'config/docker-python-base-provenance.json').read_text())
+    if image['Id']!=PARENT or image['Architecture']!='amd64' or image['Os']!='linux':
+        raise SystemExit('Immutable parent/platform mismatch')
+    if image['RootFS']['Layers'][:len(official['diff_ids'])]!=official['diff_ids']:
+        raise SystemExit('Parent does not inherit exact verified official Python base')
+    verified=[]
+    for path,digest in old['dependencies'].items():
+        if path=='/app/requirements.lock':name='requirements.lock'
+        elif path.startswith('/opt/garage-audio/dsp/vendor/'):
+            name='vendor/dsp/'+path.removeprefix('/opt/garage-audio/dsp/vendor/')
+        else:raise SystemExit('Unexpected parent dependency path')
+        if '..' in Path(name).parts or sha((root/name).read_bytes())!=digest:
+            raise SystemExit('Changed dependency input: '+name)
+        verified.append({'path':name,'sha256':digest})
+    actual={str(p.relative_to(root)) for p in (root/'vendor/dsp').rglob('*') if p.is_file()}|{'requirements.lock'}
+    if actual!={x['path'] for x in verified}:raise SystemExit('Dependency input set mismatch')
+    packages={re.sub(r'[-_.]+','-',k).lower():v for k,v in old['installed_packages'].items()}
+    direct=json.loads((receipt/'camilladsp-direct-url.json').read_text())
+    for line in (root/'requirements.lock').read_text().splitlines():
+        line=line.strip()
+        if not line or line.startswith('#'):continue
+        if line.startswith('camilladsp @ '):
+            url,digest=line.removeprefix('camilladsp @ ').split('#sha256=')
+            if direct['url']!=url or direct['archive_info']['hashes']['sha256']!=digest:
+                raise SystemExit('Parent Camilla Python direct URL/hash mismatch')
+            continue
+        match=re.fullmatch(r'([A-Za-z0-9_.-]+)(?:\[[^]]+\])?==([^;\s]+)',line)
+        if not match or packages.get(re.sub(r'[-_.]+','-',match[1]).lower())!=match[2]:
+            raise SystemExit('Parent installed lock mismatch')
+    if old['python']!='3.13.16':raise SystemExit('Parent Python mismatch')
+    contents={}
+    for folder in ('garage_audio','web','profiles'):
+        for path in sorted((root/folder).rglob('*')):
+            if '__pycache__' in path.parts or path.suffix=='.pyc':continue
+            if path.name=='.DS_Store':continue
+            if path.name=='.env' or path.name.startswith('.env.'):
+                raise SystemExit('Secret-like runtime input is prohibited')
+            if path.is_symlink():raise SystemExit('Symlink runtime input')
+            if path.is_file():contents[str(path.relative_to(root))]=path.read_bytes()
+        previous=set(old['source_files'][folder]); current={n for n in contents if n.startswith(folder+'/')}
+        if previous-current:raise SystemExit('Parent-only source files require explicit replacement review')
+        if folder=='profiles' and previous!=current:raise SystemExit('Shipped profile set changed')
+    inventory=[{'path':n,'bytes':len(b),'sha256':sha(b)} for n,b in sorted(contents.items())]
+    revision=sha(json.dumps(inventory,sort_keys=True,separators=(',',':')).encode())
+    provenance={'schema_version':1,'classification':'cached-project-dependency deployment derivative, NOT fresh install',
+        'parent_image':PARENT,'parent_reference':'garage-audio-dashboard@'+PARENT,
+        'parent_rootfs':image['RootFS'],'official_python_manifest':official['manifest_digest'],
+        'official_python_config':official['config_digest'],'python_version':old['python'],
+        'parent_installed_packages':old['installed_packages'],'camilladsp_python_direct_url':direct,
+        'verified_unchanged_dependency_inputs':verified,'runtime_source_revision':revision,
+        'runtime_source_inventory':inventory,'recipe':'Dockerfile.dashboard.cached','fresh_install_recipe':'Dockerfile.dashboard',
+        'qualification':'Application-image checkpoint; final package/audio/receiver/exclusive-device/rollback gates required.'}
+    contents['image-provenance.json']=json.dumps(provenance,sort_keys=True,indent=2).encode()+b'\n'
+    contents['Dockerfile']=(root/'Dockerfile.dashboard.cached').read_bytes()
+    with tarfile.open(receipt/'context.tar','w') as archive:
+        for name,data in sorted(contents.items()):
+            info=tarfile.TarInfo(name); info.size=len(data); info.mode=0o644; info.uid=0; info.gid=0; info.mtime=0
+            archive.addfile(info,io.BytesIO(data))
+    (receipt/'image-provenance.json').write_bytes(contents['image-provenance.json'])
+    # Exact frozen app/web map for root process admission, never a four-file minimum.
+    admission={'/app/'+x['path']:x['sha256'] for x in inventory
+               if x['path'].startswith(('garage_audio/','web/'))}
+    for name in ('private_records.py','ma_enrollment.py','ma_enrollment_installer.py','ma_enrollment_admission.py','webserver.py','setup.py'):
+        if '/app/garage_audio/'+name not in admission:raise SystemExit('Missing enrollment runtime input: '+name)
+    if len(admission)>256:raise SystemExit('Full admission manifest exceeds installer bound')
+    (receipt/'ma-enrollment-source-manifest.json').write_text(json.dumps(admission,sort_keys=True,indent=2)+'\n')
+    bootstrap_names=['garage_audio/'+n for n in ('__init__.py','private_records.py','ma_enrollment.py','ma_enrollment_installer.py','ma_enrollment_admission.py')]
+    bootstrap_names+=['config/system/garage-ma-enrollment.service','config/system/garage-ma-enrollment.tmpfiles']
+    bootstrap={n:sha((root/n).read_bytes()) for n in bootstrap_names}
+    (receipt/'ma-enrollment-bootstrap-inventory.json').write_text(json.dumps(bootstrap,sort_keys=True,indent=2)+'\n')
+    report={'source_revision':revision,'context_sha256':sha((receipt/'context.tar').read_bytes()),
+        'recipe_sha256':sha(contents['Dockerfile']),'runtime_files':len(inventory),
+        'context_bytes':(receipt/'context.tar').stat().st_size,'source_bytes':sum(x['bytes'] for x in inventory),
+        'parent_image':PARENT,'dependency_inputs_verified':len(verified),'all_locked_versions_match_installed':True,
+        'not_final_release_freeze':True,'budget_bytes':128*1024**2,'reserve_bytes':2*1024**3,
+        'additional_receiver_headroom_bytes':256*1024**2,'no_receiver_download_or_apt_install_in_this_build':True}
+    if report['context_bytes']*8+32*1024**2>report['budget_bytes']:
+        raise SystemExit('Estimated context/cache/export/log growth exceeds budget; retain snapshot, do not build')
+    (receipt/'snapshot.json').write_text(json.dumps(report,indent=2)+'\n')
+    print(json.dumps(report))
+
+if __name__=='__main__':main()

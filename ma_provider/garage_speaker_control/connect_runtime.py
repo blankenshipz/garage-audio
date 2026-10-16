@@ -38,6 +38,9 @@ def discard_capture(fifo):
     finally:os.close(fd)
 
 
+IPC_REPLY_TIMEOUT = 3
+
+
 class NativeBridge:
     def __init__(self,backend,provider,daemon):
         self.backend=backend;self.provider=provider;self.daemon=daemon
@@ -62,25 +65,55 @@ class NativeBridge:
 
     async def request(self,cmd,**fields):
         async with self.lock:
+            if self.closed or self.failed_transport:
+                raise PermissionError('native receiver IPC lifetime retired')
+            # Legacy gateway uses ordered one-line replies, not request IDs. The
+            # exchange owns this lock AND its exact reply even if its caller cancels.
+            pending=asyncio.create_task(self._exchange(cmd,fields))
+            try:return await asyncio.shield(pending)
+            except asyncio.CancelledError:
+                while not pending.done():
+                    try:await asyncio.shield(pending)
+                    except asyncio.CancelledError:continue
+                    except Exception:break
+                # Consume a failed drain; _exchange already retired indeterminate IPC.
+                if not pending.cancelled():pending.exception()
+                raise
+
+    def _retire_ipc(self):
+        self.failed_transport=True;self.closed=True;self.status='ipc_retired'
+        if self.writer is not None:self.writer.close()
+        else:self.socket.close()
+
+    async def _exchange(self,cmd,fields):
+        async def framed():
             if self.reader is None:
                 self.socket.setblocking(False)
                 self.reader,self.writer=await asyncio.open_unix_connection(sock=self.socket,limit=4096)
-            self.writer.write(json.dumps(dict(cmd=cmd,**fields)).encode()+b'\n');await self.writer.drain()
-            try:raw=await asyncio.wait_for(self.reader.readline(),3)
-            except (OSError,TimeoutError) as error:
-                trace('native_ipc_closed',command=cmd,error=type(error).__name__)
-                self.failed_transport=True;raise
-            if not raw or len(raw)>4096:
-                trace('native_ipc_closed',command=cmd)
-                self.failed_transport=True;raise PermissionError('native receiver bridge disconnected')
+            self.writer.write(json.dumps(dict(cmd=cmd,**fields)).encode()+b'\n')
+            await self.writer.drain()
+            raw=await self.reader.readline()
+            if not raw.endswith(b'\n') or len(raw)>4096:
+                raise ValueError('incomplete/oversized native response')
             value=json.loads(raw)
-            if value.get('ok') is not True:
-                trace('native_ipc_denied',command=cmd)
-                self.denied=True;self.status='guard_denied';raise PermissionError('native receiver bridge denied operation')
-            result=value['result']
-            if cmd in ('connect-prepare','connect-bind','connect-pulse'):
-                trace('native_state',command=cmd,state=result.get('state'),error=result.get('error'),transport=fields.get('state'))
-            return result
+            if not isinstance(value,dict) or type(value.get('ok')) is not bool:
+                raise ValueError('invalid native response frame')
+            if value['ok'] and not isinstance(value.get('result'),dict):
+                raise ValueError('invalid native response result')
+            return value
+        try:value=await asyncio.wait_for(framed(),IPC_REPLY_TIMEOUT)
+        except BaseException as error:
+            self._retire_ipc()
+            trace('native_ipc_closed',command=cmd,error=type(error).__name__)
+            raise
+        if value['ok'] is not True:
+            trace('native_ipc_denied',command=cmd)
+            self.denied=True;self.status='guard_denied'
+            raise PermissionError('native receiver bridge denied operation')
+        result=value['result']
+        if cmd in ('connect-prepare','connect-bind','connect-pulse'):
+            trace('native_state',command=cmd,state=result.get('state'),error=result.get('error'),transport=fields.get('state'))
+        return result
 
     async def attest(self,backend,client,epoch):
         if backend is not self.backend or str(client.data_dir)!=DATA:raise PermissionError('exact installed receiver required')
@@ -145,6 +178,16 @@ class NativeBridge:
 
     async def observe_volume(self,value):
         return await self.request('connect-volume',volume=value)
+
+    async def verify_preparation_pause(self,binding):
+        if (self.closed or self.failed_transport or self.denied or not self.armed
+                or self.epoch!=binding.epoch or self.port!=binding.port):
+            return False
+        # Existing gateway verifies the protected live daemon and exact MA process on
+        # every pulse. This only reduces transport authority, never binds/unmutes/plays.
+        result=await self.request('connect-pulse',state='paused',volume=self.volume())
+        return (not self.closed and not self.failed_transport and not self.denied
+                and result['state'] in ('setting_up','prepared','listening'))
 
     def volume(self):
         state=self.provider.mass.players.get_player_state(TARGET)
@@ -280,6 +323,7 @@ class ConnectRuntime:
                 async def prepare(self,*values):return await self.current().prepare(*values)
                 async def pulse(self,*values):return await self.current().pulse(*values)
                 async def observe_volume(self,*values):return await self.current().observe_volume(*values)
+                async def verify_preparation_pause(self,*values):return await self.current().verify_preparation_pause(*values)
                 def pause(self):self.current().pause()
                 def revoke(self):
                     if backend in runtime.bridges:self.current().revoke()

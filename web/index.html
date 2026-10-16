@@ -7,21 +7,20 @@
   <link rel="stylesheet" href="/assets/style.css"><script type="module" src="/assets/app.js"></script>
 </head>
 <body>
-  <header class="masthead"><a class="brand" href="#overview" aria-label="Garage Speakers home"><span class="brand-mark" aria-hidden="true">g.</span><span>GARAGE<span class="brand-sub">SPEAKERS / 2.1</span></span></a><div class="connection"><span id="connection-dot" class="dot"></span><span id="connection-label">Not connected</span><button id="sign-out" class="text-button" hidden>Lock</button></div></header>
+  <header class="masthead"><a class="brand" href="#connect" aria-label="Garage Speakers home"><span class="brand-mark" aria-hidden="true">g.</span><span>GARAGE<span class="brand-sub">SPEAKERS</span></span></a><div class="connection"><span id="connection-dot" class="dot"></span><span id="connection-label">Not connected</span><button id="sign-out" class="text-button" hidden>Lock</button></div></header>
   <div class="shell">
-    <aside class="sidebar"><p class="eyebrow">AGENT WORKFLOW</p><nav aria-label="Main"><a href="#connect" class="active">Connect <span>01</span></a><a href="#check">Check <span>02</span></a><a href="#calibration">Measure <span>03</span></a><a href="#improve">Improve <span>04</span></a><a href="#verify">Verify <span>05</span></a></nav><div class="sidebar-foot"><span class="dot amber"></span> Safety before sound<p>Your agent prepares. You remain in control. No sound authorization is supplied here.</p></div></aside>
+    <aside class="sidebar"><p class="eyebrow">LISTENING ROOM</p><nav aria-label="Main"><a href="#connect" class="active">Chat</a><a href="#setup">Setup</a><a href="#check">Rooms</a><a href="#calibration">Measure</a><a href="#improve">Profiles</a><a href="#verify">Evidence</a><a href="#advanced">Advanced</a></nav><div class="sidebar-foot"><span class="dot amber"></span> AI replies off<p>Setup and manual controls remain available. Ordinary playback starts in Spotify.</p></div></aside>
     <main>
       <section class="card" aria-labelledby="speakers-title">
         <h2 id="speakers-title">Music in the garage</h2>
         <p id="music-source-status" role="status">Checking Spotify configuration…</p>
-        <p id="music-player-status">Checking Garage Speakers in Music Assistant…</p>
-        <p>Everyday playback: open Spotify → choose Garage Speakers → Play. Fosi is the main volume control; Spotify volume is digital attenuation.</p>
-        <a class="browse-link" href="http://192.168.68.74:8095" target="_blank" rel="noopener noreferrer">Music Assistant administration / optional other sources</a>
+        <p id="music-player-status">Checking Garage Speakers playback connection…</p>
+        <p>Everyday playback: open Spotify → choose Garage Speakers → Play. Full-range stereo uses UMC1820 OUT3/4, with no subwoofer path. Fosi is the main volume control; Spotify volume is digital attenuation.</p>
         <p id="speakers-status" role="status" aria-live="polite">Readiness not verified.</p>
         <p id="speakers-human-status">Checking protected Spotify Connect receiver status…</p>
         <button id="speakers-stop" type="button" disabled>Stop speaker output</button>
-        <p class="hint">Spotify Pause/Stop normally control playback. This emergency button closes native output independently; if Spotify still shows playing, pause it in Spotify. Boot/reconnect never starts cached music.</p>
-        <details><summary>Optional first-use speaker check · not everyday listening</summary>
+        <p class="hint">Spotify Pause/Stop normally control playback. Stop speaker output is always available in the top bar after unlocking, independently of chat. If Spotify still shows playing, pause it in Spotify. Boot/reconnect never starts cached music.</p>
+        <details id="speakers-legacy-details" hidden><summary>Legacy native speaker check · not Docker playback</summary>
           <p>Keep the amplifier volume low and stay by the speakers. This check uses only UMC1820 OUT3/4 at fixed −60 dB for at most 2 minutes; all other outputs remain silent. It does not measure the room or verify wiring for you.</p>
           <p>Optional diagnostic preparation opens a zero-output graph and stops pending MA audio without deleting its queue. Spotify-only listening uses a genuine receiver Play transition, not an MA listening session or this diagnostic button.</p>
           <div class="control-row"><button id="speakers-setup" type="button" disabled>Prepare quiet speaker check</button><button id="speakers-enable" type="button" class="primary" disabled>Start 2-minute speaker check</button></div>

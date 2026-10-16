@@ -1,0 +1,18 @@
+# Isolated no-ports/no-devices/no-credentials fixture override, never production.
+services:
+  music-assistant:
+    image: ghcr.io/music-assistant/server:2.10.5@sha256:28023f8c0d96ca2496391f3218a6d70d7ef3ba84db846b3a3f3cd9ce7ef8aedc
+    user: "1000:1000"
+    init: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    entrypoint: ["/app/venv/bin/python", "/fixtures/audio_ma_fixture.py"]
+    read_only: true
+    tmpfs: ["/test-state:rw,uid=1000,gid=1000,size=96m", "/tmp:rw,uid=1000,gid=1000,size=64m"]
+    volumes: ["./tests:/fixtures:ro"]
+    networks: [audio-backend]
+  audio-transport:
+    volumes: ["./tests:/fixtures:ro", audio-events:/run/garage-audio/events, audio-evidence:/evidence:ro]
+  dashboard:
+    image: ${AUDIO_IMAGE:?immutable audio image required}
+    profiles: [not-used]

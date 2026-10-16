@@ -1,0 +1,22 @@
+[Unit]
+Description=Garage owned DHCP/private audio namespace lifecycle (no audio authority)
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/garage-audio-network/network-entry.py
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=45
+# Owner finally closes worker first; independent guards survive until this completes.
+KillMode=mixed
+StateDirectory=garage-audio-network
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

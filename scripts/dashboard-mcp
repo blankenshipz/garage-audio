@@ -2,4 +2,7 @@
 # SSH authenticates the caller. Never use a TTY or print the server token.
 set -eu
 host=${GARAGE_HOST:-zach@192.168.68.74}
-exec ssh -T -o BatchMode=yes "$host" docker exec -i garage-audio-dashboard python -m garage_audio.mcp_server
+container=${GARAGE_MCP_CONTAINER:-garage-audio-dashboard}
+# Trusted operator reference for isolated candidate checks; reject shell syntax.
+case "$container" in ''|*[!a-zA-Z0-9_.-]*) echo 'Invalid MCP container reference' >&2; exit 2;; esac
+exec ssh -T -o BatchMode=yes "$host" docker exec -i "$container" python -m garage_audio.mcp_server

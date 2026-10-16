@@ -144,7 +144,7 @@ class JobsTest(unittest.TestCase):
         self.app.execute('jobs.cancel',{'id':second['id']}); self.wait(second['id'])
     def test_no_hardware_paths_commands_or_agent_identity(self):
         base = {'session_id':self.sid,'position':'seat','channel':'left'}
-        self.assertEqual(self.app.execute('jobs.request',base|{'adapter':'hardware'})['error']['code'],'hardware_disabled')
+        self.assertEqual(self.app.execute('jobs.request',base|{'adapter':'hardware'})['error']['code'],'hardware_prerequisites_required')
         for extra in ({'path':'/dev/audio'},{'command':'play'},{'consent':'human'},{'identity':{'role':'human'}}):
             self.assertFalse(self.app.execute('jobs.request',base|extra)['ok'])
     def test_running_restart_policy_mutation_and_capture_clipping(self):

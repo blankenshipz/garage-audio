@@ -1,0 +1,11 @@
+{
+  "commit": "dbe69eb8aa88f644cfb46541d6cef72fa666570d",
+  "installed_package": "1.9.9-1414+git20221121.dbe69eb-1",
+  "original_binary_sha256": "4dbba08b6c09148132dc50ea5076a5639933839d843b7fbd6e149d5611c1791c",
+  "files": {
+    "output_alsa.c": "0237c003c099f449a39032e6b0308322d7bb813b10247acc0eb0af9f7d708573",
+    "output.c": "1cbe98086ee76e46534cabdffb40bbf0fe610fb73291a19e2d477e12cdc71f87",
+    "output_pack.c": "46c2e88b2d84295a6dd8d6bbaf07e16a4f4963b90d4988def9449c4cbf310928",
+    "squeezelite.h": "963e5fcd99074d6f4c62368d6fae61179285dfc1a6c571e255c1e035d593539b"
+  }
+}

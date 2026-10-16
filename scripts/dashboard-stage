@@ -12,16 +12,31 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import tarfile
 import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
-INPUTS = ('Dockerfile.dashboard', 'compose.dashboard.yaml',
+INPUTS = ('.dockerignore', 'Dockerfile.dashboard', 'Dockerfile.dashboard.cached', 'compose.dashboard.yaml',
           'requirements.txt', 'requirements.lock', 'API_CONTRACT.md', 'API_CONTRACT_ROOM.md',
           'garage_audio', 'web', 'profiles', 'docs', 'tests', 'research', 'vendor', 'README.md',
-          'scripts/dashboard-stage', 'scripts/dashboard-status', 'scripts/dashboard-mcp',
+          'scripts/dashboard-stage', 'scripts/dashboard-status', 'scripts/dashboard-mcp', 'scripts/dashboard-cached-context',
           'scripts/verify_room_release.py')
+STACK_INPUTS = ('compose.yaml', 'compose.audio.yaml', 'compose.audio-hardware.yaml',
+                'Dockerfile.audio', 'config', 'scripts')
+RELEASE_INPUT_MANIFEST = 'config/docker-release-inputs.json'
+STACK_REQUIRED = ('garage_audio/audio_container.py', 'garage_audio/audio_observer.py',
+                  'garage_audio/audio_device.py', 'garage_audio/audio_child.py',
+                  'garage_audio/audio_public.py', 'config/audio-device-policy.json',
+                  'config/pipewire.conf', 'config/asound.conf',
+                  'config/wireplumber-container.lua', 'config/wireplumber-container-bluetooth.lua',
+                  'scripts/container-transport', 'scripts/bootstrap-container-audio.py',
+                  'garage_audio/spotify_setup.py', 'web/spotify-setup.js',
+                  'tests/spotify_setup.py', 'tests/spotify_setup_compat.py',
+                  'tests/run_spotify_protocol.py', 'tests/spotify_protocol_ma_fixture.py',
+                  'docs/container-audio.md', 'docs/docker-install.md', 'docs/agents.md',
+                  RELEASE_INPUT_MANIFEST, 'docs/docker-rollback.md')
 
 # Executed remotely after activation; also executable against isolated local fixtures.
 # os.replace replaces the link itself, never copies through its directory target.
@@ -55,26 +70,104 @@ def release_pointer_command(root, release, image):
 def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
+def package_paths(args):
+    paths = set()
+    names = INPUTS + (STACK_INPUTS if args.docker_stack else ())
+    if args.docker_stack:
+        # Audio-owned top-level MA/network recipes are discovered, not guessed or
+        # silently omitted because they were added after the historical inventory.
+        names += tuple(p.name for pattern in ('Dockerfile.*', 'compose*.yaml')
+                       for p in sorted(ROOT.glob(pattern)))
+    for name in names:
+        target = ROOT / name
+        if not target.exists():
+            raise SystemExit(f'Missing required input: {name}')
+        for path in sorted(target.rglob('*')) if target.is_dir() else [target]:
+            if '__pycache__' in path.parts or path.suffix == '.pyc':
+                continue
+            if path.name == '.DS_Store' or path.name == '.env' or path.name.startswith('.env.') or path.name.endswith('.env'):
+                continue
+            if path.is_symlink():
+                raise SystemExit(f'Symlink input rejected: {path.relative_to(ROOT)}')
+            if path.is_file():
+                paths.add(path)
+    if args.docker_stack:
+        for name in STACK_REQUIRED:
+            path = ROOT / name
+            if path not in paths:
+                raise SystemExit(f'Missing required Docker asset: {name}')
+    return sorted(paths)
+
+def release_inputs(paths, strict=False):
+    """Owner-supplied references only; no live credentials or lease addresses."""
+    manifest = json.loads((ROOT / RELEASE_INPUT_MANIFEST).read_text())
+    if manifest.get('schema_version') != 1:
+        raise SystemExit('Unknown Docker release input manifest schema')
+    names = {str(p.relative_to(ROOT)) for p in paths}
+    missing = []
+    for name in dict.fromkeys(['Dockerfile.ma', 'docs/docker-rollback.md', *manifest.get('required_files', [])]):
+        if not isinstance(name, str) or name.startswith('/') or '..' in Path(name).parts:
+            raise SystemExit('Unsafe required release input path')
+        if name not in names:
+            missing.append(name)
+    for role in ('ma_patch', 'network_carrier', 'runtime_apt_lock'):
+        name = manifest.get('owner_manifests', {}).get(role)
+        if name is None:
+            missing.append('owner manifest: ' + role)
+        elif not isinstance(name, str) or name.startswith('/') or '..' in Path(name).parts or name not in names:
+            raise SystemExit('Invalid or uninventoried owner manifest: ' + role)
+    for role in ('ma', 'dashboard'):
+        reference = manifest.get('official_bases', {}).get(role)
+        if not isinstance(reference, str) or not re.fullmatch(r'[a-zA-Z0-9./:_-]+@sha256:[0-9a-f]{64}', reference):
+            missing.append('immutable official base: ' + role)
+    for role in ('dashboard','audio','ma'):
+        image = manifest.get('deployment_images', {}).get(role)
+        if not isinstance(image,str) or not re.fullmatch(r'sha256:[0-9a-f]{64}', image):
+            missing.append('immutable built image: ' + role)
+    if manifest.get('status') != 'ready_for_gate':
+        missing.append('owner manifest reconciliation/status')
+    result = {'manifest': RELEASE_INPUT_MANIFEST, 'ready_for_gate':not missing,
+              'unresolved':missing, 'scope':'source-and-image-inputs-only', 'deployment_approval':False}
+    if strict and missing:
+        raise SystemExit('Release inputs unresolved: ' + '; '.join(missing))
+    return result
+
+def inventory(args):
+    """Provisional hashes, not frozen acceptance; no private state or credentials."""
+    paths = package_paths(args)
+    receipt = Path(tempfile.mkdtemp(prefix='garage-inputs-', dir=args.receipt_root))
+    os.chmod(receipt, 0o700)
+    entries = [{'path':str(p.relative_to(ROOT)), 'sha256':digest(p), 'bytes':p.stat().st_size}
+               for p in paths]
+    report = {'frozen':False, 'scope':'docker-stack' if args.docker_stack else 'dashboard',
+              'inventory':entries, 'input_bytes':sum(i['bytes'] for i in entries),
+              'capacity':{'workspace_free':shutil.disk_usage(ROOT).free,
+                          'receipt_free':shutil.disk_usage(receipt).free}}
+    if args.docker_stack:
+        report['release_inputs'] = release_inputs(paths, args.release_inputs)
+    (receipt / 'inputs.json').write_text(json.dumps(report, indent=2) + '\n')
+    print(json.dumps({'receipt':str(receipt), 'frozen':False,
+                      'input_files':len(entries), 'input_bytes':report['input_bytes'],
+                      'capacity':report['capacity'], 'release_inputs':report.get('release_inputs')}))
+
 def freeze(args):
     if not args.writers_frozen:
         raise SystemExit('Freeze requires --writers-frozen after package-input writers are paused.')
+    paths = package_paths(args)
+    if args.release_inputs:
+        if not args.docker_stack:
+            raise SystemExit('--release-inputs requires --docker-stack')
+        release_inputs(paths, strict=True)
+    # Source archive plus extraction grow on the receipt volume. This is only a
+    # freeze reserve; build/image/cache growth needs a separate measured budget.
+    required = 2 * 1024**3 + 2 * sum(p.stat().st_size for p in paths)
+    if shutil.disk_usage(args.receipt_root).free < required:
+        raise SystemExit('Insufficient receipt capacity for reserve, archive and extraction; do not prune automatically.')
     receipt = Path(tempfile.mkdtemp(prefix='garage-dashboard-', dir=args.receipt_root))
     os.chmod(receipt, 0o700)
     inventory = []
     with tarfile.open(receipt / 'candidate.tar', 'w') as archive:
-        paths = []
-        for name in INPUTS:
-            target = ROOT / name
-            if not target.exists():
-                raise SystemExit(f'Missing required input: {name}')
-            paths.extend(sorted(target.rglob('*')) if target.is_dir() else [target])
-        for path in sorted(paths):
-            if '__pycache__' in path.parts or path.suffix == '.pyc':
-                continue
-            if path.is_symlink():
-                raise SystemExit(f'Symlink input rejected: {path.relative_to(ROOT)}')
-            if not path.is_file():
-                continue
+        for path in paths:
             data = path.read_bytes()
             name = str(path.relative_to(ROOT))
             sha = hashlib.sha256(data).hexdigest()
@@ -86,6 +179,7 @@ def freeze(args):
     candidate = digest(receipt / 'candidate.tar')
     (receipt / 'inventory.json').write_text(json.dumps(inventory, indent=2) + '\n')
     (receipt / 'candidate.sha256').write_text(candidate + '\n')
+    (receipt / 'scope.json').write_text(json.dumps({'scope':'docker-stack' if args.docker_stack else 'dashboard'}) + '\n')
     print(json.dumps({'receipt': str(receipt), 'candidate': candidate}))
 
 def run(receipt, name, argv):
@@ -96,9 +190,13 @@ def run(receipt, name, argv):
         raise SystemExit(f'{name} failed ({result.returncode}); private receipts: {receipt}')
 
 def deploy(args):
+    if args.docker_stack:
+        raise SystemExit('This helper deploys dashboard only; combined audio cutover requires separately verified exclusive ownership and M5 gates.')
     if not args.writers_frozen or not args.contract_confirmed:
         raise SystemExit('Deploy requires --writers-frozen and --contract-confirmed after parent approval.')
     receipt = Path(args.deploy).resolve()
+    if (receipt / 'scope.json').exists() and json.loads((receipt / 'scope.json').read_text())['scope'] != 'dashboard':
+        raise SystemExit('Refusing dashboard-only activation of a combined Docker-stack candidate.')
     candidate = digest(receipt / 'candidate.tar')
     if candidate != args.expected_digest or candidate != (receipt / 'candidate.sha256').read_text().strip():
         raise SystemExit('Candidate digest mismatch')
@@ -143,16 +241,19 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     group = p.add_mutually_exclusive_group(required=True)
     group.add_argument('--freeze', action='store_true')
+    group.add_argument('--inventory', action='store_true', help='Provisional private input inventory; no freeze/build/deploy')
     group.add_argument('--deploy', metavar='RECEIPT_DIRECTORY')
     p.add_argument('--receipt-root', default='/private/tmp/opencode')
     p.add_argument('--expected-digest')
     p.add_argument('--base-image')
     p.add_argument('--writers-frozen', action='store_true')
+    p.add_argument('--docker-stack', action='store_true', help='Include MA/audio Compose, audio Dockerfile, host config and scripts; never deploy via this helper')
+    p.add_argument('--release-inputs', action='store_true', help='Require reconciled patch/network/runtime owner manifests and immutable official base inputs; not approval to deploy')
     p.add_argument('--contract-confirmed', action='store_true')
     p.add_argument('--host', default='zach@192.168.68.74')
     args = p.parse_args()
     os.umask(0o077)
-    freeze(args) if args.freeze else deploy(args)
+    inventory(args) if args.inventory else freeze(args) if args.freeze else deploy(args)
 
 if __name__ == '__main__':
     main()

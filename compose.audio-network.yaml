@@ -1,0 +1,40 @@
+# UNACTIVATED. Trusted host operator generates these values for one admitted lifetime.
+# Compose creation alone is NOT admission: register IDs worker-first, verify namespace
+# joins, install dashboard on-link route, then start. Recreate ALL on generation change.
+services:
+  music-assistant:
+    restart: "no"
+    networks: !reset []
+    network_mode: container:${GARAGE_AUDIO_CARRIER_ID:?owned current carrier required}
+    labels:
+      garage.audio.generation: ${GARAGE_AUDIO_NETWORK_GENERATION:?owned generation required}
+  audio-transport:
+    restart: "no"
+    networks: !reset []
+    network_mode: container:${GARAGE_AUDIO_CARRIER_ID:?owned current carrier required}
+    environment:
+      MA_SLIMPROTO_HOST: 127.0.0.1
+    labels:
+      garage.audio.generation: ${GARAGE_AUDIO_NETWORK_GENERATION:?owned generation required}
+  audio-device:
+    restart: "no"
+    environment:
+      GARAGE_AUDIO_NETWORK_LEASE: /network/authority.json
+      GARAGE_AUDIO_NETWORK_GENERATION: ${GARAGE_AUDIO_NETWORK_GENERATION:?owned generation required}
+    volumes:
+      - ${GARAGE_AUDIO_NETWORK_AUTHORITY_DIR:?root-owned current authority required}:/network:ro
+    labels:
+      garage.audio.generation: ${GARAGE_AUDIO_NETWORK_GENERATION:?owned generation required}
+  dashboard:
+    restart: "no"
+    networks: !override [audio-management]
+    extra_hosts: !override
+      - music-assistant:${GARAGE_AUDIO_LAN_LEASE:?current admitted DHCP address required}
+    environment:
+      MA_URL: http://music-assistant:8095
+    labels:
+      garage.audio.generation: ${GARAGE_AUDIO_NETWORK_GENERATION:?owned generation required}
+networks:
+  audio-management:
+    external: true
+    name: ${GARAGE_AUDIO_MANAGEMENT_NETWORK:?exact owned private network required}

@@ -1,0 +1,43 @@
+# Operator-only transaction: create/register all roles, then ordered start. Not `up`.
+services:
+  audio-volume-init:
+    labels:
+      garage.audio.generation: ${GARAGE_AUDIO_NETWORK_GENERATION:?owned generation required}
+  music-assistant:
+    image: ${MA_PATCHED_IMAGE:?immutable patched MA image required}
+  audio-device:
+    restart: "no"
+    entrypoint: ["python", "-m", "garage_audio.audio_container"]
+    command: ["--mode", "hardware"]
+  audio-observer:
+    image: ${AUDIO_IMAGE:?immutable audio image required}
+    user: "1001:1001"
+    group_add: ["1003"]
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 32
+    restart: "no"
+    network_mode: container:${GARAGE_AUDIO_CARRIER_ID:?owned current carrier required}
+    entrypoint: ["python", "-m", "garage_audio.audio_observer"]
+    environment:
+      GARAGE_AUDIO_OBSERVER_ENABLED: private-namespace-qualified
+      GARAGE_AUDIO_NETWORK_LEASE: /network/authority.json
+      GARAGE_AUDIO_NETWORK_GENERATION: ${GARAGE_AUDIO_NETWORK_GENERATION:?owned generation required}
+      GARAGE_SOLOIST_RUNTIME: ${GARAGE_SOLOIST_RUNTIME:?authorized existing receiver runtime reference required}
+      GARAGE_MA_TOKEN_FILE: /run/ma-reference/token
+      GARAGE_CONNECT_PROVIDER: ${GARAGE_CONNECT_PROVIDER:?existing provider identity required}
+    volumes:
+      - audio-events:/run/garage-audio/events
+      - ${GARAGE_AUDIO_NETWORK_AUTHORITY_DIR:?current authority required}:/network:ro
+      - ${GARAGE_MA_TOKEN_FILE:?private authorized token reference required}:/run/ma-reference/token:ro
+    labels:
+      garage.audio.generation: ${GARAGE_AUDIO_NETWORK_GENERATION:?owned generation required}
+  dashboard:
+    container_name: garage-audio-next-dashboard
+    entrypoint: ["python", "-m", "garage_audio.audio_boot_wait"]
+    environment:
+      GARAGE_AUDIO_NETWORK_LEASE: /network/authority.json
+      GARAGE_AUDIO_NETWORK_GENERATION: ${GARAGE_AUDIO_NETWORK_GENERATION:?owned generation required}
+    volumes:
+      - ${GARAGE_AUDIO_NETWORK_AUTHORITY_DIR:?current authority required}:/network:ro

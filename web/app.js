@@ -9,10 +9,18 @@ import {Journey} from './journey.js';
 import {RoomPanel} from './room.js';
 import {ProofPanel} from './proof.js';
 import {SpeakersPanel} from './speakers.js';
+import {ChatPanel} from './chat.js';
+import {SetupPanel} from './setup.js';
+import {AudioConfigPanel} from './audio-config.js';
+import {CalibrationRunPanel} from './calibration-run.js';
 const $=id=>document.getElementById(id), api=new GarageAPI();
 const speakersPanel=new SpeakersPanel(api);
 const trustedLAN=document.body.dataset.trustedLan==='true';
 let journey=null;
+let chatPanel=null;
+let setupPanel=null;
+let audioConfigPanel=null;
+let calibrationRunPanel=null;
 let proofPanel=null,roomContext={room:null,profile:null};
 const jobsPanel=new JobsPanel(api,{onState:updateJourney});
 function updateJourney(){if(!journey)return;const fresh=jobsPanel.stale?null:{...status,human_approval_available:jobsPanel.readiness?.human_approval_available,camilla_file_available:jobsPanel.fileReadiness?.available};journey.update({authenticated,status:fresh,session,...roomContext,proof:proofPanel?.proof,job:jobsPanel.job,cancelPending:jobsPanel.pending.has('cancel')});}
@@ -27,6 +35,10 @@ function errorText(e){return [e.message,...(e.requirements||[])].join('\n');}
 function lock(){authenticated=false;status=null;profiles=[];sessions=[];session=null;sessionSelection.clear();players=[];maAuthenticated=false;selectedProfile=null;playbackError=null;actionError=null;document.querySelectorAll('form').forEach(form=>form.reset());$('login-panel').hidden=trustedLAN;$('sign-out').hidden=true;$('token').value='';$('sub-trim').value='';$('connection-dot').classList.remove('online');text('connection-label',trustedLAN?'LAN session unavailable':'Locked');text('status-json','No status available.');text('last-read','No readback yet');renderStatus();renderProfiles();renderSessions();renderSession();renderPlayers();renderPlot($('electrical-plot'),[],'No profile loaded');}
 function setControls(){
   speakersPanel.setAuthenticated(authenticated);
+  chatPanel?.setAuthenticated(authenticated);
+  setupPanel?.setAuthenticated(authenticated);
+  audioConfigPanel?.setAuthenticated(authenticated);
+  calibrationRunPanel?.setContext({authenticated,capabilities});
   if(!authenticated){sessionStorage.removeItem('garage-fit-session');roomContext={room:null,profile:null};}
   roomPanel.setContext({authenticated,capabilities,busy});
   proofPanel?.setContext({authenticated,session,...roomContext});
@@ -73,7 +85,7 @@ function renderDiagnostics(){
   const list=$('diagnostic-list');list.replaceChildren();
   const entries=[status?.dsp?.error,playbackError,actionError].filter(Boolean);
   if(!authenticated)entries.push({code:'locked',message:'Unlock to inspect private status.',requirements:[]});
-  if(authenticated)entries.push({code:'uncalibrated',message:'Acoustic performance has not been verified.',requirements:['Interface and microphone discovery, measured alignment and attended commissioning remain prerequisites.']},{code:'playback_unverified',message:'Track state and a tunneled Music Assistant browsing URL are not provided by this API.',requirements:['Continue music browsing in your separately configured Music Assistant UI. Player listing does not verify playback readiness.']});
+  if(authenticated)entries.push({code:'uncalibrated',message:'Acoustic performance has not been verified.',requirements:['Interface and microphone discovery, measured alignment and attended commissioning remain prerequisites.']},{code:'playback_unverified',message:'Track state is not provided by this API.',requirements:['Use Spotify → Garage Speakers for ordinary playback. Player listing does not verify playback readiness.']});
   for(const entry of entries){const row=make('div','diagnostic'),body=make('div');row.append(make('span','code',entry.code));body.append(make('strong','',entry.message));for(const requirement of entry.requirements||[])body.append(make('p','',requirement));row.append(body);list.append(row);}
 }
 async function readback(){
@@ -230,7 +242,7 @@ function disclose(node,id,label){if(!node)return;const details=make('details','s
 disclose(planForm,'plan-preparation','Create a quiet plan · no sound');disclose($('import-form'),'measurement-import','Import REW data & provenance');
 disclose($('measured-plot').closest('.card'),'measurement-comparison','Compare response & electrical previews');
 disclose($('diagnostics'),'technical-diagnostics','Diagnostics & technical readback');
-disclose($('job-request'),'job-request-details','Prepare a file-only job');
+disclose($('job-request'),'job-request-details','Prepare a bounded acquisition');
 disclose(document.querySelector('.authority-card'),'job-authority-details','Separate human authority · review availability');
 disclose(document.querySelector('.job-history-card'),'job-history-details','Browse job history');
 const measurementWorkspace=disclose($('calibration'),'measurement-workspace','Measurement plan & import workspace');measurementWorkspace.open=true;
@@ -240,7 +252,9 @@ roomPanel.onChange=context=>{roomContext=context;proofPanel?.setContext({authent
 roomPanel.onPlan=({name,positions,orientation})=>run('Create profile measurement plan',async()=>{const created=await api.operation('calibration.plan',{name:name.slice(0,120),positions,orientation,channels:['left','right','sub'],target:'laptop-rew',sample_rate:48000});sessions=await api.operation('sessions.list');renderSessions();await loadSession(created.id);journey.activate('calibration',{focus:'heading'});});
 const quickCopies=make('div','agent-quick-actions');quickCopies.append($('copy-mcp'),$('copy-task-brief'));document.querySelector('#connect .section-heading').after(quickCopies);
 journey=new Journey({onCancel:job=>{if(job)jobsPanel.action('cancel',()=>api.operation('jobs.cancel',{id:job.id}));}});
-$('stage-check').append($('technical-diagnostics'));
+const lifecycleHost=make('section');$('stage-verify').prepend(lifecycleHost);calibrationRunPanel=new CalibrationRunPanel(api,{host:lifecycleHost});
+document.querySelector('.authority-card>p.hint:last-child').textContent='Hardware capture needs calibrated-mic admission, commissioned routing and separate exact-manifest attended authority. Hardware correction apply remains unavailable.';
+$('stage-advanced').append($('technical-diagnostics'));
 // Quiet preparation is the main product; hardware and external-agent setup are secondary.
 text('connect-title','Prepare your listening room');document.querySelector('#connect .subtitle').textContent='Choose a goal. Bring in REW exports. Review a recommendation and its evidence — without making sound.';
 const choose=make('a','primary browse-link','Choose my room →');choose.href='#check';document.querySelector('#connect .section-heading').after(choose);
@@ -261,7 +275,21 @@ function renderCandidateForm(){
   save.onclick=()=>run('Save offline candidate',async()=>{await api.operation('candidates.save',{baseline_id:baselineSelect.value,proposal_session_id:session.id,name:`${session.name.slice(0,80)} · candidate`});profiles=await api.operation('profiles.list');renderProfiles();renderCandidateForm();await proofPanel?.refresh();});host.append(save,make('p','hint','No useful cut? Leaving the fixed baseline unchanged is a valid outcome. Candidate predictions are not measured benefit.'));
 }
 const verifyContent=$('verify').querySelector('.card');verifyContent.replaceChildren();verifyContent.id='proof-workspace';proofPanel=new ProofPanel(api,{host:verifyContent,onChange:()=>updateJourney(),onUnauthorized:()=>lock()});
-const fileOnly=disclose($('jobs'),'file-only-experiments','Advanced FILE-only experiments · synthetic, optional');fileOnly.open=false;
+const fileOnly=disclose($('jobs'),'file-only-experiments','Acquisition jobs · adapter, QC & authority');fileOnly.open=false;
+// Chat is the everyday entry; external agents and technical controls are secondary.
+const chatHost=make('section');chatHost.id='chat-home';$('stage-connect').prepend(chatHost);
+const configHost=make('section');$('stage-setup').append(configHost);
+audioConfigPanel=new AudioConfigPanel(api,{host:configHost});
+chatPanel=new ChatPanel(api,{host:chatHost,onUnauthorized:()=>lock()});
+$('stage-advanced').append($('connect'));$('stage-calibration').append(fileOnly);
+$('journey-summary').hidden=true;
+const speakerCard=$('speakers-title').closest('section');$('stage-setup').prepend(speakerCard);
+const stopBar=make('div','speaker-stop-bar');stopBar.append(make('span','','Speaker output'),$('speakers-stop'));document.querySelector('.masthead').after(stopBar);
+const stopFeedback=make('p','hint','Stop is independent of chat. Software readback is not physical silence proof.');stopFeedback.id='speaker-stop-feedback';stopFeedback.setAttribute('role','status');stopBar.append(stopFeedback);
+new ResizeObserver(()=>document.documentElement.style.setProperty('--speaker-bar-height',`${stopBar.getBoundingClientRect().height}px`)).observe(stopBar);
+const setupHost=make('section');setupHost.id='app-setup';$('stage-setup').prepend(setupHost);
+const homeReadiness=make('p','hint','Setup status not yet read. Open Setup to inspect device and credential prerequisites.');homeReadiness.id='chat-setup-status';chatHost.querySelector('.chat-shortcuts').after(homeReadiness);
+setupPanel=new SetupPanel(api,{host:setupHost,onStatus:state=>{homeReadiness.textContent=!state?'Setup status unavailable. Direct setup controls remain in Setup.':state.prerequisites?.length?'Setup needs attention: '+state.prerequisites.map(p=>`${p.component} · ${p.code.replaceAll('_',' ')}`).join('; ')+'. Open Setup for details.':'Setup references ready. Physical sound and phone playback are not inferred.';}});
 renderCandidateForm();
 async function init(){renderWorkflow();try{await api.resume();authenticated=true;$('login-panel').hidden=true;$('sign-out').hidden=trustedLAN;await refreshAll();}catch(e){if(e.status===401||e.status===403)lock();else{lock();text('login-error',errorText(e));}}}
 init();

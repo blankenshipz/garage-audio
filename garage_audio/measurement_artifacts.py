@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import uuid
 
 @contextmanager
 def directory_fd(directory):
@@ -57,3 +58,24 @@ def read(directory, name, limit):
             if info.st_size > limit: raise ValueError('Bounded artifact required')
             return os.read(opened,limit+1)
         finally: os.close(opened)
+
+@contextmanager
+def read_handle(directory, name):
+    with directory_fd(directory) as fd:
+        opened = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+        try: regular(os.fstat(opened))
+        except BaseException:
+            os.close(opened); raise
+    with os.fdopen(opened, 'rb') as file: yield file
+
+def replace_json(directory, name, data):
+    """Private anchored journal replacement, separate from top-level app records."""
+    if name != 'job.json': raise ValueError('only job journal replacement allowed')
+    temporary = 'journal-'+uuid.uuid4().hex+'.tmp'
+    with exclusive(directory, temporary) as file:
+        file.write(data); file.flush(); os.fsync(file.fileno())
+    with directory_fd(directory) as fd:
+        try: regular(os.stat(name, dir_fd=fd, follow_symlinks=False))
+        except FileNotFoundError: pass
+        os.rename(temporary, name, src_dir_fd=fd, dst_dir_fd=fd)
+        os.fsync(fd)
