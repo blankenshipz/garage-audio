@@ -19,7 +19,8 @@ class ReceiverOwnershipError(PermissionError):
 def owns_socket(proc,inode):
     # A receiver's unrelated transient FD may close between glob and readlink.
     # Skip that FD, NOT the whole process (which may still own the pinned listener).
-    for fd in (proc/'fd').glob('*'):
+    # iterdir propagates EACCES; glob may silently hide an unreadable FD table.
+    for fd in (proc/'fd').iterdir():
         try:target=os.readlink(fd)
         except (FileNotFoundError,ProcessLookupError):continue
         if target=='socket:['+inode+']':return True
@@ -55,12 +56,17 @@ class ReceiverEndpoint:
         listeners=[r for r in listening_sockets(ma_pid,inode)
                    if r['address']=='127.0.0.1' and r['port']==port and r['uid']==1000]
         sockets=[r['socket_inode'] for r in listeners]
+        if not sockets:raise ReceiverOwnershipError('owner_absent')
         if len(sockets)!=1:raise PermissionError('one exact actual loopback listener required')
         owners=[]
         for proc in Path('/proc').glob('[0-9]*'):
             try:
-                if proc.stat().st_uid!=1000 or os.stat(proc/'ns/net').st_ino!=inode:continue
+                if proc.stat().st_uid!=1000:continue
                 if not owns_socket(proc,sockets[0]):continue
+                # Positive socket non-ownership excludes unrelated processes without
+                # inspecting their namespaces. A holder's unreadable namespace is
+                # still fatal: permission denial never proves non-ownership.
+                if os.stat(proc/'ns/net').st_ino!=inode:continue
                 executable=proc/'exe';info=executable.stat();key=(int(proc.name),birth(int(proc.name)),info.st_ino,info.st_mtime_ns,info.st_size)
                 if self.verified!=key:
                     if info.st_size>100*1024*1024 or hashlib.sha256(executable.read_bytes()).hexdigest()!=self.digest:raise PermissionError('actual public receiver binary pin differs')
@@ -71,6 +77,7 @@ class ReceiverEndpoint:
         proc=Path('/proc')/str(owners[0][0])
         if birth(owners[0][0])!=owners[0][1] or proc.stat().st_uid!=1000 or os.stat(proc/'ns/net').st_ino!=inode:
             raise ReceiverOwnershipError('owner_changed')
+        if not owns_socket(proc,sockets[0]):raise ReceiverOwnershipError('owner_changed')
         current=[r for r in listening_sockets(ma_pid,inode)
                  if r['address']=='127.0.0.1' and r['port']==port and r['uid']==1000]
         if current!=listeners:raise ReceiverOwnershipError('listener_changed')

@@ -19,16 +19,16 @@ class ReceiverScan(unittest.TestCase):
         self.endpoint=receiver.ReceiverEndpoint(self.pin)
 
     def test_unrelated_closed_fd_does_not_hide_actual_pinned_listener_owner(self):
-        original_glob=Path.glob;original_readlink=os.readlink
+        original_iterdir=Path.iterdir;original_readlink=os.readlink
         vanished=Path(f'/proc/{self.pid}/fd/999999')
-        def glob(path,pattern):
-            rows=list(original_glob(path,pattern))
+        def iterdir(path):
+            rows=list(original_iterdir(path))
             if path==Path(f'/proc/{self.pid}/fd'):return iter([vanished,*rows])
             return iter(rows)
         def readlink(path,*args,**kwargs):
             if Path(path)==vanished:raise FileNotFoundError('fixture unrelated FD closed')
             return original_readlink(path,*args,**kwargs)
-        with patch.object(Path,'glob',glob),patch.object(receiver.os,'readlink',side_effect=readlink):
+        with patch.object(Path,'iterdir',iterdir),patch.object(receiver.os,'readlink',side_effect=readlink):
             observed=self.endpoint.observe(self.pid,self.ns)
         self.assertEqual(observed['pid'],self.pid)
         self.assertEqual(observed['binary_sha256'],self.pin)
@@ -46,7 +46,7 @@ class ReceiverScan(unittest.TestCase):
         with self.assertRaisesRegex(PermissionError,'binary pin differs'):
             receiver.ReceiverEndpoint('0'*64).observe(self.pid,self.ns)
         self.listener.close()
-        with self.assertRaisesRegex(PermissionError,'loopback listener'):
+        with self.assertRaisesRegex(PermissionError,'owner_absent'):
             self.endpoint.observe(self.pid,self.ns)
 
     def test_listener_replacement_between_owner_proofs_is_rejected(self):
@@ -70,5 +70,51 @@ class ReceiverScan(unittest.TestCase):
             baseline=self.endpoint.observe(self.pid,self.ns)
             for _ in range(60):self.assertEqual(self.endpoint.observe(self.pid,self.ns),baseline)
         finally:stop.set();thread.join(2)
+
+    def test_unrelated_inaccessible_namespace_is_never_inspected(self):
+        other=Path('/proc/99999999');original_glob=Path.glob;original_stat=os.stat
+        def glob(path,pattern):
+            if path==Path('/proc'):return iter([other,Path(f'/proc/{self.pid}')])
+            return original_glob(path,pattern)
+        def stat(path,*args,**kwargs):
+            if Path(path)==other:return original_stat(f'/proc/{self.pid}')
+            if Path(path)==other/'ns/net':raise PermissionError('fixture unrelated namespace EACCES')
+            return original_stat(path,*args,**kwargs)
+        original_iterdir=Path.iterdir
+        def iterdir(path):
+            if path==other/'fd':return iter(())
+            return original_iterdir(path)
+        with patch.object(Path,'glob',glob),patch.object(receiver.os,'stat',side_effect=stat),patch.object(Path,'iterdir',iterdir):
+            self.assertEqual(self.endpoint.observe(self.pid,self.ns)['pid'],self.pid)
+
+    def test_actual_owner_namespace_and_fd_table_denial_fail_closed(self):
+        original_stat=os.stat;original_iterdir=Path.iterdir
+        def stat(path,*args,**kwargs):
+            if Path(path)==Path(f'/proc/{self.pid}/ns/net'):raise PermissionError('fixture owner namespace EACCES')
+            return original_stat(path,*args,**kwargs)
+        with patch.object(receiver.os,'stat',side_effect=stat):
+            with self.assertRaises(PermissionError):self.endpoint.observe(self.pid,self.ns)
+        def denied(path):
+            if path==Path(f'/proc/{self.pid}/fd'):raise PermissionError('fixture FD table EACCES')
+            return original_iterdir(path)
+        with patch.object(Path,'iterdir',denied):
+            with self.assertRaises(PermissionError):self.endpoint.observe(self.pid,self.ns)
+
+    def test_pid_reuse_and_final_socket_loss_fail_closed(self):
+        real=receiver.birth(self.pid);calls=0
+        def reused(pid):
+            nonlocal calls
+            calls+=1
+            return real if calls==1 else real+'changed'
+        with patch.object(receiver,'birth',side_effect=reused):
+            with self.assertRaisesRegex(PermissionError,'owner_changed'):self.endpoint.observe(self.pid,self.ns)
+        original=receiver.owns_socket;hits=0
+        def lost(proc,inode):
+            nonlocal hits
+            value=original(proc,inode)
+            if value:hits+=1
+            return value and hits==1
+        with patch.object(receiver,'owns_socket',side_effect=lost):
+            with self.assertRaisesRegex(PermissionError,'owner_changed'):self.endpoint.observe(self.pid,self.ns)
 
 if __name__=='__main__':unittest.main()

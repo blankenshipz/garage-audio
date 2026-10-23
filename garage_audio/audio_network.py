@@ -104,14 +104,26 @@ def guard_main(registry):
                 '-4', 'addr', 'show', 'dev', 'ga-lan'], text=True, timeout=2))
             if [a['local'] for x in addresses for a in x['addr_info']] != [record['address']]:
                 raise RuntimeError('address_lost')
+            workload_crash=None
             for identity, expected in record.get('dependent_processes', {}).items():
                 dependent = json.loads(docker('inspect', identity))[0]
+                from .audio_recovery import check_dependent,WorkloadCrash
+                try:check_dependent(dependent,identity,expected,record['generation'])
+                except WorkloadCrash as error:
+                    workload_crash=error
+                    continue
                 child = dependent['State']['Pid']
                 if (not dependent['State']['Running'] or child != expected['pid']
                         or birth(child) != expected['birth']
                         or os.stat(f'/proc/{child}/ns/net').st_ino != expected['inode']):
                     raise RuntimeError('dependent_generation_changed')
+            if workload_crash:raise workload_crash
         except Exception as error:
+            from .audio_recovery import WorkloadCrash
+            # Preserve the initiating classification BEFORE revoke stops siblings.
+            # Existing revocation (including deliberate stop) is never recoverable.
+            kind='owned_workload_crash' if isinstance(error,WorkloadCrash) and not (Path(record['receipt'])/'authority/revoked.json').exists() else 'terminal'
+            atomic(Path(record['receipt'])/'guard-failure.json',{'kind':kind,'time':time.monotonic()})
             revoke(record, str(error) if isinstance(error, RuntimeError) else type(error).__name__)
             return
         atomic(Path(record['receipt'])/'guard-heartbeat.json', {'time': time.monotonic()})
