@@ -1,5 +1,11 @@
 # Remote read-only MCP connector (source only, unactivated)
 
+**OAuth correction:** the authentication/installation sections below describe the
+historical custom-bearer candidate, not a ChatGPT-compatible setup. Current OAuth
+source work and its unresolved integration gate are in [remote-oauth.md](remote-oauth.md).
+The executable now requires the OAuth issuer/JWKS/policy configuration there; it
+does not fall back to the historical opaque-grant environment configuration.
+
 This is a separate remote connector, not a replacement for SSH stdio MCP.
 Production remains the previously observed `64440af`; source and deployment are
 different identities. No Dot compatibility or remote access is verified yet.

@@ -138,10 +138,14 @@ class HTTPRequireAuth(RequireAuthMiddleware):
         # SDK RequireAuthMiddleware is a route wrapper, not lifespan middleware.
         if scope['type'] == 'lifespan':
             return await self.app(scope, receive, send)
+        if (scope['type'] == 'http' and scope['method'] == 'GET'
+                and scope['path'] == '/.well-known/oauth-protected-resource'):
+            return await self.app(scope, receive, send)
         return await super().__call__(scope, receive, send)
 
 
-def create_app(*, audience, grant_file, source_revision, upstream=None):
+def create_app(*, audience, grant_file=None, source_revision, upstream=None,
+               issuer=None, jwks_file=None, policy_file=None):
     url = urlsplit(audience)
     if (url.scheme != 'https' or not url.hostname or url.username or url.password
             or url.path != '/mcp' or url.query or url.fragment):
@@ -149,10 +153,24 @@ def create_app(*, audience, grant_file, source_revision, upstream=None):
     if not re.fullmatch(r'[0-9a-f]{40}', source_revision):
         raise ValueError('Exact committed source revision required')
     upstream = upstream or Adapter()
+    if issuer is not None:
+        from .remote_oauth import OAuthVerifier
+        verifier = OAuthVerifier(issuer, audience, jwks_file, policy_file)
+    elif grant_file is not None:
+        verifier = GrantVerifier(grant_file, audience)  # legacy isolated/client API, not ChatGPT
+    else:
+        raise ValueError('OAuth verifier configuration required')
     server = ReadOnlyMCP('garage-audio-read-only', stateless_http=True, json_response=True,
                          streamable_http_path='/mcp', max_request_body_size=16384,
                          transport_security=TransportSecuritySettings(
-                             allowed_hosts=[url.netloc], allowed_origins=[f'https://{url.netloc}']))
+                              allowed_hosts=[url.netloc], allowed_origins=[f'https://{url.netloc}']))
+    metadata_url = f'https://{url.netloc}/.well-known/oauth-protected-resource'
+    if issuer is not None:
+        from starlette.responses import JSONResponse
+        @server.custom_route('/.well-known/oauth-protected-resource', methods=['GET'])
+        async def protected_resource_metadata(request):
+            return JSONResponse({'resource':audience, 'authorization_servers':[issuer],
+                                 'scopes_supported':[SCOPE], 'bearer_methods_supported':['header']})
 
     def envelope(value):
         return {**value, 'source': {'connector_revision': source_revision,
@@ -194,9 +212,10 @@ def create_app(*, audience, grant_file, source_revision, upstream=None):
     app = server.streamable_http_app()
     # SDK transport lifespan remains on this Starlette app. Authentication covers
     # every route (including unknown routes), and is checked on every HTTP request.
-    app.add_middleware(HTTPRequireAuth, required_scopes=[SCOPE])
+    app.add_middleware(HTTPRequireAuth, required_scopes=[SCOPE],
+                       resource_metadata_url=metadata_url if issuer is not None else None)
     app.add_middleware(AuthenticationMiddleware,
-                       backend=BearerAuthBackend(GrantVerifier(grant_file, audience)))
+                       backend=BearerAuthBackend(verifier))
     app.add_middleware(Audit)
     return app
 
@@ -207,7 +226,9 @@ def main():
     audit.addHandler(logging.StreamHandler())
     audit.propagate = False
     app = create_app(audience=os.environ['GARAGE_REMOTE_RESOURCE'],
-                     grant_file=os.environ['GARAGE_REMOTE_GRANTS_FILE'],
+                     issuer=os.environ['GARAGE_REMOTE_ISSUER'],
+                     jwks_file=os.environ['GARAGE_REMOTE_JWKS_FILE'],
+                     policy_file=os.environ['GARAGE_REMOTE_POLICY_FILE'],
                      source_revision=os.environ['GARAGE_REMOTE_SOURCE_REVISION'])
     # Private reverse-proxy upstream only. Never bind a public/LAN socket here.
     uvicorn.run(app, host='127.0.0.1', port=8101, access_log=False, proxy_headers=False)
