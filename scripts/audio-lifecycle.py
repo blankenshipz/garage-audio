@@ -11,7 +11,7 @@ from garage_audio.audio_recovery import Supervisor,owner_lock,recoverable,verify
 
 ROOT=pathlib.Path(__file__).parent
 
-def generation(config,stop,root):
+def generation(config,stop,root,ready=None):
  receipt=root/('generation-'+str(time.time_ns()));c=Carrier(receipt)
  host_route=None;advertisements=None;result='stopped';diagnostic_stop=threading.Event();diagnostic_thread=None
  try:
@@ -103,6 +103,7 @@ def generation(config,stop,root):
      if time.monotonic()-stable_since<3:
       stop.wait(.2);continue
     if observed is not None and current!=observed:raise RuntimeError('receiver owner changed')
+    first_admission=observed is None
     receiver.publish(receipt/'authority',current);observed=current;c.receiver_process={'pid':current['pid'],'birth':current['birth']};c.write_registry()
     atomic(receipt/'receiver-listener.json',current)
     if time.monotonic()-pairing_check>.2:
@@ -116,6 +117,7 @@ def generation(config,stop,root):
       c.ns('nft','add','element','inet','garage_audio','pairing','{',','.join(map(str,ports)),'}');pairing=ports;pairing_baseline=instances
      atomic(receipt/'pairing-listeners.json',{'generation':c.generation,'ports':ports,'advertisement':'_spotify-connect._tcp.local.','actual_verified_socket_ports':sorted({r['port'] for r in pairing_baseline}),'listener_instances':pairing_baseline,'indeterminate_ingress_closed':not bool(ports)})
      pairing_check=time.monotonic()
+    if first_admission and ready:ready(c.generation)
    stop.wait(.2)
  except Exception as error:
   result='recoverable' if recoverable(error,receipt) else 'terminal'
@@ -143,8 +145,8 @@ def main():
  try:
   root=pathlib.Path('/var/lib/garage-audio-network');root.mkdir(mode=0o700,exist_ok=True)
   # Revalidate all frozen inputs and image IDs for EVERY generation.
-  result=Supervisor(root,stop).run(lambda:generation(load_config(),stop,root))
-  atomic(root/'recovery-state.json',{'state':result})
+  supervisor=Supervisor(root,stop)
+  result=supervisor.run(lambda:generation(load_config(),stop,root,supervisor.ready))
   if result!='stopped':raise SystemExit(1)
  finally:os.close(lock)
 

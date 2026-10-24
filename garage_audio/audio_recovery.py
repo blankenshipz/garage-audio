@@ -1,5 +1,5 @@
 """Private lifecycle recovery: classified workload exits only, never authority renewal."""
-import fcntl,json,os,stat,time
+import fcntl,json,os,stat,time,uuid
 from pathlib import Path
 from .audio_network import atomic,docker
 
@@ -51,22 +51,40 @@ class Supervisor:
     window=600
     def __init__(self,root,stop,clock=time.monotonic):
         self.root=Path(root);self.stop=stop;self.clock=clock
+        self.invocation=uuid.uuid4().hex;self.retries=0;self.generation=None
+    def publish(self,state,**fields):
+        atomic(self.root/'recovery-state.json',{'schema':1,'invocation':self.invocation,
+            'state':state,'retries':self.retries,'generation':self.generation,
+            'observed':time.monotonic(),**fields})
+    def ready(self,generation):
+        self.generation=generation
+        self.publish('ready')  # diagnostic only; never consumed as sound authority
     def run(self,generation):
         attempts=[];total=0
-        while not self.stop.is_set():
-            result=generation()
-            if self.stop.is_set() or result=='stopped':return 'stopped'
-            if result!='recoverable':return 'terminal'
-            now=self.clock();attempts=[x for x in attempts if now-x<self.window]
-            # Lifetime cap does not reset on a quiet interval. Manual owner start is
-            # required after exhaustion, so an hourly fault cannot retry forever.
-            if total>=len(self.delays) or len(attempts)>=3:
-                atomic(self.root/'recovery-state.json',{'state':'exhausted','retries':total})
-                return 'exhausted'
-            delay=self.delays[total];total+=1;attempts.append(now)
-            atomic(self.root/'recovery-state.json',{'state':'backoff','retry':total,'delay':delay})
-            if self.stop.wait(delay):return 'stopped'
-        return 'stopped'
+        try:
+            while not self.stop.is_set():
+                self.generation=None
+                self.publish('starting')
+                result=generation()
+                if self.stop.is_set() or result=='stopped':
+                    self.publish('stopped');return 'stopped'
+                if result!='recoverable':
+                    self.publish('terminal');return 'terminal'
+                now=self.clock();attempts=[x for x in attempts if now-x<self.window]
+                # The lifetime cap never resets after a quiet interval.
+                if total>=len(self.delays) or len(attempts)>=3:
+                    self.publish('exhausted');return 'exhausted'
+                delay=self.delays[total];total+=1;attempts.append(now)
+                self.retries=total
+                self.publish('backoff',delay=delay)
+                if self.stop.wait(delay):
+                    self.publish('stopped');return 'stopped'
+            self.publish('stopped');return 'stopped'
+        except Exception:
+            # Do not leak exception messages or mask the original cleanup failure.
+            try:self.publish('terminal',reason='generation_failed')
+            except Exception:pass
+            raise
 
 def owner_lock(path=Path('/run/garage-audio-lifecycle.lock')):
     fd=os.open(path,os.O_CREAT|os.O_RDWR|os.O_CLOEXEC|os.O_NOFOLLOW,0o600)

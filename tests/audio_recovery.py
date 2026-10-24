@@ -87,7 +87,7 @@ class Recovery(unittest.TestCase):
 
 class Lifecycle(unittest.TestCase):
  setUp=Recovery.setUp
- def fixture(self,error=None,cleanup_error=False,standby=False,unsafe=False):
+ def fixture(self,error=None,cleanup_error=False,standby=False,unsafe=False,ready_receiver=False,ready=None):
   events=[];root=self.root;stop=threading.Event()
   (root/'audio-lifecycle-policy.py').write_text('# isolated synthetic policy\n')
   class Carrier:
@@ -96,7 +96,7 @@ class Lifecycle(unittest.TestCase):
    def start(self,*_):events.append('carrier-start')
    def healthy(self):
     self.health+=1
-    if self.health>1:
+    if self.health>(6 if ready_receiver else 1):
      (self.receipt/'guard-failure.json').write_text(json.dumps({'kind':'owned_workload_crash'}))
      if error:raise error
      stop.set()
@@ -126,6 +126,11 @@ class Lifecycle(unittest.TestCase):
    return json.dumps({'state':'off','owned_children':[],'device_open':False,'device_mode':'standby' if standby else 'hardware','scalar_readers_ready':False,'segment':0,'standby':standby,'qualification_attempt':'consumed' if standby else None,'qualification_terminal':standby})
   adverts=SimpleNamespace(close=lambda:events.append('advertisements-close'),ports=lambda:[])
   endpoint=SimpleNamespace(observe=lambda *_:(_ for _ in ()).throw(FileNotFoundError()))
+  if ready_receiver:
+   endpoint=SimpleNamespace(observe=lambda *_:{'pid':123,'birth':'b'},publish=lambda *_:events.append('receiver-publish'))
+   patch.object(lifecycle,'pairing_instances',return_value=[]).start()
+   ticks=iter(range(1000))
+   patch.object(lifecycle.time,'monotonic',side_effect=lambda:next(ticks)).start()
   self.addCleanup(patch.stopall)
   for name,value in [('ROOT',root),('Carrier',Carrier),('Boot',Boot),('docker',docker),('run',lambda *_:''),('PairingAdvertisements',lambda *_:adverts),('ReceiverEndpoint',lambda *_:endpoint)]:patch.object(lifecycle,name,value).start()
   patch.object(lifecycle.subprocess,'run',side_effect=command).start();patch.object(lifecycle.subprocess,'check_output',side_effect=status).start()
@@ -134,7 +139,19 @@ class Lifecycle(unittest.TestCase):
   patch.object(lifecycle,'atomic',side_effect=lambda path,value,**kw:None if str(path).startswith('/etc/') else original(path,value,**kw)).start()
   patch.object(recovery,'docker',side_effect=docker).start()
   config={'hook':'fixture','receiver_binary_sha256':'0'*64}
-  return lambda:lifecycle.generation(config,stop,root),events
+  return lambda:lifecycle.generation(config,stop,root,ready),events
+ def test_ready_callback_requires_stable_receiver_and_follows_preadmission(self):
+  admitted=[]
+  call,events=self.fixture(ready_receiver=True,ready=lambda generation:admitted.append((generation,list(events))))
+  self.assertEqual(call(),'stopped')
+  self.assertEqual(len(admitted),1)
+  self.assertEqual(admitted[0][0],'g')
+  before=admitted[0][1]
+  self.assertIn('status',before);self.assertIn('start:audio-observer',before)
+  self.assertIn('receiver-publish',before);self.assertNotIn('closed',before)
+ def test_absent_receiver_never_reports_ready(self):
+  call,_=self.fixture(ready=lambda _:self.fail('receiver not admitted'))
+  self.assertEqual(call(),'stopped')
  def test_wired_recovery_closes_before_replacement(self):
   call,events=self.fixture(RuntimeError('network generation permanently revoked'))
   self.assertEqual(call(),'recoverable')

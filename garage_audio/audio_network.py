@@ -420,28 +420,49 @@ class Carrier:
                 '{', str(ipaddress.IPv4Address(client_address)), '}')
 
     def close(self):
-        if self.closed:
+        if getattr(self, '_cleanup_complete', False):
             return
+        # Stop the independent watchdog, but allow another close to retry failed
+        # cleanup. No helper failure may skip revocation of the owned generation.
         self.closed = True
-        if self.client and self.client.poll() is None:
-            self.client.terminate()
-            self.client.wait(timeout=4)  # own DHCP RELEASE before namespace stop
-        if self.guard and self.guard.poll() is None:
-            self.guard.terminate()
-            self.guard.wait(timeout=3)
-        if self.capture and self.capture.poll() is None:
-            time.sleep(.3)
-            self.capture.send_signal(signal.SIGINT)
-            self.capture.wait(timeout=3)
+        errors = []
+        def attempt(action):
+            try:
+                action()
+            except Exception as error:
+                errors.append(error)
+        def stop_process(process, sig, timeout):
+            if process and process.poll() is None:
+                process.send_signal(sig)
+                try:
+                    process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired as error:
+                    # Popen is an owned child, not a PID rediscovered by name.
+                    try:
+                        process.kill()
+                        process.wait(timeout=timeout)
+                    except Exception:
+                        pass  # retain the initiating timeout; replacement stays forbidden
+                    raise error
+        attempt(lambda: stop_process(self.client, signal.SIGTERM, 4))
+        attempt(lambda: stop_process(self.guard, signal.SIGTERM, 3))
+        attempt(lambda: stop_process(self.capture, signal.SIGINT, 3))
         if self.id:
             record = getattr(self, 'record', {'generation': self.generation, 'carrier': self.id,
                 'dependents': self.dependents, 'receipt': str(self.receipt)})
-            revoke(record, 'operator_stop')
-        if self.peer:
-            links = json.loads(run('ip', '-j', 'link'))
-            if any(x['ifname'] == self.peer and x.get('ifalias') == self.generation for x in links):
-                run('ip', 'link', 'del', self.peer)
-        os.close(self.lock)
+            attempt(lambda: revoke(record, 'operator_stop'))
+        def close_peer():
+            if self.peer:
+                links = json.loads(run('ip', '-j', 'link'))
+                if any(x['ifname'] == self.peer and x.get('ifalias') == self.generation for x in links):
+                    run('ip', 'link', 'del', self.peer)
+        attempt(close_peer)
+        if self.lock is not None:
+            lock, self.lock = self.lock, None
+            attempt(lambda: os.close(lock))
+        if errors:
+            raise errors[0]  # cleanup failure remains terminal to the supervisor
+        self._cleanup_complete = True
 
 
 if __name__ == '__main__':
