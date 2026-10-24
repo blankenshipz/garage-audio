@@ -53,8 +53,8 @@ export class SpeakersPanel {
     this.renderButtons();
     const s=this.state;
     if(this.mode!=='legacy-native'){
-      this.el('music-source-status').textContent='Ordinary playback starts in Spotify → Garage Speakers. No chat, manual enable or listening session is required.';
-      this.el('music-player-status').textContent='Full-range stereo · UMC1820 OUT3/4 · fixed −6 dB headroom · no subwoofer path.';
+      this.el('music-source-status').textContent=audioReadiness(s);
+      this.el('music-player-status').textContent=s?.device_mode==='standby'?'Discovery-only standby · no audio authority.': 'Full-range stereo · UMC1820 OUT3/4 · fixed −6 dB headroom · no subwoofer path. Fosi is the main volume control; Spotify is digital attenuation. Turn Fosi fully down for first playback, then raise slowly.';
       this.el('speakers-human-status').textContent=s?.device_mode==='file'?'FILE worker only: no physical audio device or sound verified.':s?.physical_verified===true?'Physical device identity reported by worker. Listening and acoustic results are not inferred.':'Physical device identity not verified.';
       this.el('speakers-status').textContent=audioSummary(s);return;
     }
@@ -70,4 +70,17 @@ export class SpeakersPanel {
       s.state==='stopped'?'Speaker output stopped · no sound.':'Output stop not verified — do not start music.';
   }
 }
-export function audioSummary(s){if(!s)return 'Audio worker unavailable. Output Stop and physical silence are not verified.';return `${s.device_mode==='file'?'FILE worker · no physical sound claim':'Audio worker'} · ${s.state} · ${s.device_open?'device open':'device closed'}${s.reason?` · ${s.reason.replaceAll('_',' ')}`:''}. Physical silence is not inferred from software readback.`;}
+export function audioSummary(s){if(!s)return 'Audio worker unavailable. Output Stop and physical silence are not verified.';return `${s.device_mode==='standby'?'Discovery-only standby':s.device_mode==='file'?'FILE worker · no physical sound claim':'Audio worker'} · ${s.state} · ${s.device_open?'device open':'device closed'}${s.reason?` · ${s.reason.replaceAll('_',' ')}`:''}. Physical silence is not inferred from software readback.`;}
+
+export function audioReadiness(s){
+ const stages={standby:'Discovery-only standby. Ordinary listening is unavailable.',
+  network_unavailable:'Audio network admission unavailable.',
+  observation_unavailable:'Fresh receiver observation unavailable.',
+  receiver_unavailable:'Receiver authentication or active-device state unavailable.',
+  awaiting_source:'Fresh Play received; waiting for source corroboration.',
+  waiting_for_play:'Receiver observed; waiting for a fresh Spotify Play.',
+  playing:'Software output playing. Listening and audibility are not verified.',
+  paused:'Software output paused.'};
+ const stage=s?.device_mode==='standby'?'standby':s?.readiness;
+ return `${stages[stage]||'Runtime playback readiness has not been verified.'} Phone discovery visibility is not verified here. Playback starts in Spotify → Garage Speakers.`;
+}

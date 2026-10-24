@@ -86,6 +86,7 @@ class Worker:
         self.volume = None
         self.state = 'off'
         self.reason = 'startup_no_authority'
+        self.last_event_received = None  # readback only; never renews playback authority
         self.last_observation = 0
         self.deadline = 0
         self.pause_deadline = 0
@@ -317,14 +318,35 @@ class Worker:
         outputs = [configuration['left'], configuration['right']]
         if configuration['sub'] is not None:
             outputs.append(configuration['sub'])
+        now = time.monotonic()
+        observed = self.baseline and self.last_event_received is not None and 0 <= now-self.last_event_received <= WATCHDOG
+        receiver = observed and self.active and self.logged_in
+        network = self.network_valid()
+        pending = self.pending_ticket
+        if self.mode == 'standby' or self.scalar_terminal:
+            readiness = 'standby'
+        elif not network:
+            readiness = 'network_unavailable'
+        elif not observed:
+            readiness = 'observation_unavailable'
+        elif not receiver:
+            readiness = 'receiver_unavailable'
+        elif self.state in ('playing', 'paused'):
+            readiness = self.state
+        elif pending and now < pending[3]:
+            readiness = 'awaiting_source'
+        else:
+            readiness = 'waiting_for_play'
         return {'state': self.state, 'reason': self.reason, 'generation': self.generation,
+                'observer_available': bool(observed), 'receiver_available': bool(receiver),
+                'readiness': readiness,
                 'device_mode': self.mode, 'device_open': self.device_lease is not None,
                 'owned_children': [c.pid for c in self.children if c.poll() is None],
                 'segment': self.segment, 'receiver_volume': self.volume,
                 'headroom_db': configuration['headroom_db'], 'outputs': outputs, 'unused_outputs_zero': True,
                 'watchdog_seconds': WATCHDOG, 'deadline_remaining': max(0, self.deadline-time.monotonic()),
                 'authority_persisted': False, 'physical_verified': False,
-                'network_generation': self.network_generation, 'network_admitted': self.network_valid(),
+                'network_generation': self.network_generation, 'network_admitted': network,
                 'scalar_readers_ready': bool(self.scalar and self.scalar.healthy()),
                 'scalar_segments_remaining': max(0, 8-self.segment) if self.scalar else None,
                 'standby': self.mode == 'standby' or self.scalar_terminal,
@@ -454,6 +476,7 @@ class Worker:
             raise ValueError('stale observer epoch/sequence')
         else:
             self.sequence = sequence
+        self.last_event_received = time.monotonic()
         self.active, self.logged_in, self.volume = value['active'], value['logged_in'], volume
         if kind == 'lost' or not self.active or not self.logged_in:
             self.halt('receiver_or_auth_lost')

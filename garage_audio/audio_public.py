@@ -19,7 +19,7 @@ PUBLIC_SOCKET = '/run/garage-audio/public/control.sock'
 STATUS_FIELDS = frozenset(('state','reason','generation','device_mode','device_open',
     'owned_children','segment','receiver_volume','headroom_db','outputs','unused_outputs_zero',
     'watchdog_seconds','deadline_remaining','authority_persisted','physical_verified',
-    'device_verified','observer_available','receiver_available'))
+    'device_verified','observer_available','receiver_available','standby','qualification_terminal','readiness'))
 
 
 class AudioFailure(Exception):
@@ -45,12 +45,22 @@ def _object(pairs):
 
 def _status(result):
     if (result.get('state') not in ('off','paused','playing')
-            or result.get('device_mode') not in ('file','hardware')
+            or result.get('device_mode') not in ('file','hardware','standby')
             or type(result.get('device_open')) is not bool
             or type(result.get('physical_verified')) is not bool):
         raise ValueError('Invalid worker status')
-    for field in ('device_verified','observer_available','receiver_available','unused_outputs_zero','authority_persisted'):
+    for field in ('device_verified','observer_available','receiver_available','unused_outputs_zero','authority_persisted','standby','qualification_terminal'):
         if field in result and type(result[field]) is not bool: raise ValueError('Invalid status flag')
+    if result['device_mode'] == 'standby' and (
+            result['state'] != 'off' or result['device_open'] or result['physical_verified']
+            or result.get('owned_children') != [] or result.get('standby') is not True
+            or result.get('qualification_terminal') is not True
+            or result.get('scalar_readers_ready') is not False):
+        raise ValueError('Invalid standby status')
+    if 'readiness' in result and result['readiness'] not in (
+            'standby','network_unavailable','observation_unavailable','receiver_unavailable',
+            'awaiting_source','waiting_for_play','playing','paused'):
+        raise ValueError('Invalid readiness')
     if 'reason' in result and (not isinstance(result['reason'],str) or not re.fullmatch(r'[a-z0-9_.-]{1,80}',result['reason'])):
         raise ValueError('Invalid reason code')
     if 'generation' in result and (not isinstance(result['generation'],str) or not re.fullmatch(r'[a-f0-9]{32}',result['generation'])):

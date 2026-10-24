@@ -125,3 +125,47 @@ rendered UI, authentication, physical audio, or provider-resume proof.
 `tests/audio_receiver_scan.py` uses isolated Linux UID1000 real sockets and
 controlled proc errors, with no audio devices or network access. Retain the
 expected old-source reproduction failure as well as the patched result.
+
+## Deferred review follow-up (source only)
+
+Cleanup now attempts every owned-helper stop, generation revocation, peer cleanup
+and lock release even when an earlier helper times out. Timed-out owned children
+receive a bounded kill/reap attempt; the initiating timeout remains terminal and
+cannot authorize a replacement generation. An unsuccessful close can be retried.
+
+The private `recovery-state.json` diagnostic has schema 1, a fresh owner invocation
+ID, current admitted generation (null during startup), monotonic observation time,
+retry count, and starting/ready/backoff/stopped/terminal/exhausted state. Ready means
+the existing startup policy/OFF checks and stable receiver ownership admission
+completed; it does not prove Spotify authentication, phone discovery or listening.
+Terminal generation exceptions retain counts without including exception messages.
+This receipt is never playback authority.
+
+Public status/Stop/Pause now accepts a constrained standby readback: OFF, no device,
+no children or scalar readers, consumed terminal ledger, and no physical success
+claim. Qualification attempt identifiers remain private. Worker readiness is a
+small enum derived from existing network validity and fresh observer metadata;
+its separate metadata timestamp never renews playback authority or mints a ticket.
+The dashboard distinguishes standby, missing observation/auth/active device,
+waiting for fresh Play, waiting for source corroboration, and software playing or
+paused. Phone visibility and audibility remain unverified. Fosi first-play volume
+guidance is also shown in the Docker view.
+
+A deterministic virtual-clock characterization confirms that a successful Docker
+inspection can exceed the independent guardian's two-second freshness budget
+(the Docker wrapper permits up to four seconds). That budget and all authority
+expiry rules are unchanged. A future inspection-budget redesign must fit complete
+ownership/lease checks within the existing bound; extending authority or publishing
+healthy ticks before complete checks is not this fix.
+
+Focused tests: `python3 -B -m unittest discover -s tests -p audio_review_fixes.py -v`,
+`python3 -B -m unittest discover -s tests -p audio_recovery.py -v`,
+`python3 -B -m unittest discover -s tests -p audio_readiness.py -v`, and
+`node --test web/tests/speakers.test.js`. These use synthetic process/IPC/time seams
+and UI fixtures, not live Docker, authentication, devices or audio.
+
+This follow-up additionally changes `audio_container.py`, `audio_public.py` and
+`web/speakers.js`; the earlier five-file host-only deployment procedure does not
+install these worker/dashboard changes. Coordinate a separately frozen release,
+matching worker/dashboard assets, test environment and rollback with the active
+owner. No deployment, merge or playback acceptance is implied by these source tests.
