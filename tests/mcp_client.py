@@ -29,6 +29,9 @@ async def journey():
                                       'calibration_create_plan', 'calibration_import_response',
                                       'calibration_readback', 'calibration_analyze',
                                       'calibration_propose', 'calibration_cancel',
+                                      'calibration_import_capture', 'calibration_correction_prepare',
+                                      'calibration_correction_get', 'calibration_correction_apply',
+                                      'calibration_correction_rollback', 'calibration_correction_verify',
                                       'measurement_request','measurement_read','measurement_execute',
                                       'measurement_cancel','measurement_history',
                                       'room_list','room_create','room_read','room_update','room_archive',
@@ -77,7 +80,7 @@ async def journey():
                     ):
                         rejected=await client.call_tool(tool,args)
                         assert json.loads(rejected.content[0].text)['error']['code']=='invalid_arguments',(tool,args)
-                    print('PASS real LOCAL MCP initialize, exact 34 legacy/calibration/measurement/room/profile tools, 5 resources and retained prompt, schema discovery, missing-DSP status, authenticated create/read session, offline profile edit, strict raw argument validation, denied unmute/play_url; synthetic fixtures only, no hardware sound')
+                    print('PASS real LOCAL MCP initialize, exact 40 legacy/calibration/measurement/room/profile tools, 5 resources and retained prompt, schema discovery, missing-DSP status, authenticated create/read session, offline profile edit, strict raw argument validation, denied unmute/play_url; synthetic fixtures only, no hardware sound')
         finally:server.shutdown();server.server_close();thread.join()
 
 if __name__=='__main__':asyncio.run(journey())
