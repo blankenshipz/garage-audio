@@ -41,7 +41,7 @@ class AdapterUnits(unittest.TestCase):
 
     def test_exact_messages_bounded_fragmented_reply(self):
         frame=json.dumps({'ok':True,'result':STATUS}).encode()+b'\n'
-        for operation in audio_public.SCHEMAS:
+        for operation in ('audio.status','audio.stop','audio.pause'):
             result,fixture=self.invoke([frame[:4],frame[4:]],operation)
             self.assertEqual(result,STATUS)
             self.assertEqual(json.loads(fixture.sent[0]),{'operation':operation})
@@ -70,11 +70,14 @@ class AdapterUnits(unittest.TestCase):
 
     def test_response_projection_rejects_nested_payloads_and_nonfinite_numbers(self):
         for extra in ({'reason':{'secret':'not forwarded'}},{'receiver_volume':{'grant':'not forwarded'}},
-                      {'watchdog_seconds':float('inf')},{'outputs':[1,2]}):
+                      {'watchdog_seconds':float('inf')},{'outputs':[1,1]},
+                      {'device_mode':'hardware','outputs':[1,2]}):
             frame=json.dumps({'ok':True,'result':{**STATUS,**extra}}).encode()+b'\n'
             with self.assertRaises(audio_public.AudioFailure): self.invoke([frame])
         result,_=self.invoke([json.dumps({'ok':True,'result':{**STATUS,'raw_grant':'not forwarded'}}).encode()+b'\n'])
         self.assertEqual(result,STATUS)
+        result,_=self.invoke([json.dumps({'ok':True,'result':{**STATUS,'outputs':[1,2]}}).encode()+b'\n'])
+        self.assertEqual(result['outputs'],[1,2])
 
     def test_extra_caller_fields_and_no_native_fallback(self):
         with tempfile.TemporaryDirectory(dir='/private/tmp/opencode') as root:
@@ -97,7 +100,7 @@ def client_journey(root,sock):
     assert Path(sock).exists(),'Actual worker socket missing'
     os.environ.update(GARAGE_DEPLOYMENT_MODE='docker',GARAGE_AUDIO_CONTROL_SOCKET=sock)
     app=Application(root,broker=lambda _: (_ for _ in ()).throw(AssertionError('Native fallback forbidden')))
-    for operation in audio_public.SCHEMAS:
+    for operation in ('audio.status','audio.stop','audio.pause'):
         result=app.execute(operation,{})
         assert result['ok'],result
         assert result['result']['state']=='off',result

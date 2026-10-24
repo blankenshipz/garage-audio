@@ -17,7 +17,7 @@ class CleanupTests(unittest.TestCase):
         c.closed = False
         c.lock = 98765  # os.close is mocked; never a real descriptor
         c.id, c.peer, c.generation = 'owned-carrier', 'owned-peer', 'generation'
-        c.record = {'generation': c.generation}
+        c.record = {'generation': c.generation, 'carrier':c.id, 'dependents':[]}
         c.dependents, c.receipt = [], Path('/synthetic-unused')
         c.client, c.guard, c.capture = [Mock() for _ in range(3)]
         for p in (c.client, c.guard, c.capture):
@@ -32,7 +32,7 @@ class CleanupTests(unittest.TestCase):
                 timeout = subprocess.TimeoutExpired('owned-helper', 3)
                 process.wait.side_effect = [timeout, 0]
                 links = json.dumps([{'ifname': c.peer, 'ifalias': c.generation}])
-                with patch.object(network, 'revoke') as revoke, patch.object(network, 'run', return_value=links) as run, patch.object(network.os, 'close') as close:
+                with patch.object(network, 'revoke', return_value={'containers_stopped':{c.id:True},'software_children_closed':None}) as revoke, patch.object(network, 'run', return_value=links) as run, patch.object(network.os, 'close') as close:
                     with self.assertRaises(subprocess.TimeoutExpired) as error:
                         c.close()
                     self.assertIs(error.exception, timeout)
@@ -61,6 +61,14 @@ class CleanupTests(unittest.TestCase):
             self.assertIs(caught.exception, error)
             close.assert_called_once_with(98765)
             self.assertFalse(getattr(c, '_cleanup_complete', False))
+
+    def test_logged_revocation_failure_is_not_completed_cleanup(self):
+        for stopped,ack in [({ 'owned-carrier':False},True),({},True),({'owned-carrier':True},False)]:
+            c=self.carrier();c.record['worker_ack']='/synthetic-ack'
+            result={'containers_stopped':stopped,'software_children_closed':ack}
+            with patch.object(network,'revoke',return_value=result),patch.object(network,'run',return_value='[]'),patch.object(network.os,'close') as close:
+                with self.assertRaisesRegex(RuntimeError,'cleanup incomplete'):c.close()
+                self.assertFalse(getattr(c,'_cleanup_complete',False));close.assert_called_once()
 
     def test_permission_failure_preserved_and_foreign_peer_never_deleted(self):
         c = self.carrier()

@@ -83,7 +83,7 @@ def generation(config,stop,root,ready=None):
   atomic(receipt/'boot-ready.json',{'generation':c.generation,'roles':b.roles,'sound_authority':False})
   atomic(pathlib.Path('/etc/garage-audio/ma-enrollment/network-endpoint.json'),{'generation':c.generation,'registry':str(c.registry),'endpoint':'http://'+c.address+':8095'})
   subprocess.run(['systemctl','start','garage-ma-enrollment-admission.service'],check=True)
-  receiver=ReceiverEndpoint(config['receiver_binary_sha256']);observed=None;deadline=time.monotonic()+60;pairing=[];pairing_check=0;candidate=None;stable_since=None;pairing_baseline=[]
+  receiver=ReceiverEndpoint(config['receiver_binary_sha256']);observed=None;deadline=time.monotonic()+60;pairing=[];pairing_check=0;candidate=None;stable_since=None;pairing_baseline=[];ready_published=False
   while not stop.is_set():
    c.healthy();pid=json.loads(docker('inspect',b.roles['music-assistant']))[0]['State']['Pid']
    try:current=receiver.observe(pid,c.inode)
@@ -103,7 +103,6 @@ def generation(config,stop,root,ready=None):
      if time.monotonic()-stable_since<3:
       stop.wait(.2);continue
     if observed is not None and current!=observed:raise RuntimeError('receiver owner changed')
-    first_admission=observed is None
     receiver.publish(receipt/'authority',current);observed=current;c.receiver_process={'pid':current['pid'],'birth':current['birth']};c.write_registry()
     atomic(receipt/'receiver-listener.json',current)
     if time.monotonic()-pairing_check>.2:
@@ -117,7 +116,8 @@ def generation(config,stop,root,ready=None):
       c.ns('nft','add','element','inet','garage_audio','pairing','{',','.join(map(str,ports)),'}');pairing=ports;pairing_baseline=instances
      atomic(receipt/'pairing-listeners.json',{'generation':c.generation,'ports':ports,'advertisement':'_spotify-connect._tcp.local.','actual_verified_socket_ports':sorted({r['port'] for r in pairing_baseline}),'listener_instances':pairing_baseline,'indeterminate_ingress_closed':not bool(ports)})
      pairing_check=time.monotonic()
-    if first_admission and ready:ready(c.generation)
+    if pairing and not ready_published and ready:
+     ready(c.generation);ready_published=True
    stop.wait(.2)
  except Exception as error:
   result='recoverable' if recoverable(error,receipt) else 'terminal'

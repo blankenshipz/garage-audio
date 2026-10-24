@@ -126,7 +126,7 @@ rendered UI, authentication, physical audio, or provider-resume proof.
 controlled proc errors, with no audio devices or network access. Retain the
 expected old-source reproduction failure as well as the patched result.
 
-## Deferred review follow-up (source only)
+## Reviewed follow-up (source only, not activated)
 
 Cleanup now attempts every owned-helper stop, generation revocation, peer cleanup
 and lock release even when an earlier helper times out. Timed-out owned children
@@ -136,8 +136,9 @@ cannot authorize a replacement generation. An unsuccessful close can be retried.
 The private `recovery-state.json` diagnostic has schema 1, a fresh owner invocation
 ID, current admitted generation (null during startup), monotonic observation time,
 retry count, and starting/ready/backoff/stopped/terminal/exhausted state. Ready means
-the existing startup policy/OFF checks and stable receiver ownership admission
-completed; it does not prove Spotify authentication, phone discovery or listening.
+the existing startup policy/OFF checks, stable receiver ownership admission and
+nonempty verified pairing-listener admission completed; it does not prove Spotify
+authentication, phone discovery or listening.
 Terminal generation exceptions retain counts without including exception messages.
 This receipt is never playback authority.
 
@@ -164,8 +165,61 @@ Focused tests: `python3 -B -m unittest discover -s tests -p audio_review_fixes.p
 `node --test web/tests/speakers.test.js`. These use synthetic process/IPC/time seams
 and UI fixtures, not live Docker, authentication, devices or audio.
 
-This follow-up additionally changes `audio_container.py`, `audio_public.py` and
-`web/speakers.js`; the earlier five-file host-only deployment procedure does not
-install these worker/dashboard changes. Coordinate a separately frozen release,
-matching worker/dashboard assets, test environment and rollback with the active
-owner. No deployment, merge or playback acceptance is implied by these source tests.
+### Canonical disposition (R1–R5)
+
+- **R1 accepted with correction:** complete owned-helper cleanup despite timeouts.
+  Revocation must prove all owned containers stopped and, when required, software
+  children closed; merely writing a revocation receipt is not successful cleanup.
+- **R2 accepted with correction:** private recovery transitions and diagnostics;
+  publish ready only after receiver and pairing admission, never merely startup.
+- **R3 accepted with correction:** constrained standby/public readiness projection.
+  Rejected events never refresh readiness metadata; slow accepted events retain
+  receipt time, not completion time. Metadata never renews playback authority.
+- **R4 wording accepted, visual acceptance limited:** standby/readiness and Fosi
+  guidance rendered in a local browser fixture at 1440×1000 and 390×844 for standby,
+  waiting-for-Play and playing. Keyboard focus/Tab, native anchor and reload were
+  exercised. Narrow sticky navigation overlaps upper content on focus-scroll;
+  whether this predates the changed lines is not established. Full-app selected
+  navigation, authentication/reconnect, phone and hardware remain unverified.
+  This is not a clean narrow-screen visual pass or a live playback claim.
+- **R5 deferred:** deterministic inspection-budget characterization only. No live
+  timing fault is established and no guardian freshness/authority boundary changed.
+
+Supported isolated Linux validation used Python 3.13.16 and Agents SDK 0.23.1:
+52/52 application tests passed, zero skips. The subsequently corrected FILE/HTTP
+IPC status/Stop/Pause journey passed separately. Frontend tests passed 84/84 with
+zero skips. These are software/fixture results, not production or physical proof.
+Private full logs, source inventories, failed attempts and browser screenshots
+are retained outside the repository in the integration/check receipts. The stale
+configuration-operation IPC expectation was corrected rather than weakening the
+production schema. No inference, playback or recording was performed.
+
+### Matching activation and rollback prerequisite
+
+Source integration is separate from deployed `64440af`. This follow-up additionally
+changes `audio_container.py`, `audio_public.py` and `web/speakers.js`; the earlier
+five-file host-only procedure **cannot install the complete feature**. No live
+activation is authorized by this review or its source tests.
+
+Before a separately authorized activation, the existing owner must establish
+actual playback state and the sound-risk safe point above. Pause writers and
+freeze the committed source SHA, exact host module/script inventory, worker image
+digest, dashboard image/assets digest and matching Compose/configuration inputs.
+Retain known-good installed host bytes/unit and worker/dashboard image references
+with their matching configuration for rollback; keep private state, credentials
+and transient receipts outside shipped inputs. Preserve credential references,
+device policy, ownership and consent boundaries, and unrelated workloads.
+
+Install host, worker and dashboard as one compatible frozen release using the
+existing lifecycle owner, not a host-only upgrade. Verify installed hashes/digests
+and the actual public status/Stop/Pause boundary, standby versus hardware mode,
+receiver/pairing admission and freshness/readiness projection. Rediscover supported
+operations on reconnect; never replay old sound authority. Only user-originated
+Spotify playback can establish the ordinary listening journey and audible result;
+software playing/discovery alone cannot. No agent-forced Play is part of this work.
+
+Rollback must stop the same owner and prove its generation closed before restoring
+the retained matching host/unit, worker and dashboard inputs. Preserve failures
+and private state; restart the old owner only under the same safe-point prerequisite.
+Do not mix old worker/public schemas with new dashboard assets or erase retained
+provider state. Activation, rollback execution and physical listening remain unrun.

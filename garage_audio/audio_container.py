@@ -445,6 +445,7 @@ class Worker:
                 client.disconnect()
 
     def event(self, value):
+        received = time.monotonic()  # receipt time, not completion of a slow launch
         self.check_scalar()
         if not self.network_valid():
             self.halt('network_authority_lost')
@@ -476,7 +477,6 @@ class Worker:
             raise ValueError('stale observer epoch/sequence')
         else:
             self.sequence = sequence
-        self.last_event_received = time.monotonic()
         self.active, self.logged_in, self.volume = value['active'], value['logged_in'], volume
         if kind == 'lost' or not self.active or not self.logged_in:
             self.halt('receiver_or_auth_lost')
@@ -492,6 +492,7 @@ class Worker:
                     raise ValueError('scalar qualification terminal')
                 token = uuid.uuid4().hex
                 self.pending_ticket = (token, self.epoch, self.stop_generation, time.monotonic()+TICKET_SECONDS)
+            self.last_event_received = received
             return dict(self.status(), pending_ticket=token)
         elif kind == 'delta' and value['state'] == 'playing':
             if not self.baseline or volume is None:
@@ -514,6 +515,7 @@ class Worker:
                 self.pending_ticket = None
         if self.state in ('playing', 'paused'):
             self.last_observation = time.monotonic()
+        self.last_event_received = received  # rejected events never renew this metadata
         result = dict(self.status(), control_generation=self.stop_generation)
         pending = self.pending_ticket
         result['pending_ticket'] = pending[0] if pending and time.monotonic() < pending[3] else None

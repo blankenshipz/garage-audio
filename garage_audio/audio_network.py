@@ -73,6 +73,7 @@ def revoke(record, reason):
     with (root/'revocations.jsonl').open('a') as out:
         out.write(value+'\n')
     (root/'guard-revoked.json').write_text(value)
+    return json.loads(value)
 
 
 def guard_main(registry):
@@ -450,7 +451,14 @@ class Carrier:
         if self.id:
             record = getattr(self, 'record', {'generation': self.generation, 'carrier': self.id,
                 'dependents': self.dependents, 'receipt': str(self.receipt)})
-            attempt(lambda: revoke(record, 'operator_stop'))
+            def close_generation():
+                result = revoke(record, 'operator_stop')
+                stopped = result['containers_stopped']
+                if (set(stopped) != set(record['dependents']+[record['carrier']])
+                        or any(value is not True for value in stopped.values())
+                        or (record.get('worker_ack') and result['software_children_closed'] is not True)):
+                    raise RuntimeError('owned generation cleanup incomplete')
+            attempt(close_generation)
         def close_peer():
             if self.peer:
                 links = json.loads(run('ip', '-j', 'link'))

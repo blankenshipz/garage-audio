@@ -87,7 +87,7 @@ class Recovery(unittest.TestCase):
 
 class Lifecycle(unittest.TestCase):
  setUp=Recovery.setUp
- def fixture(self,error=None,cleanup_error=False,standby=False,unsafe=False,ready_receiver=False,ready=None):
+ def fixture(self,error=None,cleanup_error=False,standby=False,unsafe=False,ready_receiver=False,ready=None,pairing=True):
   events=[];root=self.root;stop=threading.Event()
   (root/'audio-lifecycle-policy.py').write_text('# isolated synthetic policy\n')
   class Carrier:
@@ -128,7 +128,8 @@ class Lifecycle(unittest.TestCase):
   endpoint=SimpleNamespace(observe=lambda *_:(_ for _ in ()).throw(FileNotFoundError()))
   if ready_receiver:
    endpoint=SimpleNamespace(observe=lambda *_:{'pid':123,'birth':'b'},publish=lambda *_:events.append('receiver-publish'))
-   patch.object(lifecycle,'pairing_instances',return_value=[]).start()
+   patch.object(lifecycle,'pairing_instances',return_value=[{'port':12345}] if pairing else []).start()
+   patch.object(lifecycle,'verify_pairing_instances',return_value=[]).start()
    ticks=iter(range(1000))
    patch.object(lifecycle.time,'monotonic',side_effect=lambda:next(ticks)).start()
   self.addCleanup(patch.stopall)
@@ -149,6 +150,9 @@ class Lifecycle(unittest.TestCase):
   before=admitted[0][1]
   self.assertIn('status',before);self.assertIn('start:audio-observer',before)
   self.assertIn('receiver-publish',before);self.assertNotIn('closed',before)
+ def test_admitted_receiver_without_pairing_never_reports_ready(self):
+  call,_=self.fixture(ready_receiver=True,pairing=False,ready=lambda _:self.fail('pairing not admitted'))
+  self.assertEqual(call(),'stopped')
  def test_absent_receiver_never_reports_ready(self):
   call,_=self.fixture(ready=lambda _:self.fail('receiver not admitted'))
   self.assertEqual(call(),'stopped')
