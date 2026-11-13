@@ -1,5 +1,5 @@
 """Synthetic control-plane integration, no Docker/ALSA/network/provider access."""
-import importlib.util,json,os,tempfile,threading,unittest
+import importlib.util,json,os,subprocess,tempfile,threading,unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -87,13 +87,15 @@ class Recovery(unittest.TestCase):
 
 class Lifecycle(unittest.TestCase):
  setUp=Recovery.setUp
- def fixture(self,error=None,cleanup_error=False,standby=False,unsafe=False):
+ def fixture(self,error=None,cleanup_error=False,standby=False,unsafe=False,start_error=None):
   events=[];root=self.root;stop=threading.Event()
   (root/'audio-lifecycle-policy.py').write_text('# isolated synthetic policy\n')
   class Carrier:
    def __init__(self,receipt):
     receipt.mkdir();(receipt/'authority').mkdir();self.receipt=receipt;self.registry=receipt/'registry.json';self.generation='g';self.inode=1;self.address='192.0.2.1';self.dependents=[];self.id='carrier';self.worker_ack=None;self.guard=SimpleNamespace(poll=lambda:None);self.health=0
-   def start(self,*_):events.append('carrier-start')
+   def start(self,*_):
+    events.append('carrier-start')
+    if start_error:raise start_error
    def healthy(self):
     self.health+=1
     if self.health>1:
@@ -158,5 +160,60 @@ class Lifecycle(unittest.TestCase):
  def test_standby_with_sound_mapping_is_terminal_before_any_start(self):
   call,events=self.fixture(standby=True,unsafe=True)
   self.assertEqual(call(),'terminal');self.assertNotIn('start:audio-device',events)
+
+class PreadmissionRestart(unittest.TestCase):
+ setUp=Recovery.setUp
+ fixture=Lifecycle.fixture
+ def test_owner_restart_macvlan_race_is_preadmission_not_terminal(self):
+  call,events=self.fixture(start_error=subprocess.CalledProcessError(2,['nsenter','ip','link','set','ga-lan','up']))
+  self.assertEqual(call(),'preadmission');self.assertIn('closed',events)
+  self.assertFalse(any(str(x).startswith('start:') for x in events))
+ def test_preadmission_ownership_failures_stay_terminal(self):
+  carrier=SimpleNamespace(dependents=[],worker_ack=None)
+  self.assertTrue(recovery.preadmission(RuntimeError('bounded DHCP admission timed out'),carrier))
+  wrapped=RuntimeError('x');wrapped.__cause__=PermissionError()
+  for error in [PermissionError(),wrapped,ValueError(),FileNotFoundError()]:
+   self.assertFalse(recovery.preadmission(error,carrier))
+  for late in [SimpleNamespace(dependents=['ma'],worker_ack=None),SimpleNamespace(dependents=[],worker_ack='ack')]:
+   self.assertFalse(recovery.preadmission(RuntimeError('x'),late))
+ def test_preadmission_retries_are_bounded(self):
+  stop=SimpleNamespace(is_set=lambda:False,wait=lambda _:False);calls=[]
+  supervisor=recovery.Supervisor(self.root,stop,lambda:0)
+  self.assertEqual(supervisor.run(lambda:calls.append(1) or 'preadmission'),'exhausted')
+  self.assertEqual((len(calls),supervisor.last),(4,'preadmission'))
+
+class CarrierMacRelease(unittest.TestCase):
+ def carrier(self,holders,link_up_failures):
+  c=object.__new__(network.Carrier);c.name='gaudio-net-x';c.generation='g';c.id=None
+  c.receipt=Path(tempfile.mkdtemp());self.addCleanup(lambda:__import__('shutil').rmtree(c.receipt))
+  events=[];polls=iter(holders);failures=[link_up_failures]
+  def run(*args):
+   events.append(args)
+   if args[-2:]==('ga-lan','up') and failures[0]:
+    failures[0]-=1;raise subprocess.CalledProcessError(2,args)
+   return ''
+  def docker(*args):return json.dumps([{'State':{'Pid':42}}]) if args[0]=='inspect' else 'id'
+  hook=c.receipt/'hook';hook.write_text('');hook.chmod(0o700)
+  patches=[patch.object(network,'run',side_effect=run),patch.object(network,'docker',side_effect=docker),
+   patch.object(network.os,'stat',side_effect=lambda path,*a,_stat=os.stat,**k:SimpleNamespace(st_ino=7) if str(path).startswith('/proc/') else _stat(path,*a,**k)),patch.object(network.time,'sleep'),
+   patch.object(network.subprocess,'run',side_effect=lambda *a,**k:events.append('nft')),
+   patch.object(network.subprocess,'Popen',side_effect=StopIteration('reached DHCP')),
+   patch.object(network.Carrier,'mac_holders',side_effect=lambda:next(polls))]
+  for item in patches:item.start();self.addCleanup(item.stop)
+  return c,hook,events
+ def test_waits_for_prior_namespace_then_retries_link_up(self):
+  c,hook,events=self.carrier([['old-sandbox'],['old-sandbox'],[],[],[]],2)
+  with patch.object(network.time,'monotonic',return_value=0),self.assertRaises(StopIteration):c.start(hook)
+  add=[i for i,x in enumerate(events) if x[:3]==('ip','link','add')];up=[i for i,x in enumerate(events) if x[-2:]==('ga-lan','up')]
+  self.assertEqual((len(add),len(up)),(1,3));self.assertLess(events.index('nft'),up[0])
+ def test_foreign_holder_fails_after_bounded_wait_without_macvlan(self):
+  c,hook,events=self.carrier([['host']]*3,0)
+  clock=iter([0,0,5,network.MAC_RELEASE_WAIT+1])
+  with patch.object(network.time,'monotonic',side_effect=lambda:next(clock)):
+   with self.assertRaisesRegex(RuntimeError,'still owned after bounded wait: host'):c.start(hook)
+  self.assertFalse(any(x[:3]==('ip','link','add') for x in events))
+ def test_link_up_failure_with_visible_holder_is_not_retried(self):
+  c,hook,events=self.carrier([[],['other']],1)
+  with patch.object(network.time,'monotonic',return_value=0),self.assertRaises(subprocess.CalledProcessError):c.start(hook)
 
 if __name__=='__main__':unittest.main()

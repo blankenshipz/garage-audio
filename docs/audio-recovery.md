@@ -37,6 +37,15 @@ of cleanup or its proof prevents replacement. Inputs are revalidated each time.
 At most three retries per owner invocation: 5, 30, 120 seconds, at most three in
 600 seconds. The lifetime cap never resets after a quiet period. Exhaustion exits
 nonzero and requires an explicit owner start; systemd `Restart=no` is retained.
+Pre-admission infrastructure failures (carrier namespace, macvlan, DHCP or Docker
+not ready, before any dependent is registered and with no ownership/permission error
+in the chain) use the same bounded retries; on exhaustion the owner exits 75
+(EX_TEMPFAIL), which the unit retries via `RestartForceExitStatus=75` under a start
+limit. Exit 1 is never restarted. The carrier waits (bounded) for a just-stopped prior
+generation's namespace to release the dedicated MAC instead of failing on
+`RTNETLINK: Address already in use`; a foreign MAC holder still fails.
+needrestart must not restart the owner (`config/system/needrestart-garage-audio.conf`):
+on 2026-11-13 a libc upgrade restarted it and the restart lost that race.
 SIGTERM/SIGINT cancel backoff and do not restart. Use **systemctl stop on the owner**,
 not direct Docker manipulation: Docker does not distinguish an application that
 exits 1 itself from one whose custom signal handler deliberately exits 1.

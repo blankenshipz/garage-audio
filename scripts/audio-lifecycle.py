@@ -7,7 +7,7 @@ import json,pathlib,subprocess,time,signal,os,threading
 from garage_audio.audio_boot import Boot,load_config
 from garage_audio.audio_network import Carrier,atomic,docker,run
 from garage_audio.audio_receiver import ReceiverEndpoint,ReceiverOwnershipError,PairingAdvertisements,pairing_instances,verify_pairing_instances
-from garage_audio.audio_recovery import Supervisor,owner_lock,recoverable,verify_closed
+from garage_audio.audio_recovery import EX_TEMPFAIL,Supervisor,owner_lock,preadmission,recoverable,verify_closed
 
 ROOT=pathlib.Path(__file__).parent
 
@@ -118,7 +118,7 @@ def generation(config,stop,root):
      pairing_check=time.monotonic()
    stop.wait(.2)
  except Exception as error:
-  result='recoverable' if recoverable(error,receipt) else 'terminal'
+  result='recoverable' if recoverable(error,receipt) else 'preadmission' if preadmission(error,c) else 'terminal'
   atomic(receipt/'driver-failure.json',{'class':type(error).__name__,'errno':getattr(error,'errno',None),'time':time.monotonic(),'recovery':result,'guard_exit':c.guard.poll() if c.guard else None})
  finally:
   # Any cleanup failure propagates, preventing Supervisor from making a new generation.
@@ -132,7 +132,7 @@ def generation(config,stop,root):
     try:c.close()
     finally:
      if host_route:run('ip','route','del',host_route[0]+'/32','dev',host_route[1])
-  if result=='recoverable':verify_closed(c)
+  if result in ('recoverable','preadmission'):verify_closed(c)
  return 'stopped' if stop.is_set() else result
 
 def main():
@@ -143,9 +143,12 @@ def main():
  try:
   root=pathlib.Path('/var/lib/garage-audio-network');root.mkdir(mode=0o700,exist_ok=True)
   # Revalidate all frozen inputs and image IDs for EVERY generation.
-  result=Supervisor(root,stop).run(lambda:generation(load_config(),stop,root))
+  supervisor=Supervisor(root,stop)
+  result=supervisor.run(lambda:generation(load_config(),stop,root))
   atomic(root/'recovery-state.json',{'state':result})
-  if result!='stopped':raise SystemExit(1)
+  # Only exhausted pre-admission (carrier/DHCP/Docker not ready) is EX_TEMPFAIL, which
+  # the unit's RestartForceExitStatus retries; every other failure stays manual.
+  if result!='stopped':raise SystemExit(EX_TEMPFAIL if supervisor.last=='preadmission' else 1)
  finally:os.close(lock)
 
 if __name__=='__main__':main()
