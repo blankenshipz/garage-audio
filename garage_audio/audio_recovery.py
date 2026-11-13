@@ -1,5 +1,5 @@
 """Private lifecycle recovery: classified workload exits only, never authority renewal."""
-import fcntl,json,os,stat,time,uuid
+import fcntl,json,os,stat,subprocess,time,uuid
 from pathlib import Path
 from .audio_network import atomic,docker
 
@@ -31,6 +31,19 @@ def recoverable(error,receipt):
     except (OSError,ValueError):return False
     return value.get('kind')=='owned_workload_crash'
 
+EX_TEMPFAIL=75
+
+def preadmission(error,carrier):
+    """Infrastructure failure before any dependent was registered: no worker, DAC or receiver existed."""
+    if carrier.dependents or carrier.worker_ack:return False
+    seen=set();current=error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        # Ownership, identity and consent failures stay terminal.
+        if isinstance(current,(PermissionError,OSError,ValueError)):return False
+        current=current.__cause__ or current.__context__
+    return isinstance(error,(subprocess.SubprocessError,RuntimeError))
+
 def verify_closed(carrier):
     """Cleanup must have completed before releasing a generation for replacement."""
     for identity in [*carrier.dependents,carrier.id]:
@@ -51,7 +64,7 @@ class Supervisor:
     window=600
     def __init__(self,root,stop,clock=time.monotonic):
         self.root=Path(root);self.stop=stop;self.clock=clock
-        self.invocation=uuid.uuid4().hex;self.retries=0;self.generation=None
+        self.invocation=uuid.uuid4().hex;self.retries=0;self.generation=None;self.last=None
     def publish(self,state,**fields):
         atomic(self.root/'recovery-state.json',{'schema':1,'invocation':self.invocation,
             'state':state,'retries':self.retries,'generation':self.generation,
@@ -65,10 +78,10 @@ class Supervisor:
             while not self.stop.is_set():
                 self.generation=None
                 self.publish('starting')
-                result=generation()
+                result=generation();self.last=result
                 if self.stop.is_set() or result=='stopped':
                     self.publish('stopped');return 'stopped'
-                if result!='recoverable':
+                if result not in ('recoverable','preadmission'):
                     self.publish('terminal');return 'terminal'
                 now=self.clock();attempts=[x for x in attempts if now-x<self.window]
                 # The lifetime cap never resets after a quiet interval.

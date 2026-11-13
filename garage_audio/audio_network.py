@@ -137,6 +137,7 @@ def guard_main(registry):
 
 IMAGE = 'sha256:ece60bd70b5dbfe21d20254988c25485d9b1229d24c44955e9ab52b663865d7a'
 MAC = '02:ad:ed:29:02:01'
+MAC_RELEASE_WAIT = 20  # seconds for a stopped prior carrier's namespace to be released
 
 
 def run(*args):
@@ -176,6 +177,32 @@ class Carrier:
     def ns(self, *args):
         return run('nsenter', '-t', str(self.pid), '-n', *args)
 
+    def mac_holders(self):
+        """Namespaces other than this carrier's that still own the dedicated MAC: host links,
+        running containers, and Docker sandboxes not yet released (stopped containers)."""
+        holders = []
+        if any(x.get('address') == MAC for x in json.loads(run('ip', '-j', 'link'))):
+            holders.append('host')
+        # Parent links do not list interfaces inside other Docker namespaces.
+        for identity in docker('ps', '-q').split():
+            pid = int(docker('inspect', '--format', '{{.State.Pid}}', identity).strip())
+            if not pid or os.stat(f'/proc/{pid}/ns/net').st_ino == self.inode:
+                continue
+            if any(x.get('address') == MAC for x in json.loads(run('nsenter', '-t', str(pid), '-n', 'ip', '-j', 'link'))):
+                holders.append(identity)
+        netns = Path('/run/docker/netns')
+        for entry in (sorted(netns.iterdir()) if netns.is_dir() else ()):
+            try:
+                if entry.name == 'default' or os.stat(entry).st_ino == self.inode:
+                    continue
+                links = json.loads(subprocess.check_output(['nsenter', '--net='+str(entry), 'ip', '-j', 'link'],
+                                                           text=True, timeout=2, stderr=subprocess.DEVNULL))
+            except (OSError, ValueError, subprocess.SubprocessError):
+                continue  # sandbox released mid-scan
+            if any(x.get('address') == MAC for x in links):
+                holders.append(entry.name)
+        return holders
+
     def own(self, suffix, entry, network='none', volumes=(), image=IMAGE, extra=()):
         identity = docker('create', '--name', self.name+'-'+suffix, '--label',
             'garage.audio.generation='+self.generation, '--network', network,
@@ -192,15 +219,16 @@ class Carrier:
         value = json.loads(docker('inspect', self.id))[0]
         self.pid = value['State']['Pid']
         self.inode = os.stat(f'/proc/{self.pid}/ns/net').st_ino
-        links = json.loads(run('ip', '-j', 'link'))
-        if any(x.get('address') == MAC for x in links):
-            raise RuntimeError('dedicated carrier MAC already present')
-        # Parent links do not list interfaces inside other Docker namespaces.
-        for identity in docker('ps', '-q').split():
-            pid = int(docker('inspect', '--format', '{{.State.Pid}}', identity).strip())
-            other = json.loads(run('nsenter', '-t', str(pid), '-n', 'ip', '-j', 'link'))
-            if any(x.get('address') == MAC for x in other):
-                raise RuntimeError('dedicated carrier MAC already used in a Docker namespace')
+        # A just-stopped prior carrier (e.g. an owner restart) releases its namespace and
+        # macvlan asynchronously. Wait, bounded, for the MAC to be free; never delete it.
+        deadline = time.monotonic() + MAC_RELEASE_WAIT
+        while True:
+            holders = self.mac_holders()
+            if not holders:
+                break
+            if time.monotonic() > deadline:
+                raise RuntimeError('dedicated carrier MAC still owned after bounded wait: '+','.join(holders))
+            time.sleep(.25)
         run('ip', 'link', 'add', 'link', 'enp2s0', 'name', 'ga-lan', 'netns', str(self.pid),
             'address', MAC, 'type', 'macvlan', 'mode', 'bridge')
         self.ns('sysctl', '-q', '-w', 'net.ipv6.conf.all.disable_ipv6=1')
@@ -233,7 +261,16 @@ class Carrier:
         subprocess.run(['nsenter', '-t', str(self.pid), '-n', 'nft', '-f', '-'],
                        input=rules, text=True, check=True, timeout=3)
         self.ns('ip', 'link', 'set', 'lo', 'up')
-        self.ns('ip', 'link', 'set', 'ga-lan', 'up')
+        while True:
+            # The kernel refuses (EADDRINUSE) while a dying namespace still holds the MAC,
+            # even after Docker no longer lists it. Retry only while no holder is visible.
+            try:
+                self.ns('ip', 'link', 'set', 'ga-lan', 'up')
+                break
+            except subprocess.CalledProcessError:
+                if time.monotonic() > deadline or self.mac_holders():
+                    raise
+                time.sleep(.5)
         self.capture = subprocess.Popen(['nsenter', '-t', str(self.pid), '-n', 'tcpdump',
             '-i', 'ga-lan', '-n', '-e', '-vvv', '-l',
             '(udp port 67 or udp port 68) and ether host '+MAC],
