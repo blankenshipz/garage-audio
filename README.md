@@ -303,6 +303,10 @@ schemas. The generic `garage_operation` exposes supported typed operations, not
 shell execution. Reconnect and rediscover after an update. Full onboarding,
 actionable errors and authority boundaries: [agent guide](docs/agents.md).
 
+Agent instructions for this MCP server live in [`skills/garage-audio`](skills/garage-audio/SKILL.md).
+Run `scripts/install-agent-skill` to symlink them into Claude Code (`~/.claude/skills`) and
+opencode (`~/.config/opencode/skills`).
+
 ## Measure → improve → verify → rollback
 
 For example, suppose bass sounds boomy at your workbench but thin at a nearby chair.
