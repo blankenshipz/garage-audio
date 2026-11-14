@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
-from garage_audio.audio_config import DEFAULT, Configurations, compile_graph, validate_spec
+from garage_audio.audio_config import DEFAULT, Configurations, compile_graph, default_configuration, validate_spec
 from garage_audio.audio_container import Worker
 from garage_audio.audio_device import hardware_graph
 
@@ -71,6 +71,24 @@ class TransactionTests(unittest.TestCase):
                 # Hardware mutation remains denied even with a matching-looking proposal.
                 args = {'proposal_id': worker.configurations.propose(spec)['proposal_id']}
                 with self.assertRaises(PermissionError): worker.configurations.execute('audio.config.validate', args)
+                self.assertEqual(worker.children, [])
+            finally:
+                worker.closed.set(); worker.halt('test_exit')
+
+    def test_out5_policy_selects_sub_layout_and_passes_route_admission(self):
+        self.assertEqual(default_configuration([3, 4]), DEFAULT)
+        self.assertEqual(default_configuration([3, 4, 5]), dict(DEFAULT, layout='powered-sub-2.1', sub=5))
+        with tempfile.TemporaryDirectory() as root:
+            worker = Worker(root, Path(root)/'evidence')
+            worker.mode, worker.outputs = 'hardware', [3, 4, 5]  # Isolated seam; no device admission.
+            worker.configurations = Configurations(worker)
+            self.assertEqual(worker.configurations.state['configuration']['sub'], 5)
+            try:
+                with patch.object(worker, 'network_valid', return_value=True), \
+                     patch('garage_audio.audio_device.DeviceLease', side_effect=RuntimeError('route admitted')) as lease:
+                    with self.assertRaisesRegex(RuntimeError, 'route admitted'): worker.start_owned(None)
+                    lease.assert_called_once()
+                self.assertEqual(worker.status()['outputs'], [3, 4, 5])
                 self.assertEqual(worker.children, [])
             finally:
                 worker.closed.set(); worker.halt('test_exit')

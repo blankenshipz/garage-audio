@@ -6,8 +6,10 @@ Assistant session button, browser code, terminal or periodic approval is require
 
 For the first new fixed-level playback, turn Fosi fully down first. After you hear
 music starting, raise its physical knob slowly. Fosi is the primary volume control;
-Spotify volume is optional digital attenuation. OUT3/4 are full-range stereo with
-unity DSP master and one −6 dB headroom stage. There is no sub/crossover requirement.
+Spotify volume is optional digital attenuation. With the stereo device policy, OUT3/4
+are full-range with unity DSP master and one −6 dB headroom stage. With the OUT5 sub
+policy, OUT3/4 are high-passed and OUT5 low-passed at 80 Hz, same headroom; see
+[Powered sub on OUT5](audio-configuration.md#powered-sub-on-out5).
 Digital headroom does not guarantee safe acoustic level or prevent analog clipping.
 
 Pause mutes output. Resume starts quietly with the current chosen digital level;

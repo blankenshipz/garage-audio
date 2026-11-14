@@ -79,6 +79,14 @@ class AdapterUnits(unittest.TestCase):
         result,_=self.invoke([json.dumps({'ok':True,'result':{**STATUS,'outputs':[1,2]}}).encode()+b'\n'])
         self.assertEqual(result['outputs'],[1,2])
 
+    def test_hardware_output_maps_are_reviewed_layouts_only(self):
+        for outputs in ([3,4],[3,4,5]):
+            frame=json.dumps({'ok':True,'result':{**STATUS,'device_mode':'hardware','outputs':outputs}}).encode()+b'\n'
+            self.assertEqual(self.invoke([frame])[0]['outputs'],outputs)
+        for outputs in ([3,5],[4,3,5],[3,4,6]):
+            frame=json.dumps({'ok':True,'result':{**STATUS,'device_mode':'hardware','outputs':outputs}}).encode()+b'\n'
+            with self.subTest(outputs=outputs), self.assertRaises(audio_public.AudioFailure): self.invoke([frame])
+
     def test_extra_caller_fields_and_no_native_fallback(self):
         with tempfile.TemporaryDirectory(dir='/private/tmp/opencode') as root:
             app=Application(root,broker=lambda _: self.fail('Native fallback forbidden'))

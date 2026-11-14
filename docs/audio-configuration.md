@@ -12,7 +12,8 @@ the same validation and authorization rules. Stale proposals cannot apply.
 Only a server-owned, declared virtual FILE binding can apply in this milestone.
 Hardware apply remains blocked: no trusted-LAN session, browser button, chat “yes”
 or agent assertion provides independent exact-proposal human authority or verifies
-cabling/powered-sub compatibility. Production stereo remains OUT3/4 at −6 dB.
+cabling/powered-sub compatibility. The hardware layout instead follows the root-owned
+device policy (see [Powered sub on OUT5](#powered-sub-on-out5)).
 
 ## Runtime correction contract
 
@@ -30,10 +31,10 @@ in the diff too. `.rollback` requires a freshly validated proposal of the comple
 previous state, including its correction. Readback adds
 `correction_verification: electrical-declaration-only-not-acoustic-proof`.
 
-Both FILE and hardware startup compile accepted routing/correction. Hardware still
-enforces commissioned OUT3/4 before device admission; a 2.1 route is rejected,
-not silently truncated, until independently reviewed wiring policy and authority
-are implemented. FILE state cannot migrate to hardware because binding differs.
+Both FILE and hardware startup compile accepted routing/correction. Before device
+admission, `hardware_graph` requires the compiled route to equal the device policy's
+`outputs` exactly; any other route is rejected, not silently truncated. FILE state
+cannot migrate to hardware because binding differs.
 Hardware apply/rollback/validation remain denied; this checkpoint adds no authority
 channel or device opens. All sound still requires fresh receiver admission and
 existing network/device/watchdog safeguards. No acoustic verification is implied.
@@ -51,3 +52,34 @@ provider/budget authorization; the app now enters the guarded runner outside its
 global persistence lock, and the unconditional gate prevents all provider work. No canned reply is
 presented as a model result. This remains a private alpha, not a portability,
 license-completeness or novel-acoustic-algorithm claim.
+
+## Powered sub on OUT5
+
+The root-owned policy mounted at `/device-policy.json` (host
+`/etc/garage-audio/docker-device.json`) admits exactly two layouts
+(`audio_device.load_policy`):
+
+| `outputs` | Hardware graph |
+|---|---|
+| `[3, 4]` | Stereo, full range on OUT3/4. |
+| `[3, 4, 5]` | `powered-sub-2.1`: OUT3/4 LR4 high-pass at 80 Hz; OUT5 gets L+R at −6.02 dB each, LR4 low-pass at 80 Hz. |
+
+Headroom stays −6 dB in both. Because hardware apply is unavailable, the worker's
+hardware configuration starts from the policy (`audio_config.default_configuration`),
+not from a proposal. A saved hardware configuration whose route differs from the
+policy fails closed at start. Status `outputs` reports the loaded route.
+
+The policy is an operator wiring statement, not acoustic verification. Wire OUT5
+to the sub's line/LFE input with a balanced-to-unbalanced 1/4-inch-to-RCA lead, sub
+gain at minimum and its own low-pass fully open. Then:
+
+- Write the policy with `scripts/bootstrap-container-audio.py --apply --sub-output …`
+  (without `--sub-output` it writes stereo), or edit `outputs` in place (root, 0444).
+- If the running audio-device or dashboard image changes, update its image ID and
+  the hashes of any changed frozen inputs in `/etc/garage-audio/audio-boot.json`;
+  `audio_boot.load_config` refuses mismatches.
+- Restart `garage-audio-network`. The next Play loads the 2.1 graph.
+
+To roll back, write `outputs: [3, 4]` and restart. Set the sub's level and phase by
+measurement.
+

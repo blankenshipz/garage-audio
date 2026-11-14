@@ -8,6 +8,9 @@ import stat
 IDENTITY = {'vendor': '1397', 'product': '0514', 'serial': 'D72E24B7',
             'alsa_card': 'UMC1820', 'pcm': 0}
 CAPABILITIES = {'channels': 12, 'format': 'S24_3LE', 'samplerate': 48000}
+STEREO_OUTPUTS = [3, 4]
+# Operator-wired powered sub on OUT5, fed from the declarative 2.1 graph.
+SUB_OUTPUTS = [3, 4, 5]
 
 
 def load_policy(path):
@@ -16,8 +19,9 @@ def load_policy(path):
     if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022 or info.st_size > 4096:
         raise PermissionError('immutable root-owned device policy required')
     value = json.loads(path.read_text())
-    if value != {'version': 1, 'identity': IDENTITY, 'capabilities': CAPABILITIES,
-                  'device_uid': 1002, 'device_gid': 1003, 'outputs': [3, 4]}:
+    base = {'version': 1, 'identity': IDENTITY, 'capabilities': CAPABILITIES,
+            'device_uid': 1002, 'device_gid': 1003}
+    if value not in ({**base, 'outputs': STEREO_OUTPUTS}, {**base, 'outputs': SUB_OUTPUTS}):
         raise ValueError('exact reviewed UMC policy required')
     return value
 
@@ -125,18 +129,21 @@ class DeviceLease:
             self.fd = None
 
 
-def hardware_graph(graph, alsa):
+def hardware_graph(graph, alsa, outputs=STEREO_OUTPUTS):
     if alsa != 'hw:CARD=UMC1820,DEV=0':
         raise ValueError('no default DAC or alternate target')
-    # Declarative state is not commissioning authority. Until the immutable
-    # reviewed policy changes, only the existing OUT3/4 wiring is admissible.
+    # Declarative state is not commissioning authority. The route must match the
+    # immutable root-owned policy's outputs exactly (callers pass them from it).
+    if outputs not in (STEREO_OUTPUTS, SUB_OUTPUTS):
+        raise PermissionError('outputs are not a reviewed policy layout')
+    label = 'OUT' + '/'.join(map(str, outputs))
     mapping = graph['mixers']['route']['mapping']
-    if [row['dest'] for row in mapping] != [2, 3]:
-        raise PermissionError('output map exceeds commissioned OUT3/4 policy; sub wiring authority required')
+    if [row['dest'] for row in mapping] != [o - 1 for o in outputs]:
+        raise PermissionError(f'output map differs from reviewed {label} policy; sub wiring authority required')
     gain = graph['filters']['headroom']['parameters']['gain']
     if type(gain) not in (int, float) or not -60 <= gain <= -6:
         raise ValueError('hardware headroom must remain at least 6dB')
-    graph['title'] = 'Garage identity-bound UMC declarative OUT3/4'
+    graph['title'] = 'Garage identity-bound UMC declarative ' + label
     graph['devices']['playback'] = {'type': 'Alsa', 'channels': 12, 'device': alsa, 'format': 'S24_3_LE'}
     graph['devices'].update(enable_rate_adjust=True, capture_samplerate=48000,
         resampler={'type': 'AsyncSinc', 'profile': 'Balanced'}, target_level=2048,

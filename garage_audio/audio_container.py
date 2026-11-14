@@ -70,9 +70,10 @@ class Worker:
         self.clipped_start = None
         if (qualification_policy or qualification_store) and mode not in ('scalar', 'standby'):
             raise PermissionError('qualification cannot be bypassed by changing audio mode')
+        self.outputs = [3, 4]
         if mode == 'hardware':
             from .audio_device import load_policy
-            load_policy('/device-policy.json')
+            self.outputs = list(load_policy('/device-policy.json')['outputs'])
         if mode in ('scalar', 'standby') and any(Path(p).exists() for p in ('/dev/snd', '/host-snd', '/host-asound', '/device-policy.json', '/device-lock')):
             raise PermissionError('scalar mode forbids sound device/policy mounts')
         self.root, self.evidence = Path(root), Path(evidence)
@@ -240,7 +241,7 @@ class Worker:
         if self.mode == 'hardware':
             from .audio_device import DeviceLease, hardware_graph
             # Reject uncommissioned routes before acquiring or opening a device.
-            graph = hardware_graph(graph, 'hw:CARD=UMC1820,DEV=0')
+            graph = hardware_graph(graph, 'hw:CARD=UMC1820,DEV=0', self.outputs)
             lease = DeviceLease()
             with self.children_lock:
                 if self.stop_generation != started_generation:

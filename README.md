@@ -237,8 +237,10 @@ for listening, manual controls or measurement planning.
 
 The reference system uses a UMC1820, Fosi V3 amplification and Klipsch R-28F mains;
 an R-12SW powered sub is the intended 2.1 addition. Stereo OUT3/OUT4 has user-reported
-working Spotify playback. OUT5 is intended for the sub's line/LFE input and is **not
-commissioned**. The observed Linux playback PCM is 12-channel S24_3LE/48 kHz;
+working Spotify playback. With the device policy set to `outputs: [3, 4, 5]`, the Docker
+hardware worker also feeds the sub's line/LFE input from OUT5 with an 80 Hz LR4 crossover
+(see [Powered sub on OUT5](docs/audio-configuration.md#powered-sub-on-out5)); level and
+phase are not acoustically verified. The observed Linux playback PCM is 12-channel S24_3LE/48 kHz;
 historical 20-channel software templates do not establish the physical jack map.
 
 Room/profile storage, REW import and analysis, and shared MCP/HTTP state are

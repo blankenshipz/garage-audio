@@ -16,7 +16,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from garage_audio.audio_device import inventory, IDENTITY, CAPABILITIES
+from garage_audio.audio_device import inventory, IDENTITY, CAPABILITIES, STEREO_OUTPUTS, SUB_OUTPUTS
 
 RULE = '''# Garage Docker candidate; exact UMC playback/control only, never capture/default DAC.
 SUBSYSTEM=="sound", KERNEL=="pcmC*D0p", ATTRS{idVendor}=="1397", ATTRS{idProduct}=="0514", ATTRS{serial}=="D72E24B7", OWNER:="1002", GROUP:="1003", MODE:="0600", TAG-="uaccess"
@@ -72,6 +72,8 @@ def main():
     parser.add_argument('--frozen-inventory')
     parser.add_argument('--candidate-sha256')
     parser.add_argument('--receipt')
+    parser.add_argument('--sub-output', action='store_true',
+                        help='admit the operator-wired powered sub on OUT5 (policy outputs 3,4,5)')
     args = parser.parse_args()
     value = inventory(proc=Path('/proc/asound'), nodes=Path('/dev/snd'))
     if value['identity'] != IDENTITY or value['capabilities'] != CAPABILITIES:
@@ -138,7 +140,8 @@ def main():
                     after['nodes'][name]['inode'] != meta['inode'] for name, meta in value['nodes'].items()):
                 raise RuntimeError('USB/node generation changed during bootstrap')
             policy = {'version': 1, 'identity': IDENTITY, 'capabilities': CAPABILITIES,
-                      'device_uid': 1002, 'device_gid': 1003, 'outputs': [3, 4]}
+                      'device_uid': 1002, 'device_gid': 1003,
+                      'outputs': SUB_OUTPUTS if args.sub_output else STEREO_OUTPUTS}
             durable(SYSUSERS, SYSUSER.encode(), 0o644)
             subprocess.run(['systemd-sysusers', str(SYSUSERS)], check=True, timeout=10)
             if pwd.getpwuid(1002).pw_gid != 1002:

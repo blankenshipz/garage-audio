@@ -10,7 +10,8 @@ import tempfile
 import types
 import unittest
 from unittest.mock import patch
-from garage_audio.audio_device import CAPABILITIES, IDENTITY, DeviceLease, device_environment, hardware_graph, validate_inventory
+from garage_audio.audio_device import (CAPABILITIES, IDENTITY, SUB_OUTPUTS, DeviceLease, device_environment,
+                                       hardware_graph, load_policy, validate_inventory)
 from garage_audio.audio_container import line_graph
 
 
@@ -140,6 +141,28 @@ class IdentityTests(unittest.TestCase):
         self.assertEqual([x['dest'] for x in graph['mixers']['route']['mapping']], [2, 3])
         with self.assertRaises(ValueError):
             hardware_graph(line_graph('/not-opened.f32'), 'default')
+
+    def test_policy_admits_exact_stereo_or_out5_sub_layout_only(self):
+        base = {'version': 1, 'identity': IDENTITY, 'capabilities': CAPABILITIES, 'device_uid': 1002, 'device_gid': 1003}
+        root_owned = types.SimpleNamespace(st_mode=stat.S_IFREG | 0o444, st_uid=0, st_size=256)
+        for outputs, admitted in (([3, 4], True), ([3, 4, 5], True), ([3, 5], False),
+                                  ([4, 3, 5], False), ([3, 4, 6], False), ([3, 4, 5, 6], False)):
+            with tempfile.NamedTemporaryFile('w', suffix='.json') as policy:
+                json.dump({**base, 'outputs': outputs}, policy); policy.flush()
+                with self.subTest(outputs=outputs), patch.object(Path, 'lstat', return_value=root_owned):
+                    if admitted: self.assertEqual(load_policy(policy.name)['outputs'], outputs)
+                    else: self.assertRaises(ValueError, load_policy, policy.name)
+
+    def test_hardware_route_must_match_policy_outputs(self):
+        from garage_audio.audio_config import DEFAULT, compile_graph
+        sub = compile_graph(dict(DEFAULT, layout='powered-sub-2.1', sub=5), '/not-opened.f32')
+        graph = hardware_graph(sub, 'hw:CARD=UMC1820,DEV=0', SUB_OUTPUTS)
+        self.assertEqual([x['dest'] for x in graph['mixers']['route']['mapping']], [2, 3, 4])
+        self.assertIn('OUT3/4/5', graph['title'])
+        stereo = compile_graph(DEFAULT, '/not-opened.f32')
+        for candidate, outputs in ((stereo, SUB_OUTPUTS), (sub, [3, 4]), (stereo, [3, 4, 6])):
+            with self.subTest(outputs=outputs), self.assertRaises(PermissionError):
+                hardware_graph(candidate, 'hw:CARD=UMC1820,DEV=0', outputs)
 
 
 if __name__ == '__main__':

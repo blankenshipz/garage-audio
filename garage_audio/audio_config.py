@@ -74,6 +74,13 @@ def validate_spec(spec):
     return copy.deepcopy(spec)
 
 
+def default_configuration(outputs):
+    """Hardware apply is unavailable, so the root-owned device policy selects the layout."""
+    if outputs == [3, 4, 5]:
+        return dict(DEFAULT, layout='powered-sub-2.1', sub=5)
+    return copy.deepcopy(DEFAULT)
+
+
 def compile_graph(spec, output):
     from .audio_container import line_graph
     spec = validate_spec(spec)
@@ -106,7 +113,8 @@ class Configurations:
         self.path = worker.evidence / 'accepted-configuration.json'
         self.binding = {'revision': 'file-12-v1' if worker.mode == 'file' else 'hardware-unverified-v1',
                         'kind': worker.mode, 'wiring': 'declared-virtual' if worker.mode == 'file' else 'unverified'}
-        self.state = {'revision': 0, 'configuration': copy.deepcopy(DEFAULT), 'previous': None}
+        default = default_configuration(worker.outputs) if worker.mode == 'hardware' else copy.deepcopy(DEFAULT)
+        self.state = {'revision': 0, 'configuration': default, 'previous': None}
         if self.path.exists():
             saved = json.loads(self.path.read_text())
             validate_spec(saved['configuration'])

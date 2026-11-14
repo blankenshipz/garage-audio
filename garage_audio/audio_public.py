@@ -70,7 +70,7 @@ def _status(result):
         raise ValueError('Invalid child readback')
     if 'outputs' in result:
         outputs = result['outputs']
-        if result['device_mode'] != 'file' and outputs != [3,4]: raise ValueError('Unexpected hardware output map')
+        if result['device_mode'] != 'file' and outputs not in ([3,4],[3,4,5]): raise ValueError('Unexpected hardware output map')
         if (not isinstance(outputs,list) or not 2 <= len(outputs) <= 3 or
                 any(type(v) is not int or not 1 <= v <= 12 for v in outputs) or len(set(outputs)) != len(outputs)):
             raise ValueError('Invalid output map')
