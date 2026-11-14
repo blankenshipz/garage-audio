@@ -54,5 +54,9 @@ dns-sd -B _spotify-connect._tcp local.   # macOS; avahi-browse -r _spotify-conne
   the user before doing it, unless they have already accepted that risk for routine recovery.
 - `driver-failure.json` with `"recovery": "terminal"` and a permission or ownership error: do not
   loop restarts; diagnose and report.
+- `PermissionError` right after a reboot or USB replug: check `ls -ln /dev/snd/` on the host. The
+  UMC playback/control nodes must be `1002:1003` mode 0600 via the udev rule, which needs the
+  `garage-dac` account from `/etc/sysusers.d/garage-audio.conf` (installed by
+  `scripts/bootstrap-container-audio.py`). Never chown the nodes by hand as a fix.
 - Library upgrades must not restart the owner: install
   `config/system/needrestart-garage-audio.conf` as `/etc/needrestart/conf.d/90-garage-audio.conf`.

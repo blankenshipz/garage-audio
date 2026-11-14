@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 import os
+import pwd
 from pathlib import Path
 import re
 import stat
@@ -20,6 +21,12 @@ from garage_audio.audio_device import inventory, IDENTITY, CAPABILITIES
 RULE = '''# Garage Docker candidate; exact UMC playback/control only, never capture/default DAC.
 SUBSYSTEM=="sound", KERNEL=="pcmC*D0p", ATTRS{idVendor}=="1397", ATTRS{idProduct}=="0514", ATTRS{serial}=="D72E24B7", OWNER:="1002", GROUP:="1003", MODE:="0600", TAG-="uaccess"
 SUBSYSTEM=="sound", KERNEL=="controlC*", ATTRS{idVendor}=="1397", ATTRS{idProduct}=="0514", ATTRS{serial}=="D72E24B7", OWNER:="1002", GROUP:="1003", MODE:="0600", TAG-="uaccess"
+'''
+# udev only applies OWNER:= for a resolvable account: without a passwd entry for
+# UID 1002 it logs "Failed to resolve user" and skips the rule at every boot.
+SYSUSERS = Path('/etc/sysusers.d/garage-audio.conf')
+SYSUSER = '''# Garage audio: resolvable owner for the UMC udev rule (container device worker UID).
+u garage-dac 1002:1002 "Garage audio DAC worker" - /usr/sbin/nologin
 '''
 
 
@@ -132,6 +139,10 @@ def main():
                 raise RuntimeError('USB/node generation changed during bootstrap')
             policy = {'version': 1, 'identity': IDENTITY, 'capabilities': CAPABILITIES,
                       'device_uid': 1002, 'device_gid': 1003, 'outputs': [3, 4]}
+            durable(SYSUSERS, SYSUSER.encode(), 0o644)
+            subprocess.run(['systemd-sysusers', str(SYSUSERS)], check=True, timeout=10)
+            if pwd.getpwuid(1002).pw_gid != 1002:
+                raise RuntimeError('UID 1002 must resolve for the udev OWNER rule')
             durable(paths[0], RULE.encode(), 0o644)
             durable(paths[1], json.dumps(policy).encode(), 0o444)
             if legacy is not None:
