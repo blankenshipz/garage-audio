@@ -7,7 +7,7 @@ import json,pathlib,subprocess,time,signal,os,threading
 from garage_audio.audio_boot import Boot,load_config
 from garage_audio.audio_network import Carrier,atomic,docker,run
 from garage_audio.audio_receiver import ReceiverEndpoint,ReceiverOwnershipError,PairingAdvertisements,pairing_instances,verify_pairing_instances
-from garage_audio.audio_recovery import EX_TEMPFAIL,Supervisor,guard_classification,owner_lock,preadmission,recoverable,verify_closed
+from garage_audio.audio_recovery import EX_TEMPFAIL,Supervisor,classify_failure,guard_classification,owner_lock,verify_closed
 
 ROOT=pathlib.Path(__file__).parent
 
@@ -120,7 +120,9 @@ def generation(config,stop,root,ready=None):
      ready(c.generation);ready_published=True
    stop.wait(.2)
  except Exception as error:
-  result='recoverable' if recoverable(error,receipt) else 'preadmission' if preadmission(error,c) else 'terminal'
+  # A guard stall is classified by the owner-side watcher only AFTER it stops the guard; wait (bounded)
+  # for that verdict so a stall is never misread as terminal. No verdict in time => terminal.
+  result=classify_failure(error,receipt,c)
   atomic(receipt/'driver-failure.json',{'class':type(error).__name__,'errno':getattr(error,'errno',None),'time':time.monotonic(),'recovery':result,'guard_exit':c.guard.poll() if c.guard else None,'guard_failure':guard_classification(receipt)})
  finally:
   # Any cleanup failure propagates, preventing Supervisor from making a new generation.

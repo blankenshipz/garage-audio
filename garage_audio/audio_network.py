@@ -29,12 +29,19 @@ def docker(*args, timeout=4):
 # it is classified as a recoverable stall (see audio_recovery.recoverable).
 HEARTBEAT_TOLERANCE_ENV = 'GARAGE_AUDIO_GUARD_HEARTBEAT_TOLERANCE'
 HEARTBEAT_TOLERANCE_DEFAULT = 12.0
-HEARTBEAT_TOLERANCE_MIN = 2.0
-HEARTBEAT_TOLERANCE_MAX = 300.0
 STALL_KIND = 'guard_heartbeat_stall'
 GUARD_INSPECT_TIMEOUT = 6  # seconds for the one batched `docker inspect` per guard pass
+GUARD_NS_TIMEOUT = 2  # seconds for the guard's namespace address probe (nsenter) per pass
+# The minimum may never be below one worst-case SUCCESSFUL pass (inspect + nsenter = 8 s)
+# plus scheduling margin, or a healthy but slow pass would be classified as a stall.
+HEARTBEAT_TOLERANCE_MIN = 10.0
+HEARTBEAT_TOLERANCE_MAX = 300.0
 GUARD_TERMINATE_WAIT = 2
 GUARD_KILL_WAIT = 3
+# How long the lifecycle driver waits for the watcher's final guard classification
+# before it classifies failure itself (then terminal, fail-closed).
+GUARD_VERDICT_MARGIN = 2
+GUARD_VERDICT_WAIT = GUARD_TERMINATE_WAIT + GUARD_KILL_WAIT + GUARD_VERDICT_MARGIN
 
 
 def heartbeat_tolerance(environ=None):
@@ -188,7 +195,7 @@ def guard_main(registry):
                     or os.stat(f'/proc/{pid}/ns/net').st_ino != record['inode']:
                 raise RuntimeError('namespace_generation_changed')
             addresses = json.loads(subprocess.check_output(['nsenter', '-t', str(pid), '-n', 'ip', '-j',
-                '-4', 'addr', 'show', 'dev', 'ga-lan'], text=True, timeout=2))
+                '-4', 'addr', 'show', 'dev', 'ga-lan'], text=True, timeout=GUARD_NS_TIMEOUT))
             if [a['local'] for x in addresses for a in x['addr_info']] != [record['address']]:
                 raise RuntimeError('address_lost')
             workload_crash=None
@@ -265,6 +272,10 @@ class Carrier:
         self.id = self.peer = None
         self.registry = self.receipt/'registry.json'
         self.closed = False
+        # Watcher -> driver hand-off (see watch_guard / await_guard_verdict).
+        self.stall_pending = threading.Event()  # watcher decided to stop a stalled guard
+        self.guard_verdict = threading.Event()  # guard classification is final (or watcher gone)
+        self.watcher_failed = threading.Event()  # watcher died unexpectedly: fail closed
         self.worker_ack = None
         self.dependent_processes = {}
 
@@ -405,22 +416,55 @@ class Carrier:
 
         Exited guard: immediate terminal revocation. Alive but stale beyond the
         tolerance: classified stall (recoverable only through the bounded Supervisor)."""
+        try:
+            return self.guard_watch_loop()
+        except Exception as error:
+            # The watcher can never die silently: anything unexpected is a terminal,
+            # fail-closed revocation (a stall classification is never written here, and one
+            # already written stays as it was). healthy() also refuses once this is set.
+            self.watcher_failed.set()
+            self.guard_verdict.set()
+            print('guard watcher failed: '+type(error).__name__, file=sys.stderr)
+            if self.closed:
+                return None  # deliberate stop owns revocation
+            return revoke(json.loads(self.registry.read_text()), 'independent_guard_lost')
+        finally:
+            # Every exit path (return, deliberate stop, exception) releases the driver.
+            self.guard_verdict.set()
+
+    def guard_watch_loop(self):
         begun = time.monotonic()
         heartbeat = self.receipt/'guard-heartbeat.json'
         last = begun
         while not self.closed:
             if self.guard.poll() is not None:
+                # Whatever the guard classified, it wrote before exiting: final.
+                self.guard_verdict.set()
                 return revoke(json.loads(self.registry.read_text()), 'independent_guard_lost')
+            now = time.monotonic()
             try:
-                last = json.loads(heartbeat.read_text())['time']
-            except FileNotFoundError:
-                last = begun
-            except (ValueError, OSError, KeyError, TypeError):
-                pass  # torn/unreadable read: keep the last good observation, never refresh it
-            staleness = time.monotonic()-last
+                value = json.loads(heartbeat.read_text())['time']
+                if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                        or not math.isfinite(value) or value > now:
+                    raise ValueError('malformed heartbeat')
+                last = value
+            except (ValueError, OSError, KeyError, TypeError, AttributeError):
+                pass  # missing/torn/malformed: keep the last good value (initially the start); never refresh
+            staleness = now-last
             if staleness > self.heartbeat_tolerance:
                 return self.revoke_stalled_guard(staleness)
             time.sleep(.2)
+
+    def await_guard_verdict(self, timeout=None):
+        """Driver side: True when the guard classification is final and safe to read.
+
+        A stall is decided by the watcher AFTER it has stopped the guard, so the driver, which
+        sees the guard gone (or about to go) first, must not classify until the watcher has
+        either written the stall or decided terminal. On timeout the caller must classify
+        terminal (fail closed)."""
+        if self.guard is None or (self.guard.poll() is None and not self.stall_pending.is_set()):
+            return True
+        return self.guard_verdict.wait(GUARD_VERDICT_WAIT if timeout is None else timeout)
 
     def terminate_guard(self):
         """Stop the owned guard process. Returns 'exited' if it was already gone before we
@@ -443,6 +487,7 @@ class Carrier:
         competing classification; the stall is then recorded write-once and only if no
         classification or revocation exists. Anything else is the terminal path."""
         def terminal():
+            self.guard_verdict.set()  # no stall will be written: the classification is final
             return revoke(json.loads(self.registry.read_text()), 'independent_guard_lost')
         def classified():
             return any((self.receipt/name).exists()
@@ -451,6 +496,9 @@ class Carrier:
             return None  # deliberate stop owns revocation
         if classified():
             return terminal()  # guard (or an operator) is already classifying/revoking
+        # From here the driver may observe the guard gone before the stall file exists; it
+        # waits for guard_verdict (set below, or by watch_guard on any exit) before classifying.
+        self.stall_pending.set()
         outcome = self.terminate_guard()
         if self.closed:
             return None
@@ -459,6 +507,7 @@ class Carrier:
         if not write_guard_failure(self.receipt, STALL_KIND, staleness=round(staleness, 3),
                                    tolerance=self.heartbeat_tolerance):
             return terminal()
+        self.guard_verdict.set()  # stall is on disk, write-once: final before the slower revoke
         return revoke(json.loads(self.registry.read_text()), STALL_KIND)
 
     def write_registry(self):
@@ -488,6 +537,7 @@ class Carrier:
 
     def healthy(self):
         if (self.closed or self.guard is None or self.guard.poll() is not None
+                or self.watcher_failed.is_set()
                 or (self.receipt/'authority/revoked.json').exists()
                 or (self.receipt/'guard-revoked.json').exists()):
             raise RuntimeError('network generation permanently revoked')

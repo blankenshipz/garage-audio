@@ -97,6 +97,7 @@ class Lifecycle(unittest.TestCase):
   class Carrier:
    def __init__(self,receipt):
     receipt.mkdir();(receipt/'authority').mkdir();self.receipt=receipt;self.registry=receipt/'registry.json';self.generation='g';self.inode=1;self.address='192.0.2.1';self.dependents=[];self.id='carrier';self.worker_ack=None;self.guard=SimpleNamespace(poll=lambda:None);self.health=0
+   def await_guard_verdict(self,*_):return True
    def start(self,*_):
     events.append('carrier-start')
     if start_error:raise start_error

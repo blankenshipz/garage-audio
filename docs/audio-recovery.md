@@ -70,6 +70,12 @@ ownership pass; the owner's watcher compares its age against a tolerance.
   and is terminal.
 - The stalled guardian is terminated (bounded wait, then killed) so it cannot outlive
   the generation. If it cannot be proven gone the failure is terminal.
+- The watcher stops the guardian before it writes the stall, and the lifecycle driver
+  can see the guardian gone first. The driver therefore waits (bounded by the terminate
+  and kill waits plus a margin) for the watcher's final verdict before classifying the
+  failure, and classifies it terminal if no verdict arrives in time. A heartbeat that is
+  missing, torn or malformed counts as missing (staleness runs from the last good value
+  or the watcher start); any unexpected watcher error is a terminal revocation.
 - The stall is written once. It is never written over an existing terminal
   classification, `guard-revoked.json` or `authority/revoked.json`, and a late write
   by the stalled guardian cannot replace it. Owner/DHCP/receiver loss, lease or
@@ -78,12 +84,13 @@ ownership pass; the owner's watcher compares its age against a tolerance.
   terminal.
 
 `GARAGE_AUDIO_GUARD_HEARTBEAT_TOLERANCE` sets the tolerance in seconds (a number
-from 2 to 300, default **12**). It is read once when the carrier is constructed; an
+from 10 to 300, default **12**). It is read once when the carrier is constructed; an
 unparsable, non-finite or out-of-range value stops startup with an error that does not
 echo the value, rather than falling back to a weaker setting. The earlier fixed 2 s
 was shorter than one guard pass can legitimately take: each pass makes one batched
-`docker inspect` (own 6 s timeout) plus a namespace probe, and a pass that times out
-publishes nothing. 12 s allows one such slow pass plus scheduling delay under
+`docker inspect` (own 6 s timeout) plus a namespace probe (2 s), and a pass that times
+out publishes nothing. The minimum of 10 s is above that 8 s worst-case successful pass,
+so a healthy but slow pass can never be classified as a stall. 12 s allows one such slow pass plus scheduling delay under
 memory/swap pressure while a hung guardian is still detected within seconds. Do not raise it to hide a persistent fault;
 prefer `config/system/garage-audio-network.service.d-resource-protection.conf.example`
 (copy by hand; nothing installs it) to keep the units resident and scheduled.
@@ -96,7 +103,10 @@ python3 -B -m garage_audio.audio_recovery status [--root PATH] [--json]
 
 It only reads: it takes no lock, writes nothing, never creates the root, and exits 2
 if the root is missing or unreadable. It reports the generation, recovery state,
-retry count, the last guard failure (kind, staleness, tolerance), last revocation
+retry count, the effective heartbeat tolerance as read from the status process's own
+environment (labelled as such; an invalid value is reported as invalid, never echoed; the
+owner unit's `Environment=` may differ), the last guard failure (kind, staleness,
+tolerance), last revocation
 reason, driver failure and heartbeat age (`time.monotonic`, system-wide on Linux; an
 age from another boot is shown as unknown), plus a plain explanation of each state:
 

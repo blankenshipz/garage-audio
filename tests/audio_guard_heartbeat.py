@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -86,6 +87,11 @@ def watcher(testcase, guard, tolerance=12.0, heartbeat=0.0):
     carrier.registry = root/'registry.json'
     carrier.guard = guard
     carrier.heartbeat_tolerance = tolerance
+    carrier.stall_pending = threading.Event()
+    carrier.guard_verdict = threading.Event()
+    carrier.watcher_failed = threading.Event()
+    carrier.dependents = ['registered-dependent']  # past pre-admission: only the guard class decides
+    carrier.worker_ack = None
     calls = []
 
     def revoke(record, reason):
@@ -96,12 +102,14 @@ def watcher(testcase, guard, tolerance=12.0, heartbeat=0.0):
     return carrier, root, calls, revoke
 
 
-def run_watcher(carrier, revoke, clock, sleeps=1000):
+def run_watcher(carrier, revoke, clock, sleeps=1000, on_sleep=None):
     """Run watch_guard on virtual time; sleep() closes the carrier after `sleeps` polls."""
     count = [0]
 
     def sleep(_):
         count[0] += 1
+        if on_sleep:
+            on_sleep(count[0])
         if count[0] >= sleeps:
             carrier.closed = True
     with patch.object(network, 'revoke', side_effect=revoke), \
@@ -117,11 +125,17 @@ def failure(root):
 class HeartbeatToleranceSetting(unittest.TestCase):
     def test_default_and_valid_values(self):
         self.assertEqual(network.heartbeat_tolerance({}), 12.0)
-        for raw, expected in [('2', 2.0), ('300', 300.0), (' 15.5 ', 15.5), ('12', 12.0)]:
+        for raw, expected in [('10', 10.0), ('300', 300.0), (' 15.5 ', 15.5), ('12', 12.0)]:
             self.assertEqual(network.heartbeat_tolerance({network.HEARTBEAT_TOLERANCE_ENV: raw}), expected)
 
+    def test_minimum_is_not_below_a_worst_case_successful_guard_pass(self):
+        # One successful pass can take the batched inspect timeout plus the namespace probe.
+        worst_pass = network.GUARD_INSPECT_TIMEOUT + network.GUARD_NS_TIMEOUT
+        self.assertGreater(network.HEARTBEAT_TOLERANCE_MIN, worst_pass)
+        self.assertGreaterEqual(network.HEARTBEAT_TOLERANCE_DEFAULT, network.HEARTBEAT_TOLERANCE_MIN)
+
     def test_invalid_values_fail_closed_without_echoing_the_value(self):
-        for raw in ['', ' ', 'abc', '1.9', '300.1', 'nan', 'inf', '-inf', '-5', '0', '1e999', '12s']:
+        for raw in ['', ' ', 'abc', '2', '9.9', '300.1', 'nan', 'inf', '-inf', '-5', '0', '1e999', '12s']:
             with self.subTest(raw=raw), self.assertRaises(ValueError) as caught:
                 network.heartbeat_tolerance({network.HEARTBEAT_TOLERANCE_ENV: raw})
             if raw in ('abc', '12s'):
@@ -154,10 +168,10 @@ class WatcherTolerance(unittest.TestCase):
 
     def test_tolerance_is_configurable(self):
         guard = FakeGuard()
-        carrier, root, calls, revoke = watcher(self, guard, tolerance=2.0)
-        run_watcher(carrier, revoke, Clock(0, 2.5))
+        carrier, root, calls, revoke = watcher(self, guard, tolerance=10.0)
+        run_watcher(carrier, revoke, Clock(0, 10.5))
         self.assertEqual([c['reason'] for c in calls], [network.STALL_KIND])
-        self.assertEqual(failure(root)['tolerance'], 2.0)
+        self.assertEqual(failure(root)['tolerance'], 10.0)
 
     def test_missing_heartbeat_counts_from_watcher_start(self):
         guard = FakeGuard()
@@ -624,6 +638,220 @@ class Status(unittest.TestCase):
         self.assertEqual(state['last_failure']['driver_guard_exit'], -15)
         self.assertNotIn('private detail', json.dumps(state))
         self.assertNotIn('secret', json.dumps(state))
+
+
+class SpyEvent(threading.Event):
+    """Event that reports when a thread starts waiting on it (deterministic hand-off, no sleeps)."""
+
+    def __init__(self):
+        super().__init__()
+        self.waiting = threading.Event()
+
+    def wait(self, timeout=None):
+        self.waiting.set()
+        return super().wait(timeout)
+
+
+class BlockingGuard(FakeGuard):
+    """The guard dies on SIGTERM, but wait() does not return until `release` is set: the window in
+    which the guard is already gone while the watcher has not yet recorded its classification."""
+
+    def __init__(self):
+        super().__init__()
+        self.gone = threading.Event()
+        self.release = threading.Event()
+
+    def wait(self, timeout=None):
+        self.gone.set()
+        if not self.release.wait(10):
+            raise AssertionError('test deadlock: watcher was never released')
+        return super().wait(timeout)
+
+
+class DriverClassificationRace(unittest.TestCase):
+    def test_m1_driver_classifies_recoverable_when_it_races_the_watcher_stall_path(self):
+        guard = BlockingGuard()
+        carrier, root, calls, revoke = watcher(self, guard)
+        carrier.guard_verdict = SpyEvent()
+        outcome, errors = [], []
+
+        def run(target, *args):
+            def body():
+                try:
+                    target(*args)
+                except BaseException as error:  # surfaced by the assertions below
+                    errors.append(error)
+            thread = threading.Thread(target=body, daemon=True)
+            thread.start()
+            return thread
+        with patch.object(network, 'revoke', side_effect=revoke):
+            watcher_thread = run(carrier.revoke_stalled_guard, 13.25)
+            self.assertTrue(guard.gone.wait(5))
+            # The window: guard gone (driver's healthy() would raise), no classification yet.
+            self.assertIsNotNone(guard.poll())
+            self.assertFalse((root/'guard-failure.json').exists())
+            self.assertTrue(carrier.stall_pending.is_set())
+            self.assertFalse(recovery.recoverable(RuntimeError(REVOKED), root))  # what the unfixed driver saw
+            driver_thread = run(lambda: outcome.append(recovery.classify_failure(RuntimeError(REVOKED), root, carrier)))
+            self.assertTrue(carrier.guard_verdict.waiting.wait(5))  # driver is blocked on the verdict
+            self.assertEqual(outcome, [])
+            guard.release.set()  # watcher resumes: writes the stall, then revokes
+            watcher_thread.join(5)
+            driver_thread.join(5)
+        self.assertEqual(errors, [])
+        self.assertEqual(outcome, ['recoverable'])
+        self.assertEqual(failure(root)['kind'], network.STALL_KIND)
+        self.assertEqual([c['reason'] for c in calls], [network.STALL_KIND])
+
+    def test_m1_driver_sees_terminal_when_the_watcher_decides_terminal(self):
+        guard = FakeGuard(dies='never')  # cannot be stopped: terminal, no stall file
+        carrier, root, calls, revoke = watcher(self, guard)
+        with patch.object(network, 'revoke', side_effect=revoke), \
+                patch.object(network, 'GUARD_TERMINATE_WAIT', 0), patch.object(network, 'GUARD_KILL_WAIT', 0):
+            carrier.revoke_stalled_guard(20)
+        self.assertTrue(carrier.guard_verdict.is_set())
+        self.assertEqual(recovery.classify_failure(RuntimeError(REVOKED), root, carrier), 'terminal')
+
+    def test_m1_watcher_that_never_finalizes_is_terminal_after_the_bounded_wait(self):
+        guard = FakeGuard(returncode=-signal.SIGTERM)
+        carrier, root, calls, revoke = watcher(self, guard)
+        carrier.stall_pending.set()  # watcher claimed the stall and then went silent
+        carrier.guard_verdict = SpyEvent()
+        # Even a stall file on disk is not trusted without the watcher's final verdict.
+        (root/'guard-failure.json').write_text(json.dumps({'kind': network.STALL_KIND, 'time': 1}))
+        with patch.object(network, 'GUARD_VERDICT_WAIT', 0.01):
+            self.assertFalse(carrier.await_guard_verdict())
+            self.assertEqual(recovery.classify_failure(RuntimeError(REVOKED), root, carrier), 'terminal')
+        self.assertTrue(carrier.guard_verdict.waiting.is_set())
+
+    def test_the_wait_bound_covers_terminate_kill_and_a_margin(self):
+        self.assertGreater(network.GUARD_VERDICT_WAIT, network.GUARD_TERMINATE_WAIT + network.GUARD_KILL_WAIT)
+
+    def test_unrelated_failures_with_a_healthy_guard_are_not_delayed(self):
+        carrier, root, calls, revoke = watcher(self, FakeGuard())
+        carrier.guard_verdict = SpyEvent()
+        self.assertTrue(carrier.await_guard_verdict())
+        self.assertFalse(carrier.guard_verdict.waiting.is_set())
+        self.assertEqual(recovery.classify_failure(PermissionError('x'), root, carrier), 'terminal')
+        carrier.guard = None  # failure before the guard existed
+        self.assertTrue(carrier.await_guard_verdict())
+
+    def test_guard_that_exited_by_itself_is_released_by_the_watcher(self):
+        guard = FakeGuard(returncode=1)
+        carrier, root, calls, revoke = watcher(self, guard, heartbeat=None)
+        (root/'guard-failure.json').write_text(json.dumps({'kind': 'owned_workload_crash', 'time': 1}))
+        run_watcher(carrier, revoke, Clock(0))
+        self.assertTrue(carrier.await_guard_verdict(0.01))
+        self.assertTrue(carrier.guard_verdict.is_set())
+        self.assertEqual(recovery.classify_failure(RuntimeError(REVOKED), root, carrier), 'recoverable')
+
+    def test_every_watcher_exit_path_releases_the_driver(self):
+        # deliberate stop before the first poll
+        carrier, root, calls, revoke = watcher(self, FakeGuard())
+        carrier.closed = True
+        run_watcher(carrier, revoke, Clock(0))
+        self.assertTrue(carrier.guard_verdict.is_set())
+        self.assertEqual(calls, [])
+        # deliberate stop while the stalled guard is being terminated
+        guard = FakeGuard()
+        carrier, root, calls, revoke = watcher(self, guard)
+        guard.on_terminate = lambda: setattr(carrier, 'closed', True)
+        run_watcher(carrier, revoke, Clock(0, 13))
+        self.assertTrue(carrier.guard_verdict.is_set())
+        self.assertFalse((root/'guard-failure.json').exists())
+
+
+class WatcherRobustness(unittest.TestCase):
+    def test_malformed_heartbeats_are_treated_like_a_missing_heartbeat(self):
+        for text in ['{"time": "abc"}', '{"time": null}', '{"time": [1]}', '{"time": true}', '[]', '"x"', '7',
+                     '{"time": 1e999}', '{"time": 9999}', '{"time": -1e999}', '{}', '']:
+            with self.subTest(text=text):
+                carrier, root, calls, revoke = watcher(self, FakeGuard())
+                (root/'guard-heartbeat.json').write_text(text)
+                run_watcher(carrier, revoke, Clock(0, 5, 13))
+                # The watcher survived the parse and measured staleness from its own start.
+                self.assertEqual([c['reason'] for c in calls], [network.STALL_KIND])
+                self.assertEqual(failure(root)['staleness'], 13)
+                self.assertFalse(carrier.watcher_failed.is_set())
+
+    def test_malformed_or_missing_after_a_good_heartbeat_keeps_the_last_good_value(self):
+        for damage in (lambda root: (root/'guard-heartbeat.json').write_text('{"time": "x"}'),
+                       lambda root: (root/'guard-heartbeat.json').unlink(),
+                       lambda root: (root/'guard-heartbeat.json').write_text('{"tim')):
+            carrier, root, calls, revoke = watcher(self, FakeGuard(), heartbeat=5.0)
+            run_watcher(carrier, revoke, Clock(0, 6, 17.5), on_sleep=lambda _n, root=root, damage=damage: damage(root))
+            self.assertEqual([c['reason'] for c in calls], [network.STALL_KIND])
+            self.assertEqual(failure(root)['staleness'], 12.5)  # from 5.0, not refreshed by the damage
+
+    def test_unexpected_exception_revokes_terminally_and_never_kills_the_watcher_silently(self):
+        guard = FakeGuard()
+        carrier, root, calls, revoke = watcher(self, guard)
+        with patch.object(network.Carrier, 'guard_watch_loop', side_effect=ZeroDivisionError), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            run_watcher(carrier, revoke, Clock(0))
+        self.assertEqual([c['reason'] for c in calls], ['independent_guard_lost'])
+        self.assertFalse((root/'guard-failure.json').exists())  # never a stall
+        self.assertTrue(carrier.watcher_failed.is_set())
+        self.assertTrue(carrier.guard_verdict.is_set())
+        self.assertIn('ZeroDivisionError', err.getvalue())
+        self.assertNotIn('Traceback', err.getvalue())
+        # healthy() refuses even if the revocation record were somehow absent
+        (root/'authority/revoked.json').unlink()
+        with self.assertRaisesRegex(RuntimeError, REVOKED):
+            carrier.healthy()
+        self.assertFalse(recovery.recoverable(RuntimeError(REVOKED), root))
+
+    def test_exception_inside_the_stall_path_is_terminal(self):
+        guard = FakeGuard()
+        carrier, root, calls, revoke = watcher(self, guard)
+        with patch.object(network, 'write_guard_failure', side_effect=OSError('disk')), \
+                contextlib.redirect_stderr(io.StringIO()):
+            run_watcher(carrier, revoke, Clock(0, 13))
+        self.assertEqual([c['reason'] for c in calls], ['independent_guard_lost'])
+        self.assertFalse((root/'guard-failure.json').exists())
+        self.assertTrue(carrier.watcher_failed.is_set() and carrier.guard_verdict.is_set())
+
+    def test_exception_while_a_deliberate_stop_is_in_progress_does_not_revoke(self):
+        carrier, root, calls, revoke = watcher(self, FakeGuard())
+        carrier.closed = True
+        with patch.object(network.Carrier, 'guard_watch_loop', side_effect=ZeroDivisionError), \
+                contextlib.redirect_stderr(io.StringIO()):
+            run_watcher(carrier, revoke, Clock(0))
+        self.assertEqual(calls, [])
+        self.assertTrue(carrier.guard_verdict.is_set())
+
+
+class StatusEffectiveTolerance(unittest.TestCase):
+    def test_default_environment_and_invalid_are_reported_without_echo(self):
+        env = network.HEARTBEAT_TOLERANCE_ENV
+        report = recovery.tolerance_report({})
+        self.assertEqual((report['effective_seconds'], report['effective_source']), (12.0, 'default'))
+        report = recovery.tolerance_report({env: '30'})
+        self.assertEqual((report['effective_seconds'], report['effective_source']), (30.0, 'environment'))
+        for bad in ('s3cret-abc', '5'):
+            report = recovery.tolerance_report({env: bad})
+            self.assertEqual((report['effective_seconds'], report['effective_source']), (None, 'invalid'))
+            self.assertNotIn(bad, json.dumps(report))
+
+    def test_status_command_labels_the_effective_value(self):
+        root = make_root(self)
+        env = network.HEARTBEAT_TOLERANCE_ENV
+        for value, fragment in (('45', '45 s (environment)'), ('s3cret-abc', 'INVALID')):
+            out = io.StringIO()
+            with patch.dict(os.environ, {env: value}), contextlib.redirect_stdout(out):
+                self.assertEqual(recovery.main(['status', '--root', str(root)]), 0)
+                text = out.getvalue()
+                out.truncate(0)
+                out.seek(0)
+                self.assertEqual(recovery.main(['status', '--root', str(root), '--json']), 0)
+                parsed = json.loads(out.getvalue())
+            self.assertIn("effective in this process's environment", text)
+            self.assertIn(fragment, text)
+            self.assertNotIn('s3cret', text+json.dumps(parsed))
+            self.assertIn('scope', parsed['tolerance'])
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(env, None)
+            self.assertEqual(recovery.collect_status(root, now=1)['tolerance']['effective_seconds'], 12.0)
 
 
 if __name__ == '__main__':

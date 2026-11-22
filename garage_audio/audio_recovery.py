@@ -1,7 +1,8 @@
 """Private lifecycle recovery: classified workload exits only, never authority renewal."""
 import argparse,fcntl,json,math,os,stat,subprocess,sys,time,uuid
 from pathlib import Path
-from .audio_network import HEARTBEAT_TOLERANCE_DEFAULT,HEARTBEAT_TOLERANCE_ENV,STALL_KIND,atomic,docker
+from .audio_network import (HEARTBEAT_TOLERANCE_DEFAULT,HEARTBEAT_TOLERANCE_ENV,HEARTBEAT_TOLERANCE_MAX,
+    HEARTBEAT_TOLERANCE_MIN,STALL_KIND,atomic,docker,heartbeat_tolerance)
 
 class WorkloadCrash(RuntimeError):
     pass
@@ -59,6 +60,16 @@ def preadmission(error,carrier):
         if isinstance(current,(PermissionError,OSError,ValueError)):return False
         current=current.__cause__ or current.__context__
     return isinstance(error,(subprocess.SubprocessError,RuntimeError))
+
+def classify_failure(error,receipt,carrier):
+    """'recoverable' | 'preadmission' | 'terminal' for a generation failure.
+
+    A guard stall is classified by the owner-side watcher only after it has stopped the guard, so
+    the driver (which sees the guard gone first) waits, bounded, for that final verdict. If the
+    verdict is not final in time the failure is terminal: never guess recoverable."""
+    if not carrier.await_guard_verdict():return 'terminal'
+    if recoverable(error,receipt):return 'recoverable'
+    return 'preadmission' if preadmission(error,carrier) else 'terminal'
 
 def verify_closed(carrier):
     """Cleanup must have completed before releasing a generation for replacement."""
@@ -184,6 +195,18 @@ def _age(now,value):
     if isinstance(value,bool) or not isinstance(value,(int,float)) or not math.isfinite(value):return None
     return round(now-value,3)
 
+def tolerance_report(environ=None):
+    """Effective tolerance read exactly as the owner reads it, from THIS process's environment.
+    An invalid value is reported as invalid and never echoed."""
+    environment=os.environ if environ is None else environ
+    report={'setting':HEARTBEAT_TOLERANCE_ENV,'default_seconds':HEARTBEAT_TOLERANCE_DEFAULT,
+            'min_seconds':HEARTBEAT_TOLERANCE_MIN,'max_seconds':HEARTBEAT_TOLERANCE_MAX,
+            'scope':'this process environment; the owner unit may set it differently (see its Environment=)'}
+    try:value=heartbeat_tolerance(environment)
+    except ValueError:
+        return dict(report,effective_seconds=None,effective_source='invalid')
+    return dict(report,effective_seconds=value,effective_source='environment' if HEARTBEAT_TOLERANCE_ENV in environment else 'default')
+
 def collect_status(root=DEFAULT_ROOT,now=None):
     """Read-only snapshot. Takes no lock and writes nothing. Monotonic ages assume the same
     boot (CLOCK_MONOTONIC is system-wide on Linux); a negative age marks another boot."""
@@ -192,7 +215,7 @@ def collect_status(root=DEFAULT_ROOT,now=None):
     report={'root':str(root),'state':'unknown','explanation':'No recovery-state.json: the owner has not run '
             'with this root, or the record was removed.','restart_guidance':'Check the service manager for the owner unit '
             f'({SERVICE}) before starting anything.','retries':None,'retries_remaining':None,'generation':None,
-            'tolerance':{'default_seconds':HEARTBEAT_TOLERANCE_DEFAULT,'setting':HEARTBEAT_TOLERANCE_ENV},
+            'tolerance':tolerance_report(),
             'notes':notes}
     if state:
         name=state.get('state') if isinstance(state.get('state'),str) else 'unknown'
@@ -247,7 +270,12 @@ def format_status(report):
     driver=report.get('driver_failure')
     if driver:lines.append('driver failure: '+', '.join(f'{k}={v}' for k,v in driver.items()))
     tolerance=report['tolerance']
-    lines.append(f"guard heartbeat tolerance: default {tolerance['default_seconds']:g} s, set with {tolerance['setting']} (2-300)")
+    if tolerance['effective_source']=='invalid':
+        effective=f"INVALID in this environment (owner would refuse to start; must be {tolerance['min_seconds']:g}-{tolerance['max_seconds']:g} s)"
+    else:effective=f"{tolerance['effective_seconds']:g} s ({tolerance['effective_source']})"
+    lines.append(f"guard heartbeat tolerance, effective in this process's environment: {effective}; default "
+                 f"{tolerance['default_seconds']:g} s, set with {tolerance['setting']} ({tolerance['min_seconds']:g}-{tolerance['max_seconds']:g}); "
+                 "the owner unit's own Environment= may differ")
     lines.append('restart guidance: '+report['restart_guidance'])
     lines.extend('note: '+note for note in report['notes'])
     return '\n'.join(lines)

@@ -136,16 +136,19 @@ class HeartbeatBudgetTests(unittest.TestCase):
             root = Path(tmp)
             (root/'guard-heartbeat.json').write_text(json.dumps({'time':0}))
             (root/'registry.json').write_text('{}')
-            owner = SimpleNamespace(closed=False, receipt=root, registry=root/'registry.json',
-                                    guard=SimpleNamespace(poll=lambda:None), heartbeat_tolerance=network.heartbeat_tolerance({}))
+            owner = object.__new__(network.Carrier)
+            owner.__dict__.update(closed=False, receipt=root, registry=root/'registry.json',
+                                  guard=SimpleNamespace(poll=lambda:None), heartbeat_tolerance=network.heartbeat_tolerance({}),
+                                  stall_pending=threading.Event(), guard_verdict=threading.Event(),
+                                  watcher_failed=threading.Event())
             revoked = []
             clock = iter([2.1, 2.1, 12.5])
             def sleep(_):
                 pass
             with patch.object(network.time, 'monotonic', side_effect=lambda: next(clock)), \
                     patch.object(network.time, 'sleep', side_effect=sleep), \
-                    patch.object(owner, 'revoke_stalled_guard', create=True,
+                    patch.object(network.Carrier, 'revoke_stalled_guard', create=True,
                                  side_effect=lambda staleness: revoked.append(round(staleness, 1))):
-                network.Carrier.watch_guard(owner)
+                owner.watch_guard()
             # Docker's slow success at 2.1s is tolerated; only staleness beyond 12s is acted on.
             self.assertEqual(revoked, [12.5])

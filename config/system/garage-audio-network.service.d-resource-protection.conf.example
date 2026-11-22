@@ -29,7 +29,7 @@ IOWeight=<1..10000, e.g. 400>
 # Scheduling priority (-20..19, lower is higher priority). Needs no extra privilege
 # for a root-owned unit; stay modest.
 Nice=<-20..19, e.g. -5>
-# Optional: widen the heartbeat tolerance (seconds, 2..300, default 12). Invalid
+# Optional: widen the heartbeat tolerance (seconds, 10..300, default 12). Invalid
 # values make the owner refuse to start. Leave unset unless stalls are observed
 # with the protections above in place. Keep it well above the 6 s per-pass
 # `docker inspect` timeout and far below the point where a hung guard would be
