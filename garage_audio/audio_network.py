@@ -5,6 +5,7 @@ Real receiver listener ownership qualification must precede production admission
 """
 import ipaddress
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -17,8 +18,88 @@ import fcntl
 import stat
 
 
-def docker(*args):
-    return subprocess.check_output(['docker', *args], text=True, timeout=4)
+def docker(*args, timeout=4):
+    return subprocess.check_output(['docker', *args], text=True, timeout=timeout)
+
+
+# Independent guard liveness. The guard writes guard-heartbeat.json once per full
+# ownership pass; the owner-side watcher revokes the generation when it is stale.
+# A guard that has EXITED is revoked immediately. A guard that is alive but late
+# (host memory/swap/CPU pressure) is tolerated for this many seconds, after which
+# it is classified as a recoverable stall (see audio_recovery.recoverable).
+HEARTBEAT_TOLERANCE_ENV = 'GARAGE_AUDIO_GUARD_HEARTBEAT_TOLERANCE'
+HEARTBEAT_TOLERANCE_DEFAULT = 12.0
+HEARTBEAT_TOLERANCE_MIN = 2.0
+HEARTBEAT_TOLERANCE_MAX = 300.0
+STALL_KIND = 'guard_heartbeat_stall'
+GUARD_INSPECT_TIMEOUT = 6  # seconds for the one batched `docker inspect` per guard pass
+GUARD_TERMINATE_WAIT = 2
+GUARD_KILL_WAIT = 3
+
+
+def heartbeat_tolerance(environ=None):
+    """Validated heartbeat tolerance in seconds. An invalid value never falls back."""
+    raw = (os.environ if environ is None else environ).get(HEARTBEAT_TOLERANCE_ENV)
+    if raw is None:
+        return HEARTBEAT_TOLERANCE_DEFAULT
+    try:
+        value = float(raw.strip())
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value) or not HEARTBEAT_TOLERANCE_MIN <= value <= HEARTBEAT_TOLERANCE_MAX:
+        raise ValueError(f'{HEARTBEAT_TOLERANCE_ENV} must be a number of seconds between '
+                         f'{HEARTBEAT_TOLERANCE_MIN:g} and {HEARTBEAT_TOLERANCE_MAX:g}')
+    return value
+
+
+def inspect_batch(identities, timeout=GUARD_INSPECT_TIMEOUT):
+    """One `docker inspect` for several exact container IDs, mapped back by exact Id.
+
+    Any nonzero exit (CalledProcessError), duplicate/missing/extra Id or malformed
+    result fails closed; a timeout is raised as TimeoutExpired for the caller."""
+    identities = list(identities)
+    if not identities or len(set(identities)) != len(identities) \
+            or any(not isinstance(x, str) or not x for x in identities):
+        raise RuntimeError('inspect_request_invalid')
+    values = json.loads(docker('inspect', *identities, timeout=timeout))
+    if not isinstance(values, list) or len(values) != len(identities):
+        raise RuntimeError('inspect_batch_mismatch')
+    result = {}
+    for value in values:
+        identity = value.get('Id') if isinstance(value, dict) else None
+        if identity not in identities or identity in result:
+            raise RuntimeError('inspect_batch_mismatch')
+        result[identity] = value
+    return result
+
+
+def write_guard_failure(receipt, kind, **fields):
+    """Record the initiating classification; returns False when it was not written.
+
+    A stall is write-once (hard link: complete content or nothing) and can never
+    replace an existing classification. A terminal/crash classification written by
+    the guard never replaces a stall already decided by the owner."""
+    path = Path(receipt)/'guard-failure.json'
+    value = {'kind': kind, 'time': time.monotonic(), **fields}
+    if kind == STALL_KIND:
+        temporary = path.with_name(path.name+'.next-'+uuid.uuid4().hex)
+        temporary.write_text(json.dumps(value))
+        temporary.chmod(0o600)
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            return False
+        finally:
+            temporary.unlink(missing_ok=True)
+        return True
+    try:
+        existing = json.loads(path.read_text()).get('kind')
+    except (OSError, ValueError, AttributeError):
+        existing = None
+    if existing == STALL_KIND:
+        return False
+    atomic(path, value)
+    return True
 
 
 def birth(pid):
@@ -94,7 +175,12 @@ def guard_main(registry):
                 raise RuntimeError('lease_lost_or_address_changed')
             if time.monotonic() >= lease['received']+lease['seconds']:
                 raise RuntimeError('lease_expired')
-            carrier = json.loads(docker('inspect', record['carrier']))[0]
+            # One batched inspect (carrier first, then dependents in registry order)
+            # shortens the pass and the window between observations. Results are mapped
+            # by exact Id; every per-container check below is unchanged.
+            dependent_ids = list(record.get('dependent_processes', {}))
+            inspected = inspect_batch([record['carrier'], *dependent_ids])
+            carrier = inspected[record['carrier']]
             pid = carrier['State']['Pid']
             if carrier['Config']['Labels'].get('garage.audio.generation') != record['generation'] \
                     or not carrier['State']['Running'] or pid != record['carrier_process']['pid'] \
@@ -107,7 +193,7 @@ def guard_main(registry):
                 raise RuntimeError('address_lost')
             workload_crash=None
             for identity, expected in record.get('dependent_processes', {}).items():
-                dependent = json.loads(docker('inspect', identity))[0]
+                dependent = inspected[identity]
                 from .audio_recovery import check_dependent,WorkloadCrash
                 try:check_dependent(dependent,identity,expected,record['generation'])
                 except WorkloadCrash as error:
@@ -119,12 +205,18 @@ def guard_main(registry):
                         or os.stat(f'/proc/{child}/ns/net').st_ino != expected['inode']):
                     raise RuntimeError('dependent_generation_changed')
             if workload_crash:raise workload_crash
+        except subprocess.TimeoutExpired:
+            # A bounded query that did not finish proves nothing either way. Do not
+            # publish a heartbeat or renew authority for an unverified pass; the
+            # owner-side watcher classifies a persistent stall after its tolerance.
+            time.sleep(.2)
+            continue
         except Exception as error:
             from .audio_recovery import WorkloadCrash
             # Preserve the initiating classification BEFORE revoke stops siblings.
             # Existing revocation (including deliberate stop) is never recoverable.
             kind='owned_workload_crash' if isinstance(error,WorkloadCrash) and not (Path(record['receipt'])/'authority/revoked.json').exists() else 'terminal'
-            atomic(Path(record['receipt'])/'guard-failure.json',{'kind':kind,'time':time.monotonic()})
+            write_guard_failure(record['receipt'], kind)
             revoke(record, str(error) if isinstance(error, RuntimeError) else type(error).__name__)
             return
         atomic(Path(record['receipt'])/'guard-heartbeat.json', {'time': time.monotonic()})
@@ -155,6 +247,8 @@ class Carrier:
     def __init__(self, receipt):
         if os.geteuid() != 0:
             raise PermissionError('trusted host administrator only')
+        # Invalid operator tuning fails closed before any lock, receipt or container exists.
+        self.heartbeat_tolerance = heartbeat_tolerance()
         self.lock = os.open('/run/garage-audio-carrier.lock', os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
         info = os.fstat(self.lock)
         if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or stat.S_IMODE(info.st_mode) != 0o600:
@@ -303,20 +397,69 @@ class Carrier:
         self.write_registry()
         self.guard = subprocess.Popen([sys.executable, '-m', 'garage_audio.audio_network', '--guard', str(self.registry)],
             stderr=(self.receipt/'guard.stderr').open('w'), pass_fds=(self.lock,))
-        def guard_guard():
-            begun = time.monotonic()
-            while not self.closed:
-                heartbeat = self.receipt/'guard-heartbeat.json'
-                try:
-                    last = json.loads(heartbeat.read_text())['time'] if heartbeat.exists() else begun
-                except (ValueError, OSError):
-                    last = begun
-                if self.guard.poll() is not None or time.monotonic()-last > 2:
-                    revoke(json.loads(self.registry.read_text()), 'independent_guard_lost')
-                    return
-                time.sleep(.2)
-        threading.Thread(target=guard_guard, daemon=True).start()
+        threading.Thread(target=self.watch_guard, daemon=True).start()
         return self
+
+    def watch_guard(self):
+        """Owner-side watcher: cheap poll of the guard process and its heartbeat.
+
+        Exited guard: immediate terminal revocation. Alive but stale beyond the
+        tolerance: classified stall (recoverable only through the bounded Supervisor)."""
+        begun = time.monotonic()
+        heartbeat = self.receipt/'guard-heartbeat.json'
+        last = begun
+        while not self.closed:
+            if self.guard.poll() is not None:
+                return revoke(json.loads(self.registry.read_text()), 'independent_guard_lost')
+            try:
+                last = json.loads(heartbeat.read_text())['time']
+            except FileNotFoundError:
+                last = begun
+            except (ValueError, OSError, KeyError, TypeError):
+                pass  # torn/unreadable read: keep the last good observation, never refresh it
+            staleness = time.monotonic()-last
+            if staleness > self.heartbeat_tolerance:
+                return self.revoke_stalled_guard(staleness)
+            time.sleep(.2)
+
+    def terminate_guard(self):
+        """Stop the owned guard process. Returns 'exited' if it was already gone before we
+        signalled (terminal), 'terminated' once our signal ended it, else 'alive'."""
+        if self.guard.poll() is not None:
+            return 'exited'
+        self.guard.terminate()
+        try:
+            self.guard.wait(timeout=GUARD_TERMINATE_WAIT)
+        except subprocess.TimeoutExpired:
+            self.guard.kill()
+            try:
+                self.guard.wait(timeout=GUARD_KILL_WAIT)
+            except subprocess.TimeoutExpired:
+                return 'alive'
+        return 'terminated' if self.guard.returncode in (-signal.SIGTERM, -signal.SIGKILL) else 'exited'
+
+    def revoke_stalled_guard(self, staleness):
+        """Guard alive but stale. The guard is stopped FIRST so it cannot later write a
+        competing classification; the stall is then recorded write-once and only if no
+        classification or revocation exists. Anything else is the terminal path."""
+        def terminal():
+            return revoke(json.loads(self.registry.read_text()), 'independent_guard_lost')
+        def classified():
+            return any((self.receipt/name).exists()
+                       for name in ('guard-failure.json', 'authority/revoked.json', 'guard-revoked.json'))
+        if self.closed:
+            return None  # deliberate stop owns revocation
+        if classified():
+            return terminal()  # guard (or an operator) is already classifying/revoking
+        outcome = self.terminate_guard()
+        if self.closed:
+            return None
+        if outcome != 'terminated' or classified():
+            return terminal()
+        if not write_guard_failure(self.receipt, STALL_KIND, staleness=round(staleness, 3),
+                                   tolerance=self.heartbeat_tolerance):
+            return terminal()
+        return revoke(json.loads(self.registry.read_text()), STALL_KIND)
 
     def write_registry(self):
         self.record = {'generation': self.generation, 'carrier': self.id, 'dependents': self.dependents,

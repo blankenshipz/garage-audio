@@ -355,6 +355,12 @@ An owner/receiver failure may intentionally leave hardware OFF with DAC closed.
 Do not repeatedly restart individual containers: generation guardians bind the
 combined lifecycle. Use [Docker rollback](docs/docker-rollback.md) and the lifecycle
 owner's targeted repair. No prune, state-volume deletion or unrelated service restart.
+A heartbeat stall of a still-running guardian (host memory/swap pressure) is retried
+by the owner's bounded recovery; `GARAGE_AUDIO_GUARD_HEARTBEAT_TOLERANCE` (default
+12 s) tunes it. Inspect state read-only with
+`python3 -B -m garage_audio.audio_recovery status [--root PATH] [--json]`; terminal,
+exhausted and recoverable outcomes and a resource-protection drop-in example are in
+[audio recovery](docs/audio-recovery.md).
 See [agent recovery](docs/agents.md) for reconnect and structured failures.
 
 ## Develop and package

@@ -129,20 +129,23 @@ class TelemetryTests(unittest.TestCase):
 
 class HeartbeatBudgetTests(unittest.TestCase):
     def test_successful_slow_inspection_can_outlive_guardian_freshness_budget(self):
-        # Execute the actual nested watchdog with virtual time. No real delay or
-        # Docker call, and no authority interval is widened by this characterization.
-        tree = ast.parse(Path(network.__file__).read_text())
-        start = next(n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name == 'guard_guard')
+        # Intentional change (was: revoke at a hard-coded 2s): the owner-side watcher now
+        # tolerates a late-but-alive guard for the configured tolerance (default 12s).
+        # Virtual time; no real delay or Docker call, and authority expiry is unchanged.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root/'guard-heartbeat.json').write_text(json.dumps({'time':0}))
             (root/'registry.json').write_text('{}')
-            owner = SimpleNamespace(closed=False, receipt=root, registry=root/'registry.json', guard=SimpleNamespace(poll=lambda:None))
+            owner = SimpleNamespace(closed=False, receipt=root, registry=root/'registry.json',
+                                    guard=SimpleNamespace(poll=lambda:None), heartbeat_tolerance=network.heartbeat_tolerance({}))
             revoked = []
-            virtual_time = SimpleNamespace(monotonic=lambda:2.1, sleep=lambda _:self.fail('must revoke at stale budget'))
-            scope = dict(self=owner, json=json, time=virtual_time, revoke=lambda record, reason:revoked.append(reason))
-            exec(compile(ast.Module(body=[start], type_ignores=[]), '<isolated-watchdog>', 'exec'), scope)
-            # Docker's four-second timeout allows success at 2.1 seconds, but the
-            # independent watchdog correctly refuses the now-stale observation.
-            scope['guard_guard']()
-            self.assertEqual(revoked, ['independent_guard_lost'])
+            clock = iter([2.1, 2.1, 12.5])
+            def sleep(_):
+                pass
+            with patch.object(network.time, 'monotonic', side_effect=lambda: next(clock)), \
+                    patch.object(network.time, 'sleep', side_effect=sleep), \
+                    patch.object(owner, 'revoke_stalled_guard', create=True,
+                                 side_effect=lambda staleness: revoked.append(round(staleness, 1))):
+                network.Carrier.watch_guard(owner)
+            # Docker's slow success at 2.1s is tolerated; only staleness beyond 12s is acted on.
+            self.assertEqual(revoked, [12.5])
