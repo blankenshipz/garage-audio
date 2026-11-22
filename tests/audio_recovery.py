@@ -66,10 +66,13 @@ class Recovery(unittest.TestCase):
           'dependent_processes':{'app':expected,'worker':expected}}
   registry=self.root/'registry.json';registry.write_text(json.dumps(record));registry.chmod(0o600)
   (self.root/'lease.json').write_text(json.dumps({'event':'bound','ip':'192.0.2.1','received':0,'seconds':1000}))
-  def inspect(*args):
-   identity=args[1];role='dashboard' if identity=='app' else 'audio-device'
-   return json.dumps([{'Id':identity,'Config':{'Labels':{'garage.audio.generation':'g','com.docker.compose.service':role}},
-    'State':{'Pid':123 if identity!='app' else 0,'Running':identity!='app','Status':'exited' if identity=='app' else 'running','ExitCode':1 if identity=='app' else 0}}])
+  def inspect(*args,**kwargs):
+   # Intentional change: the guard now issues ONE batched `docker inspect` per pass.
+   def one(identity):
+    role='dashboard' if identity=='app' else 'audio-device'
+    return {'Id':identity,'Config':{'Labels':{'garage.audio.generation':'g','com.docker.compose.service':role}},
+     'State':{'Pid':123 if identity!='app' else 0,'Running':identity!='app','Status':'exited' if identity=='app' else 'running','ExitCode':1 if identity=='app' else 0}}
+   return json.dumps([one(identity) for identity in args[1:]])
   original_stat=network.os.stat
   def proc_stat(path,*args,**kwargs):
    return SimpleNamespace(st_ino=7) if str(path)=='/proc/123/ns/net' else original_stat(path,*args,**kwargs)
@@ -78,9 +81,10 @@ class Recovery(unittest.TestCase):
    self.assertEqual(json.loads((self.root/'guard-failure.json').read_text())['kind'],'owned_workload_crash')
    self.assertEqual(revoke.call_count,1)
    # An independently invalid sibling must override an earlier eligible crash.
-   def invalid(*args):
+   def invalid(*args,**kwargs):
     value=json.loads(inspect(*args))
-    if args[1]=='worker':value[0]['Id']='wrong'
+    for item in value:
+     if item['Id']=='worker':item['Config']['Labels']['garage.audio.generation']='other'
     return json.dumps(value)
    with patch.object(network,'docker',side_effect=invalid):network.guard_main(registry)
    self.assertEqual(json.loads((self.root/'guard-failure.json').read_text())['kind'],'terminal')
@@ -93,6 +97,7 @@ class Lifecycle(unittest.TestCase):
   class Carrier:
    def __init__(self,receipt):
     receipt.mkdir();(receipt/'authority').mkdir();self.receipt=receipt;self.registry=receipt/'registry.json';self.generation='g';self.inode=1;self.address='192.0.2.1';self.dependents=[];self.id='carrier';self.worker_ack=None;self.guard=SimpleNamespace(poll=lambda:None);self.health=0
+   def await_guard_verdict(self,*_):return True
    def start(self,*_):
     events.append('carrier-start')
     if start_error:raise start_error

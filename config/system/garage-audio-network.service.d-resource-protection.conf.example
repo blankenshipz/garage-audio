@@ -1,0 +1,45 @@
+# EXAMPLE ONLY - never installed automatically; no install script reads this file.
+# Copy by hand, edit the placeholder values, and install as
+#   /etc/systemd/system/garage-audio-network.service.d/10-resource-protection.conf
+# (root 0644), then `systemctl daemon-reload`. It is independent of recovery.conf
+# (which only changes ExecStart/restart policy) and changes no safety check.
+#
+# Why: the carrier guard writes a heartbeat the owner watches. On a host under
+# memory or swap pressure the guard can be starved for longer than the heartbeat
+# tolerance (docs/audio-recovery.md). These settings keep the owner and its guard
+# resident and scheduled ahead of bulk work so a stall is unlikely; the bounded
+# `guard_heartbeat_stall` recovery is the backstop, not the plan.
+#
+# Sizing: observe the lifecycle unit's real usage first, for example
+#   systemctl show garage-audio-network.service -p MemoryCurrent
+# and set MemoryMin to roughly 1.5x the steady-state peak. Over-reserving starves
+# other services; under-reserving defeats the purpose. Every value below is a
+# placeholder to be replaced, not a recommendation for any particular host.
+#
+# Prerequisites: cgroup v2 (MemoryMin, MemorySwapMax, CPUWeight and IOWeight need
+# it). Verify with `systemctl show garage-audio-network.service -p MemoryMin`.
+[Service]
+# Memory the kernel will not reclaim from this unit while it is in use.
+MemoryMin=<size, e.g. 128M>
+# Never swap this unit out: a swapped-out guard is the usual cause of long stalls.
+MemorySwapMax=0
+# Relative CPU/IO share against the default of 100; higher wins under contention.
+CPUWeight=<10..10000, e.g. 400>
+IOWeight=<1..10000, e.g. 400>
+# Scheduling priority (-20..19, lower is higher priority). Needs no extra privilege
+# for a root-owned unit; stay modest.
+Nice=<-20..19, e.g. -5>
+# Optional: widen the heartbeat tolerance (seconds, 10..300, default 12). Invalid
+# values make the owner refuse to start. Leave unset unless stalls are observed
+# with the protections above in place. Keep it well above the 6 s per-pass
+# `docker inspect` timeout and far below the point where a hung guard would be
+# acceptable to leave running.
+#Environment=GARAGE_AUDIO_GUARD_HEARTBEAT_TOLERANCE=<seconds>
+
+# Optional, separate drop-in for the container runtime services (the unit names
+# differ per distribution; check `systemctl list-units '*docker*' '*containerd*'`).
+# Install as /etc/systemd/system/<runtime>.service.d/10-memory-low.conf:
+#
+#   [Service]
+#   # Soft protection: reclaimed only after unprotected cgroups are exhausted.
+#   MemoryLow=<size, e.g. 256M>

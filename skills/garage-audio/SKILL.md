@@ -49,7 +49,8 @@ dns-sd -B _spotify-connect._tcp local.   # macOS; avahi-browse -r _spotify-conne
   design: **never** add restart policies, `docker start` them, or `docker rm -f` carriers.
   Recover only with `systemctl start` / `restart` of the owner
   (see `docs/audio-recovery.md`). `/var/lib/garage-audio-network/recovery-state.json` holds the
-  last owner result.
+  last owner result; `python3 -B -m garage_audio.audio_recovery status` summarizes it read-only
+  (state, last guard failure such as `guard_heartbeat_stall`, heartbeat age, restart guidance).
 - Starting or restarting the owner is hardware mode, and the provider may resume audibly. Tell
   the user before doing it, unless they have already accepted that risk for routine recovery.
 - `driver-failure.json` with `"recovery": "terminal"` and a permission or ownership error: do not

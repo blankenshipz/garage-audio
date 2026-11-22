@@ -53,6 +53,75 @@ exits 1 itself from one whose custom signal handler deliberately exits 1.
 No recovery operation renews a grant, starts a qualification/recorder, calls Play,
 seeks, restores a track, or forces volume. No credential bytes enter receipts.
 
+## Heartbeat tolerance and stall recovery
+
+The independent guardian process publishes `guard-heartbeat.json` after each full
+ownership pass; the owner's watcher compares its age against a tolerance.
+
+- **Guardian exited** (the process is gone): immediate revocation, reason
+  `independent_guard_lost`. Terminal, as before.
+- **Guardian alive but heartbeat older than the tolerance**: the generation is still
+  revoked and every owned container stopped (muted/fail-closed), but the failure
+  is classified `guard_heartbeat_stall` in `guard-failure.json` with the measured
+  staleness and the tolerance. This kind is **recoverable** through the existing
+  bounded Supervisor (5/30/120 s, at most three in 600 s, lifetime cap, then
+  `exhausted`); no new delays or caps exist. Before any new generation the usual
+  `verify_closed()` proof must succeed, so a stop that cannot be proven fails closed
+  and is terminal.
+- The stalled guardian is terminated (bounded wait, then killed) so it cannot outlive
+  the generation. If it cannot be proven gone the failure is terminal.
+- The watcher stops the guardian before it writes the stall, and the lifecycle driver
+  can see the guardian gone first. The driver therefore waits (bounded by the terminate
+  and kill waits plus a margin) for the watcher's final verdict before classifying the
+  failure, and classifies it terminal if no verdict arrives in time. A heartbeat that is
+  missing, torn or malformed counts as missing (staleness runs from the last good value
+  or the watcher start); any unexpected watcher error is a terminal revocation.
+- The stall is written once. It is never written over an existing terminal
+  classification, `guard-revoked.json` or `authority/revoked.json`, and a late write
+  by the stalled guardian cannot replace it. Owner/DHCP/receiver loss, lease or
+  address change, namespace or generation change, ownership mismatch,
+  permission/OS/value errors, a deliberate stop and an existing revocation remain
+  terminal.
+
+`GARAGE_AUDIO_GUARD_HEARTBEAT_TOLERANCE` sets the tolerance in seconds (a number
+from 10 to 300, default **12**). It is read once when the carrier is constructed; an
+unparsable, non-finite or out-of-range value stops startup with an error that does not
+echo the value, rather than falling back to a weaker setting. The earlier fixed 2 s
+was shorter than one guard pass can legitimately take: each pass makes one batched
+`docker inspect` (own 6 s timeout) plus a namespace probe (2 s), and a pass that times
+out publishes nothing. The minimum of 10 s is above that 8 s worst-case successful pass,
+so a healthy but slow pass can never be classified as a stall. 12 s allows one such slow pass plus scheduling delay under
+memory/swap pressure while a hung guardian is still detected within seconds. Do not raise it to hide a persistent fault;
+prefer `config/system/garage-audio-network.service.d-resource-protection.conf.example`
+(copy by hand; nothing installs it) to keep the units resident and scheduled.
+
+Inspect state without side effects:
+
+```
+python3 -B -m garage_audio.audio_recovery status [--root PATH] [--json]
+```
+
+It only reads: it takes no lock, writes nothing, never creates the root, and exits 2
+if the root is missing or unreadable. It reports the generation, recovery state,
+retry count, the effective heartbeat tolerance as read from the status process's own
+environment (labelled as such; an invalid value is reported as invalid, never echoed; the
+owner unit's `Environment=` may differ), the last guard failure (kind, staleness,
+tolerance), last revocation
+reason, driver failure and heartbeat age (`time.monotonic`, system-wide on Linux; an
+age from another boot is shown as unknown), plus a plain explanation of each state:
+
+| state | meaning | operator action |
+| --- | --- | --- |
+| unknown | no `recovery-state.json` under the root (never ran, or removed) | check the service manager first |
+| starting / ready | a generation is being admitted / admitted (not playback proof) | none |
+| backoff | a recoverable failure; the Supervisor will retry on its own | wait; do not restart |
+| stopped | deliberate stop | start the owner when wanted |
+| terminal | a security or ownership failure or unrecoverable cleanup | find the cause first; then `systemctl start` the owner |
+| exhausted | recoverable failures hit the retry or lifetime cap | fix the underlying load/fault, then `systemctl start` the owner |
+
+Restart only with `systemctl stop`/`start` on the owner, never by manipulating
+containers directly. Terminal and exhausted exits require an explicit start.
+
 ## Startup sound risk: important activation prerequisite
 
 This is ordinary **hardware** mode, not a silent qualification. Fresh worker OFF
@@ -161,14 +230,15 @@ waiting for fresh Play, waiting for source corroboration, and software playing o
 paused. Phone visibility and audibility remain unverified. Fosi first-play volume
 guidance is also shown in the Docker view.
 
-A deterministic virtual-clock characterization confirms that a successful Docker
-inspection can exceed the independent guardian's two-second freshness budget
-(the Docker wrapper permits up to four seconds). That budget and all authority
-expiry rules are unchanged. A future inspection-budget redesign must fit complete
-ownership/lease checks within the existing bound; extending authority or publishing
-healthy ticks before complete checks is not this fix.
+A deterministic virtual-clock characterization confirmed that a successful Docker
+inspection could exceed the earlier fixed two-second guardian-heartbeat budget.
+That finding is addressed by "Heartbeat tolerance and stall recovery" below; the
+guardian's authority expiry rules and complete ownership/lease checks are unchanged
+and a healthy tick is still never published before those checks complete.
 
-Focused tests: `python3 -B -m unittest discover -s tests -p audio_review_fixes.py -v`,
+Focused tests: `python3 -B -m unittest discover -s tests -p audio_guard_heartbeat.py -v`
+(heartbeat tolerance, stall classification/recovery, batched inspect and status; fakes only),
+`python3 -B -m unittest discover -s tests -p audio_review_fixes.py -v`,
 `python3 -B -m unittest discover -s tests -p audio_recovery.py -v`,
 `python3 -B -m unittest discover -s tests -p audio_readiness.py -v`, and
 `node --test web/tests/speakers.test.js`. These use synthetic process/IPC/time seams
