@@ -2,6 +2,7 @@
 
 Synthetic fakes only; no service manager, Music Assistant or CamillaDSP is contacted.
 """
+import copy
 import importlib.util
 import json
 import os
@@ -157,6 +158,42 @@ class HardLimits(unittest.TestCase):
         self.assertTrue(any(p.startswith('far:') for p in problems))  # 3000 samples @48k = 62.5 ms
         self.assertTrue(any('mixer to4' in p for p in problems))
 
+    def test_audit_flags_unbounded_filter_types(self):
+        policy = safety.build_policy({})
+        unbounded = {
+            'free': {'type': 'Biquad', 'parameters': {'type': 'Free', 'a1': 0.0, 'a2': 0.0, 'b0': 4.0, 'b1': 0.0,
+                                                       'b2': 0.0}},
+            'lt': {'type': 'Biquad', 'parameters': {'type': 'LinkwitzTransform', 'freq_act': 50, 'q_act': 0.7,
+                                                     'freq_target': 25, 'q_target': 0.5}},
+            'fir': {'type': 'Conv', 'parameters': {'type': 'Raw', 'filename': 'x.raw'}},
+            'diffeq': {'type': 'DiffEq', 'parameters': {'a': [1.0], 'b': [4.0]}},
+            'loud': {'type': 'Loudness', 'parameters': {'reference_level': -25, 'high_boost': 7, 'low_boost': 7}},
+            'geq': {'type': 'BiquadCombo', 'parameters': {'type': 'GraphicEqualizer', 'gains': [12.0]}},
+            'mystery': {'type': 'Mystery', 'parameters': {}},
+            'aux': {'type': 'Volume', 'parameters': {'ramp_time': 200, 'fader': 'Aux1'}},
+        }
+        for name, definition in unbounded.items():
+            with self.subTest(filter=name):
+                problems = safety.audit_filter(policy, name, definition, 48000)
+                self.assertTrue(problems and 'unbounded filter type' in problems[0], problems)
+        bounded = {
+            'xo': {'type': 'BiquadCombo', 'parameters': {'type': 'LinkwitzRileyHighpass', 'freq': 80, 'order': 4}},
+            'vol': {'type': 'Volume', 'parameters': {'ramp_time': 200}},
+            'vol_main': {'type': 'Volume', 'parameters': {'ramp_time': 200, 'fader': 'Main'}},
+            'dither': {'type': 'Dither', 'parameters': {'type': 'Simple', 'bits': 16}},
+            'limit': {'type': 'Limiter', 'parameters': {'clip_limit': -1.0}},
+            'half': {'type': 'Gain', 'parameters': {'gain': 0.5, 'scale': 'linear'}},
+            'silent': {'type': 'Gain', 'parameters': {'gain': 0.0, 'scale': 'linear'}},
+        }
+        for name, definition in bounded.items():
+            with self.subTest(filter=name):
+                self.assertEqual(safety.audit_filter(policy, name, definition, 48000), [])
+        # Linear gain is converted to dB: 2.0 is +6 dB, above the 0 dB default trim ceiling.
+        self.assertTrue(safety.audit_filter(policy, 'double', {'type': 'Gain', 'parameters': {
+            'gain': 2.0, 'scale': 'linear'}}, 48000))
+        self.assertTrue(safety.audit_filter(policy, 'xo_low', {'type': 'BiquadCombo', 'parameters': {
+            'type': 'ButterworthLowpass', 'freq': 10, 'order': 2}}, 48000))
+
 
 class BackupBeforeWrite(unittest.TestCase):
     def harness(self, **kw):
@@ -301,6 +338,38 @@ class Rollback(unittest.TestCase):
         with self.assertRaises(SafetyError):
             tools.call(h.ctx, 'dsp_restore_backup', {'backup_id': record['id']})
         self.assertNotIn('set_config', h.camilla.events)
+
+    def test_restore_refuses_unbounded_or_hard_cap_configs_even_if_already_live(self):
+        bad_filters = {
+            'free': {'type': 'Biquad', 'parameters': {'type': 'Free', 'a1': 0.0, 'a2': 0.0, 'b0': 4.0, 'b1': 0.0,
+                                                       'b2': 0.0}},
+            'fir': {'type': 'Conv', 'parameters': {'type': 'Raw', 'filename': 'x.raw'}},
+            'mystery': {'type': 'Mystery', 'parameters': {}},
+            'hot': {'type': 'Gain', 'parameters': {'gain': 4.0, 'scale': 'linear'}},  # +12 dB > hard +6
+        }
+        for name, definition in bad_filters.items():
+            with self.subTest(filter=name):
+                config = fakes.base_config()
+                config['filters'][name] = definition
+                # The same filter is already live, so "only changed filters" logic would let it through.
+                h = fakes.Harness(self, {'allow_write': True}, camilla=fakes.FakeCamilla(copy.deepcopy(config)))
+                record = h.ctx.backups.save({'tool': 'synthetic', 'reason': 'x', 'volume_db': -20.0, 'mute': True,
+                                             'config': config})
+                with self.assertRaises(SafetyError) as caught:
+                    tools.call(h.ctx, 'dsp_restore_backup', {'backup_id': record['id'], 'restore_volume': True})
+                self.assertIn('cannot bound', caught.exception.message)
+                self.assertTrue(any(p.startswith(f'{name}:') for p in caught.exception.details['violations']))
+                self.assertNotIn('set_config', h.camilla.events)
+                self.assertNotIn(('set_volume', -20.0), h.camilla.events)
+                self.assertEqual(h.ctx.backups.list(), [record['id']])  # no new backup written
+
+    def test_incremental_write_keeps_working_beside_live_unbounded_filter(self):
+        config = fakes.base_config()
+        config['filters']['fir'] = {'type': 'Conv', 'parameters': {'type': 'Raw', 'filename': 'x.raw'}}
+        h = fakes.Harness(self, {'allow_write': True}, camilla=fakes.FakeCamilla(config))
+        result = tools.call(h.ctx, 'dsp_update_peq', {'filter': 'peq_left_1', 'gain': -4})
+        self.assertTrue(result['ok'])
+        self.assertTrue(any(p.startswith('fir:') for p in result['preexisting_limit_violations']))
 
     def test_restore_volume_above_ceiling_refused_before_anything_applies(self):
         h = fakes.Harness(self, {'allow_write': True})

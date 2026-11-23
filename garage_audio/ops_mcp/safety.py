@@ -165,6 +165,29 @@ def delay_ms(parameters, samplerate):
     return None
 
 
+# Filter types whose effect on level the audit can bound. Anything else (Biquad Free,
+# LinkwitzTransform, Conv, DiffEq, Loudness, BiquadCombo EQ shapes, unknown types) is
+# reported as an "unbounded" violation, so a write path can never introduce one.
+GAIN_BIQUADS = ('Peaking', 'Highshelf', 'Lowshelf', 'HighshelfFO', 'LowshelfFO')
+GAINLESS_BIQUADS = ('Highpass', 'Lowpass', 'HighpassFO', 'LowpassFO', 'Notch', 'Bandpass', 'Allpass', 'AllpassFO')
+Q_BIQUADS = ('Peaking', 'Notch', 'Bandpass', 'Allpass')
+CROSSOVER_COMBOS = ('ButterworthHighpass', 'ButterworthLowpass', 'LinkwitzRileyHighpass', 'LinkwitzRileyLowpass')
+LEVEL_NEUTRAL_TYPES = ('Dither', 'Limiter')  # never raise level
+# A Volume filter is bounded only on the Main fader (capped by volume_ceiling_db); Aux faders
+# are not controlled or capped by this server.
+
+
+def gain_db(value, scale='dB'):
+    """A Gain/mixer gain in dB, or None when it cannot be interpreted. Linear 0 (silence) is -inf."""
+    if not _finite(value):
+        return None
+    if scale in (None, 'dB'):
+        return float(value)
+    if scale == 'linear':
+        return 20.0 * math.log10(abs(value)) if value else -math.inf
+    return None
+
+
 def audit_filter(policy, name, definition, samplerate):
     """Return a list of human-readable limit violations for one filter definition."""
     problems = []
@@ -177,17 +200,26 @@ def audit_filter(policy, name, definition, samplerate):
         if not _finite(value) or not low <= value <= high:
             problems.append(f'{name}: {label}={value!r} outside {low}..{high}')
 
+    def unbounded(what):
+        problems.append(f'{name}: unbounded filter type {what!r}; the server cannot verify its level, '
+                        'so it may not be introduced or restored')
+
     if kind == 'Biquad':
         subtype = params.get('type')
-        if subtype in ('Peaking', 'Highshelf', 'Lowshelf', 'Notch', 'Bandpass', 'Allpass',
-                       'Highpass', 'Lowpass', 'HighpassFO', 'LowpassFO', 'HighshelfFO', 'LowshelfFO',
-                       'AllpassFO', 'LinkwitzTransform'):
-            if 'freq' in params:
-                outside('freq', params['freq'], policy.freq_min_hz, policy.freq_max_hz)
-        if subtype in ('Peaking', 'Highshelf', 'Lowshelf', 'HighshelfFO', 'LowshelfFO'):
+        if subtype not in GAIN_BIQUADS + GAINLESS_BIQUADS:
+            unbounded(f'Biquad {subtype}')
+            return problems
+        outside('freq', params.get('freq'), policy.freq_min_hz, policy.freq_max_hz)
+        if subtype in GAIN_BIQUADS:
             outside('gain', params.get('gain'), policy.min_gain_db, policy.max_boost_db)
-        if subtype in ('Peaking', 'Notch', 'Bandpass', 'Allpass') and 'q' in params:
+        if subtype in Q_BIQUADS and 'q' in params:
             outside('q', params['q'], policy.q_min, policy.q_max)
+    elif kind == 'BiquadCombo':
+        subtype = params.get('type')
+        if subtype not in CROSSOVER_COMBOS:
+            unbounded(f'BiquadCombo {subtype}')
+            return problems
+        outside('freq', params.get('freq'), policy.freq_min_hz, policy.freq_max_hz)
     elif kind == 'Delay':
         value = delay_ms(params, samplerate)
         if value is None:
@@ -195,7 +227,14 @@ def audit_filter(policy, name, definition, samplerate):
         else:
             outside('delay_ms', value, 0.0, policy.delay_max_ms)
     elif kind == 'Gain':
-        outside('gain', params.get('gain'), policy.channel_gain_min_db, policy.channel_gain_max_db)
+        value = gain_db(params.get('gain'), params.get('scale', 'dB'))
+        if value != -math.inf:  # linear 0 is silence
+            outside('gain_db', value, policy.channel_gain_min_db, policy.channel_gain_max_db)
+    elif kind == 'Volume':
+        if params.get('fader', 'Main') != 'Main':
+            unbounded(f"Volume fader {params.get('fader')}")
+    elif kind not in LEVEL_NEUTRAL_TYPES:
+        unbounded(kind)
     return problems
 
 
@@ -216,6 +255,21 @@ def audit_config(policy, config):
             for mapping in (mixers[name] or {}).get('mapping', []) if isinstance(mixers[name], dict) else []:
                 for source in mapping.get('sources', []) if isinstance(mapping, dict) else []:
                     gain = source.get('gain', 0) if isinstance(source, dict) else None
-                    if not _finite(gain) or gain > policy.channel_gain_max_db:
+                    value = gain_db(gain, source.get('scale', 'dB')) if isinstance(source, dict) else None
+                    if value is None or value > policy.channel_gain_max_db:
                         problems.append(f'mixer {name}: source gain {gain!r} above {policy.channel_gain_max_db}')
     return problems
+
+
+def hard_policy():
+    """The absolute caps as a Policy (no operator tightening)."""
+    return build_policy(HARD)
+
+
+def audit_whole_config(config):
+    """Violations of the hard caps anywhere in ``config``, including unbounded filter types.
+
+    Used for writes that push a configuration not derived from the live one (restore):
+    such a config must be entirely boundable and inside the hard caps.
+    """
+    return audit_config(hard_policy(), config)

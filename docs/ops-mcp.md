@@ -198,6 +198,13 @@ A change is rejected if it adds any violation, or if a filter it edits would sti
 be outside the limits. Violations that already exist in filters the change does not
 touch are reported, not fixed. `dsp_get_config` lists them.
 
+The server can only bound filters whose level effect it understands: `Gain` (dB or
+linear), `Delay`, `Volume` on the Main fader, `Dither`, `Limiter`, Biquad
+Peaking/shelf/pass/notch/bandpass/allpass, and Butterworth/Linkwitz-Riley
+`BiquadCombo` crossovers. Any other filter (Biquad `Free` or `LinkwitzTransform`, `Conv`,
+`DiffEq`, `Loudness`, `Volume` on an Aux fader, other `BiquadCombo` shapes, unknown
+types) is reported as an "unbounded filter type" violation. No write can introduce one.
+
 ## DSP backups and rollback
 
 Every DSP write (`dsp_update_peq`, `dsp_set_channel_delay`, `dsp_set_channel_gain`,
@@ -221,6 +228,10 @@ newest `camilladsp.backup_retention` backups.
 
 * The restore is itself validated against the **current** limits and backed up first,
   so a restore can be undone.
+* The restored config must be bounded as a whole. If any filter in it is an unbounded
+  type, or any value is outside the hard caps, the restore is refused with
+  `safety_limit` before anything is applied or backed up. This applies even if the same
+  filter is live now. Fix such configs through the reviewed configuration process.
 * `restore_volume=true` also restores the volume. The volume is checked against the
   ceiling before anything is applied.
 * It restores an unmuted state only when `allow_playback` is on.

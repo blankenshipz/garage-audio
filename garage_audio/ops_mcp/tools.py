@@ -149,7 +149,8 @@ TOOLS = [
     Tool('dsp_list_backups', READ, 'Automatic DSP backups (newest first).',
          obj({'limit': {'type': 'integer', 'minimum': 1, 'maximum': 200}}), dsp.list_backups),
     Tool('dsp_restore_backup', WRITE, 'Restore a DSP backup. The restore is validated against limits and itself backed '
-         'up first. restore_volume also restores main volume/mute (ceiling enforced; an unmuted '
+         'up first; a backup with unbounded filter types or values outside the hard caps is refused. '
+         'restore_volume also restores main volume/mute (ceiling enforced; an unmuted '
          'backup is only unmuted when allow_playback is on).',
          obj({'backup_id': ID, 'restore_volume': {'type': 'boolean'}}, ['backup_id']), dsp.restore_backup),
     # 5 Room correction --------------------------------------------------------------

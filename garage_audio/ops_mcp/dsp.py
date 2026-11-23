@@ -91,14 +91,25 @@ def _backup(ctx, config, tool, reason):
     return record['id']
 
 
-def apply_config(ctx, tool, reason, mutate):
-    """Backup-then-apply a config change built by ``mutate(config_copy)``."""
+def apply_config(ctx, tool, reason, mutate, whole_config=False):
+    """Backup-then-apply a config change built by ``mutate(config_copy)``.
+
+    ``whole_config=True`` is for writes that replace the configuration with one not
+    derived from the live config (restore): every filter in it must be of a boundable
+    type and inside the hard caps, not only the filters that differ from live.
+    """
     policy = ctx.config.policy
     cam = ctx.clients.camilla
     with ctx.exclusive():
         current = cam.get_config()
         candidate = copy.deepcopy(current)
         changed = mutate(candidate)
+        if whole_config:
+            hard = safety.audit_whole_config(candidate)
+            if hard:
+                raise SafetyError('configuration rejected: it contains filters the server cannot bound or values '
+                                  'outside the hard speaker-protection caps; fix it through the reviewed '
+                                  'configuration process instead', violations=hard)
         before = set(safety.audit_config(policy, current))
         after = safety.audit_config(policy, candidate)
         # Reject anything new, and any violation on a filter this change touches: an edited
@@ -277,8 +288,9 @@ def restore_backup(ctx, args):
         raise OpsError('unreadable', 'backup has no configuration')
 
     def mutate(candidate):
-        # Filters whose definition the restore changes must be inside the current limits;
-        # unchanged ones are already live and are only reported as pre-existing.
+        # Filters whose definition the restore changes must be inside the current limits.
+        # Unchanged ones are already live; whole_config=True still requires every filter in
+        # the restored config to be boundable and inside the hard caps.
         live = candidate.get('filters') or {}
         target = config.get('filters') or {}
         changed = sorted(name for name in target if target[name] != live.get(name))
@@ -290,7 +302,7 @@ def restore_backup(ctx, args):
     if args.get('restore_volume') and record.get('volume_db') is not None:
         # Checked before anything is applied so a refused volume never leaves a half restore.
         volume = safety.check_volume(ctx.config.policy, record['volume_db'], 'backup volume_db')
-    result = apply_config(ctx, 'dsp_restore_backup', f"restore {args['backup_id']}", mutate)
+    result = apply_config(ctx, 'dsp_restore_backup', f"restore {args['backup_id']}", mutate, whole_config=True)
     result['restored_from'] = args['backup_id']
     if volume is not None:
         # The pre-restore volume/mute were captured in the backup apply_config just wrote.
