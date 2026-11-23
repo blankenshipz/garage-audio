@@ -1,0 +1,59 @@
+{
+  "_comment": "EXAMPLE ONLY - garage-audio ops MCP server configuration. Copy to a private location (for example /etc/garage-audio-ops-mcp/config.json), edit the placeholders and point --config or GARAGE_OPS_MCP_CONFIG at it. No script installs this file. See docs/ops-mcp.md.",
+  "_comment_safety": "Read-only by default. allow_write enables recovery, DSP edits and pause/stop. allow_playback (together with allow_write) lets the agent start playback and change player volume. Limits can only be tightened below the hard caps in garage_audio/ops_mcp/safety.py; looser values are rejected at startup.",
+  "allow_write": false,
+  "allow_playback": false,
+  "state_dir": "/var/lib/garage-audio-ops-mcp",
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8766,
+    "token_file": "/etc/garage-audio-ops-mcp/http-token",
+    "allowed_hosts": []
+  },
+  "limits": {
+    "max_boost_db": 3.0,
+    "volume_ceiling_db": -10.0,
+    "ma_volume_max": 50
+  },
+  "supervisor": {
+    "unit": "garage-audio-network.service",
+    "status_root": "/var/lib/garage-audio-network",
+    "systemctl": ["systemctl"],
+    "timeout_seconds": 90,
+    "min_action_interval_seconds": 120
+  },
+  "containers": {
+    "docker": ["docker"],
+    "label": "garage.audio.generation",
+    "names": []
+  },
+  "logs": {
+    "journalctl": ["journalctl"],
+    "units": ["garage-audio-network.service"],
+    "containers": [],
+    "max_lines": 200
+  },
+  "music_assistant": {
+    "url": "http://127.0.0.1:8095",
+    "token_file": "/etc/garage-audio-ops-mcp/music-assistant-token",
+    "timeout_seconds": 8,
+    "players": []
+  },
+  "camilladsp": {
+    "host": "127.0.0.1",
+    "port": 1234,
+    "timeout_seconds": 5,
+    "channels": {"left": 0, "right": 1, "sub": 2},
+    "backup_retention": 50
+  },
+  "room_correction": {
+    "max_boost_db": 0.0,
+    "max_filters": 6,
+    "freq_min_hz": 25.0,
+    "freq_max_hz": 300.0,
+    "smoothing_octaves": 0.1667,
+    "tolerance_db": 1.0,
+    "sample_rate": 48000,
+    "history_retention": 200
+  }
+}

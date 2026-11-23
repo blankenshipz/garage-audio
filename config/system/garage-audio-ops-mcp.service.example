@@ -1,0 +1,64 @@
+# EXAMPLE ONLY - never installed automatically; no install script reads this file.
+# Operator MCP server for the garage audio stack (docs/ops-mcp.md).
+#
+# Copy by hand to /etc/systemd/system/garage-audio-ops-mcp.service (root 0644),
+# replace every <placeholder>, then `systemctl daemon-reload` and
+# `systemctl enable --now garage-audio-ops-mcp.service`. Nothing here is a
+# recommendation for a particular host.
+#
+# Before enabling:
+#   * Create a dedicated, unprivileged account for <ops-user>. Do not use root.
+#   * Write the HTTP bearer token (32+ random printable characters, for example
+#     `python3 -c 'import secrets; print(secrets.token_urlsafe(48))'`) to
+#     /etc/garage-audio-ops-mcp/http-token, owned by <ops-user>, mode 0600.
+#     The server refuses to start HTTP without it or with looser permissions.
+#   * Copy config/ops-mcp.example.json to /etc/garage-audio-ops-mcp/config.json
+#     and edit it. It ships read-only (allow_write=false, allow_playback=false).
+#   * Validate: sudo -u <ops-user> <venv>/bin/python -m garage_audio.ops_mcp \
+#       --transport http --config /etc/garage-audio-ops-mcp/config.json --check-config
+#
+# Privileges are granted outside this unit, deliberately and individually:
+#   * Recovery (allow_write=true) runs `systemctl start|restart --no-block` on the
+#     configured owner unit. An unprivileged user needs a narrow polkit rule for
+#     exactly that unit and those verbs (example in docs/ops-mcp.md). No sudo.
+#   * Container inspection runs `docker ps/inspect`. Access to the Docker socket
+#     is root-equivalent; grant it only if you accept that (docs/ops-mcp.md).
+#   * Reading unit logs needs membership of the systemd-journal group.
+# Without these grants the matching read tools report "unavailable" and the
+# rest of the server keeps working.
+
+[Unit]
+Description=Garage audio operator MCP server (EXAMPLE)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=<ops-user>
+Group=<ops-group>
+# A checkout or installed copy of this repository; `-m` imports from here.
+WorkingDirectory=<path to garage-audio checkout>
+ExecStart=<venv>/bin/python -m garage_audio.ops_mcp --transport http --config /etc/garage-audio-ops-mcp/config.json
+# Never a crash loop: the server either starts with a valid config and token or
+# exits with status 2 and a one-line reason in the journal.
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=2
+UMask=0077
+# Backups and room-correction history live here (matches state_dir in the
+# example config). Mode 0700: the server refuses a group/world-accessible dir.
+StateDirectory=garage-audio-ops-mcp
+StateDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Keep the bind on loopback (server.host in the config). Reach it remotely only
+# through a private network or TLS proxy you control, never a public interface.
+
+[Install]
+WantedBy=multi-user.target

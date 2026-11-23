@@ -1,0 +1,221 @@
+"""Speaker and amplifier protection limits enforced in code.
+
+``HARD`` values are code constants. Operator configuration may only tighten them:
+a configured value that is looser than its hard limit is rejected at load time
+(fail closed), never silently clamped. Every DSP write and every room-correction
+proposal is checked against the effective ``Policy``.
+"""
+import math
+from dataclasses import dataclass, fields
+
+from .errors import ConfigError, SafetyError
+
+# Absolute limits. Changing these requires a code change and review.
+HARD = {
+    'max_boost_db': 6.0,             # highest positive PEQ/shelf gain
+    'min_gain_db': -24.0,            # deepest PEQ/shelf cut
+    'freq_min_hz': 20.0,
+    'freq_max_hz': 20000.0,
+    'q_min': 0.1,
+    'q_max': 20.0,
+    'delay_max_ms': 50.0,
+    'channel_gain_max_db': 6.0,      # Gain filter / level trim ceiling
+    'channel_gain_min_db': -60.0,
+    'volume_ceiling_db': 0.0,        # CamillaDSP main volume never above this
+    'max_filters_per_channel': 10,   # room-correction proposal size
+    'ma_volume_max': 100,            # Music Assistant player volume (0-100)
+}
+# 'max' keys may only be lowered by configuration; 'min' keys may only be raised.
+DIRECTION = {
+    'max_boost_db': 'max', 'min_gain_db': 'min', 'freq_min_hz': 'min', 'freq_max_hz': 'max',
+    'q_min': 'min', 'q_max': 'max', 'delay_max_ms': 'max', 'channel_gain_max_db': 'max',
+    'channel_gain_min_db': 'min', 'volume_ceiling_db': 'max', 'max_filters_per_channel': 'max',
+    'ma_volume_max': 'max',
+}
+# Conservative shipped defaults (tighter than HARD).
+DEFAULTS = {
+    'max_boost_db': 3.0, 'min_gain_db': -15.0, 'freq_min_hz': 20.0, 'freq_max_hz': 20000.0,
+    'q_min': 0.3, 'q_max': 10.0, 'delay_max_ms': 20.0, 'channel_gain_max_db': 0.0,
+    'channel_gain_min_db': -40.0, 'volume_ceiling_db': -10.0, 'max_filters_per_channel': 8,
+    'ma_volume_max': 50,
+}
+VOLUME_MIN_DB = -100.0
+SHELF_SLOPE = (1.0, 12.0)
+SPEED_OF_SOUND_M_S = 343.0
+INTEGER_KEYS = {'max_filters_per_channel', 'ma_volume_max'}
+
+
+@dataclass(frozen=True)
+class Policy:
+    max_boost_db: float
+    min_gain_db: float
+    freq_min_hz: float
+    freq_max_hz: float
+    q_min: float
+    q_max: float
+    delay_max_ms: float
+    channel_gain_max_db: float
+    channel_gain_min_db: float
+    volume_ceiling_db: float
+    max_filters_per_channel: int
+    ma_volume_max: int
+
+    def as_dict(self):
+        return {f.name: getattr(self, f.name) for f in fields(self)}
+
+
+def _finite(value):
+    return type(value) in (int, float) and math.isfinite(value)
+
+
+def build_policy(overrides=None):
+    """Effective policy = DEFAULTS updated by overrides; any loosening is a ConfigError."""
+    overrides = {} if overrides is None else overrides
+    if not isinstance(overrides, dict):
+        raise ConfigError('limits must be an object')
+    unknown = set(overrides) - set(HARD)
+    if unknown:
+        raise ConfigError('unknown limit keys', keys=sorted(unknown))
+    values = dict(DEFAULTS)
+    for key, value in overrides.items():
+        if key in INTEGER_KEYS:
+            if type(value) is not int:
+                raise ConfigError(f'limit {key} must be an integer')
+        elif not _finite(value):
+            raise ConfigError(f'limit {key} must be a finite number')
+        hard = HARD[key]
+        if (DIRECTION[key] == 'max' and value > hard) or (DIRECTION[key] == 'min' and value < hard):
+            raise ConfigError(f'limit {key}={value} would loosen the hard limit {hard}; configuration may only tighten',
+                              key=key, hard_limit=hard)
+        values[key] = float(value) if key not in INTEGER_KEYS else value
+    checks = [
+        (values['max_boost_db'] >= 0, 'max_boost_db must be >= 0'),
+        (values['min_gain_db'] <= 0, 'min_gain_db must be <= 0'),
+        (values['freq_min_hz'] < values['freq_max_hz'], 'freq_min_hz must be below freq_max_hz'),
+        (values['q_min'] < values['q_max'], 'q_min must be below q_max'),
+        (values['delay_max_ms'] >= 0, 'delay_max_ms must be >= 0'),
+        (values['channel_gain_min_db'] < values['channel_gain_max_db'], 'channel gain range is empty'),
+        (values['volume_ceiling_db'] >= VOLUME_MIN_DB, f'volume_ceiling_db must be >= {VOLUME_MIN_DB}'),
+        (values['max_filters_per_channel'] >= 1, 'max_filters_per_channel must be >= 1'),
+        (values['ma_volume_max'] >= 0, 'ma_volume_max must be >= 0'),
+    ]
+    for ok, message in checks:
+        if not ok:
+            raise ConfigError(message)
+    return Policy(**values)
+
+
+def check_range(name, value, low, high):
+    if not _finite(value):
+        raise SafetyError(f'{name} must be a finite number', parameter=name)
+    if not low <= value <= high:
+        raise SafetyError(f'{name}={value} is outside the allowed range {low}..{high}',
+                          parameter=name, minimum=low, maximum=high)
+    return float(value)
+
+
+def check_gain(policy, value, name='gain'):
+    return check_range(name, value, policy.min_gain_db, policy.max_boost_db)
+
+
+def check_freq(policy, value, name='freq'):
+    return check_range(name, value, policy.freq_min_hz, policy.freq_max_hz)
+
+
+def check_q(policy, value, name='q'):
+    return check_range(name, value, policy.q_min, policy.q_max)
+
+
+def check_delay_ms(policy, value, name='delay_ms'):
+    return check_range(name, value, 0.0, policy.delay_max_ms)
+
+
+def check_channel_gain(policy, value, name='gain_db'):
+    return check_range(name, value, policy.channel_gain_min_db, policy.channel_gain_max_db)
+
+
+def check_volume(policy, value, name='volume_db'):
+    return check_range(name, value, VOLUME_MIN_DB, policy.volume_ceiling_db)
+
+
+def check_ma_volume(policy, value):
+    if type(value) is not int:
+        raise SafetyError('volume level must be an integer 0-100', parameter='level')
+    return int(check_range('level', value, 0, policy.ma_volume_max))
+
+
+def check_peq(policy, params):
+    """Validate a Peaking biquad parameter dict {freq, q, gain}."""
+    return {'type': 'Peaking', 'freq': check_freq(policy, params.get('freq')),
+            'q': check_q(policy, params.get('q')), 'gain': check_gain(policy, params.get('gain'))}
+
+
+def delay_ms(parameters, samplerate):
+    """Convert a CamillaDSP Delay parameter block to milliseconds, or None if unknown."""
+    value = parameters.get('delay')
+    unit = parameters.get('unit', 'ms')
+    if not _finite(value):
+        return None
+    if unit == 'ms':
+        return float(value)
+    if unit == 'mm':
+        return float(value) / SPEED_OF_SOUND_M_S
+    if unit == 'samples' and _finite(samplerate) and samplerate > 0:
+        return float(value) * 1000.0 / samplerate
+    return None
+
+
+def audit_filter(policy, name, definition, samplerate):
+    """Return a list of human-readable limit violations for one filter definition."""
+    problems = []
+    if not isinstance(definition, dict):
+        return [f'{name}: filter definition is not an object']
+    kind = definition.get('type')
+    params = definition.get('parameters') if isinstance(definition.get('parameters'), dict) else {}
+
+    def outside(label, value, low, high):
+        if not _finite(value) or not low <= value <= high:
+            problems.append(f'{name}: {label}={value!r} outside {low}..{high}')
+
+    if kind == 'Biquad':
+        subtype = params.get('type')
+        if subtype in ('Peaking', 'Highshelf', 'Lowshelf', 'Notch', 'Bandpass', 'Allpass',
+                       'Highpass', 'Lowpass', 'HighpassFO', 'LowpassFO', 'HighshelfFO', 'LowshelfFO',
+                       'AllpassFO', 'LinkwitzTransform'):
+            if 'freq' in params:
+                outside('freq', params['freq'], policy.freq_min_hz, policy.freq_max_hz)
+        if subtype in ('Peaking', 'Highshelf', 'Lowshelf', 'HighshelfFO', 'LowshelfFO'):
+            outside('gain', params.get('gain'), policy.min_gain_db, policy.max_boost_db)
+        if subtype in ('Peaking', 'Notch', 'Bandpass', 'Allpass') and 'q' in params:
+            outside('q', params['q'], policy.q_min, policy.q_max)
+    elif kind == 'Delay':
+        value = delay_ms(params, samplerate)
+        if value is None:
+            problems.append(f'{name}: delay cannot be interpreted')
+        else:
+            outside('delay_ms', value, 0.0, policy.delay_max_ms)
+    elif kind == 'Gain':
+        outside('gain', params.get('gain'), policy.channel_gain_min_db, policy.channel_gain_max_db)
+    return problems
+
+
+def audit_config(policy, config):
+    """All limit violations in a CamillaDSP config (filters and mixer source gains)."""
+    if not isinstance(config, dict):
+        return ['configuration is not an object']
+    devices = config.get('devices') if isinstance(config.get('devices'), dict) else {}
+    samplerate = devices.get('samplerate')
+    problems = []
+    filters = config.get('filters') or {}
+    if isinstance(filters, dict):
+        for name in sorted(filters):
+            problems.extend(audit_filter(policy, name, filters[name], samplerate))
+    mixers = config.get('mixers') or {}
+    if isinstance(mixers, dict):
+        for name in sorted(mixers):
+            for mapping in (mixers[name] or {}).get('mapping', []) if isinstance(mixers[name], dict) else []:
+                for source in mapping.get('sources', []) if isinstance(mapping, dict) else []:
+                    gain = source.get('gain', 0) if isinstance(source, dict) else None
+                    if not _finite(gain) or gain > policy.channel_gain_max_db:
+                        problems.append(f'mixer {name}: source gain {gain!r} above {policy.channel_gain_max_db}')
+    return problems
