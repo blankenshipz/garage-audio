@@ -312,16 +312,17 @@ MEASURE_HARD = {
     'max_duration_seconds': 60.0,    # longest audible time of one measurement action
     'sweep_min_hz': 10.0,            # lowest sweep frequency
     'sweep_max_hz': 22000.0,         # highest sweep frequency (also below the Nyquist frequency)
+    'level_ttl_seconds': 1800.0,     # a confirmed level (level check) expires after this long
 }
 MEASURE_DIRECTION = {
     'sweep_level_max_dbfs': 'max', 'start_level_dbfs': 'max', 'level_step_max_db': 'max',
     'sub_sweep_max_hz': 'max', 'sweep_seconds_max': 'max', 'max_duration_seconds': 'max',
-    'sweep_min_hz': 'min', 'sweep_max_hz': 'max',
+    'sweep_min_hz': 'min', 'sweep_max_hz': 'max', 'level_ttl_seconds': 'max',
 }
 MEASURE_DEFAULTS = {
     'sweep_level_max_dbfs': -18.0, 'start_level_dbfs': -40.0, 'level_step_max_db': 3.0,
     'sub_sweep_max_hz': 200.0, 'sweep_seconds_max': 10.0, 'max_duration_seconds': 30.0,
-    'sweep_min_hz': 15.0, 'sweep_max_hz': 20000.0,
+    'sweep_min_hz': 15.0, 'sweep_max_hz': 20000.0, 'level_ttl_seconds': 1800.0,
 }
 MEASURE_LEVEL_FLOOR_DBFS = -90.0
 CAPTURE_CLIP_DBFS = -0.5           # a capture peak at or above this counts as clipped
@@ -338,6 +339,7 @@ class MeasurePolicy:
     max_duration_seconds: float
     sweep_min_hz: float
     sweep_max_hz: float
+    level_ttl_seconds: float
 
     def as_dict(self):
         return {f.name: getattr(self, f.name) for f in fields(self)}
@@ -371,6 +373,7 @@ def build_measure_policy(overrides=None):
         (values['sweep_seconds_max'] >= 0.5, 'sweep_seconds_max must be >= 0.5'),
         (values['max_duration_seconds'] >= values['sweep_seconds_max'],
          'max_duration_seconds must be >= sweep_seconds_max'),
+        (values['level_ttl_seconds'] >= 10.0, 'level_ttl_seconds must be >= 10'),
     ]
     for ok, message in checks:
         if not ok:

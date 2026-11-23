@@ -60,6 +60,10 @@ def inverse_filter(sweep, f1, f2, seconds, rate):
     h = np.abs(np.fft.rfft(sweep, nfft) * np.fft.rfft(inv, nfft))
     freqs = np.fft.rfftfreq(nfft, 1.0 / rate)
     band = (freqs >= 2.0 * f1) & (freqs <= f2 / 2.0)
+    if np.count_nonzero(band) < 4:  # a two-octave sweep leaves (almost) no inner band: use the whole sweep band
+        band = (freqs >= f1) & (freqs <= f2)
+    if not band.any():
+        raise ValueError(f'sweep band {f1:g}-{f2:g} Hz is too narrow to normalise the inverse filter')
     return inv / float(np.median(h[band]))
 
 

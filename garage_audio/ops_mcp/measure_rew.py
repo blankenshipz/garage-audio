@@ -1,41 +1,98 @@
 """Optional REW (Room EQ Wizard) REST API backend for ``measure_sweep`` (default off).
 
 REW 5.40+ exposes an HTTP API (start REW with ``-api`` or enable it in Preferences;
-default ``http://127.0.0.1:4735``). The endpoint paths and payload shapes below are kept
-in one table so they can be checked against the API documentation of the installed REW
-build (``GET /`` on the API port serves an OpenAPI description). They have NOT been
-verified against a live REW instance in this repository: tests use a fake. Some features
-(e.g. automation of measurements) may need a REW Pro licence.
+default ``http://127.0.0.1:4735``). Automated measurement through the API (starting a sweep
+and reading results back) REQUIRES A REW PRO LICENCE; without it REW refuses the measure
+command and this backend reports a ``rew_error``.
+
+Every endpoint path, command name and payload field used here lives in ``PROTOCOL`` below and
+can be overridden per key with ``measurement.rew.protocol`` (validated, see config.py). They are
+UNVERIFIED AGAINST A LIVE REW: they follow the published API description as far as it could be
+read, tests use a fake, and the installed REW build's own description (``GET /`` on the API
+port serves an OpenAPI document) is authoritative.
 
 REW plays through the output device configured *inside REW*. That output must be the stack
 sink (PipeWire -> CamillaDSP), never the DAC; the ops server cannot verify REW's routing
 and says so in every result. Level checks and noise checks are not provided through this
 backend; the sweep level sent to REW is still capped by the measurement policy.
+
+Behaviour: REW's blocking mode is read first, switched on for the measurement and restored
+afterwards. The blocking measure call runs in a worker thread; an abort or the deadline sends
+the cancel command and returns without waiting for REW. Measurement indices are 1-based.
 """
 import base64
 import json
 import math
+import re
 import struct
+import threading
 import time
 import urllib.error
 import urllib.request
 
 from .errors import OpsError
 
-# key -> (method, path). Unverified against a live REW; see module docstring.
-ENDPOINTS = {
-    'version': ('GET', '/version'),
-    'blocking': ('POST', '/application/blocking'),
-    'level': ('POST', '/measure/level'),
-    'sweep_config': ('POST', '/measure/sweep/configuration'),
-    'naming': ('POST', '/measure/naming'),
-    'command': ('POST', '/measure/command'),
-    'measurements': ('GET', '/measurements'),
-    'frequency_response': ('GET', '/measurements/{id}/frequency-response'),
-    'impulse_response': ('GET', '/measurements/{id}/impulse-response'),
+# One table of everything protocol-specific. ALL UNVERIFIED against a live REW (see docstring);
+# override per key with measurement.rew.protocol. Methods are fixed (GET = read, POST = change).
+PROTOCOL = {
+    'path.version': '/version',
+    'path.blocking': '/application/blocking',          # GET -> bool, POST bool
+    'path.level': '/measure/level',
+    'path.sweep_config': '/measure/sweep/configuration',
+    'path.naming': '/measure/naming',
+    'path.command': '/measure/command',
+    'path.measurements': '/measurements',                # keyed by measurement index
+    'path.frequency_response': '/measurements/{id}/frequency-response',
+    'path.impulse_response': '/measurements/{id}/impulse-response',
+    'command.measure': 'Measure',                        # REW also has an "SPL" command; Measure = sweep
+    'command.cancel': 'Cancel',
+    'field.command': 'command',
+    'field.sweep_start': 'startFreq',
+    'field.sweep_end': 'endFreq',
+    'field.sweep_length': 'length',
+    'index_base': 1,                                     # REW numbers measurements from 1
 }
+CALLS = {
+    'version': ('GET', 'path.version'),
+    'blocking_get': ('GET', 'path.blocking'),
+    'blocking_set': ('POST', 'path.blocking'),
+    'level': ('POST', 'path.level'),
+    'sweep_config': ('POST', 'path.sweep_config'),
+    'naming': ('POST', 'path.naming'),
+    'command': ('POST', 'path.command'),
+    'measurements': ('GET', 'path.measurements'),
+    'frequency_response': ('GET', 'path.frequency_response'),
+    'impulse_response': ('GET', 'path.impulse_response'),
+}
+_PATH = re.compile(r'^/[A-Za-z0-9_./-]{0,120}(\{id\}[A-Za-z0-9_./-]{0,60})?$')
+_NAME = re.compile(r'^[A-Za-z][A-Za-z0-9_]{0,40}$')
 MAX_RESPONSE = 32 * 1024 * 1024
-POLL_S = 0.2
+POLL_S = 0.1
+RESULT_WAIT_S = 5.0     # after the blocking call returns: how long to look for the new measurement
+CANCEL_JOIN_S = 2.0     # after cancel: how long to wait for the worker before returning anyway
+
+
+def validate_protocol(overrides):
+    """Validated copy of PROTOCOL with ``overrides`` applied (raises ValueError with a plain message)."""
+    if not isinstance(overrides, dict):
+        raise ValueError('measurement.rew.protocol must be an object')
+    out = dict(PROTOCOL)
+    for key, value in overrides.items():
+        if key not in PROTOCOL:
+            raise ValueError(f'measurement.rew.protocol: unknown key {key!r} (known: {sorted(PROTOCOL)})')
+        if key == 'index_base':
+            if value not in (0, 1) or isinstance(value, bool):
+                raise ValueError('measurement.rew.protocol.index_base must be 0 or 1')
+        elif key.startswith('path.'):
+            if not isinstance(value, str) or not _PATH.fullmatch(value) or '..' in value:
+                raise ValueError(f'measurement.rew.protocol.{key} must be a plain absolute API path')
+            if ('{id}' in PROTOCOL[key]) != ('{id}' in value):
+                raise ValueError(f'measurement.rew.protocol.{key} must {"" if "{id}" in PROTOCOL[key] else "not "}'
+                                 'contain {id}')
+        elif not isinstance(value, str) or not _NAME.fullmatch(value):
+            raise ValueError(f'measurement.rew.protocol.{key} must be a plain identifier')
+        out[key] = value
+    return out
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -64,16 +121,18 @@ def _urllib_transport(method, url, body, timeout):
 
 
 class RewClient:
-    def __init__(self, url, timeout, transport=None):
+    def __init__(self, url, timeout, transport=None, protocol=None):
         self.url = url.rstrip('/')
         self.timeout = timeout
         self.transport = transport or _urllib_transport
+        self.protocol = dict(protocol or PROTOCOL)
 
-    def call(self, key, body=None, **params):
-        method, path = ENDPOINTS[key]
+    def call(self, key, body=None, timeout=None, **params):
+        method, path_key = CALLS[key]
+        path = self.protocol[path_key]
         path = path.format(**{k: urllib.request.quote(str(v), safe='') for k, v in params.items()})
         try:
-            status, value = self.transport(method, self.url + path, body, self.timeout)
+            status, value = self.transport(method, self.url + path, body, timeout or self.timeout)
         except OpsError:
             raise
         except (OSError, ValueError):
@@ -82,6 +141,10 @@ class RewClient:
         if not 200 <= int(status) < 300:
             raise OpsError('rew_error', f'REW API {method} {path} answered HTTP {status}', http_status=status)
         return value
+
+    def command(self, which, timeout=None):
+        p = self.protocol
+        return self.call('command', {p['field.command']: p[f'command.{which}']}, timeout=timeout)
 
 
 def decode_floats(text):
@@ -115,45 +178,106 @@ class RewBackend:
     def __init__(self, client):
         self.client = client
         self._cancel_requested = False
+        self.notes = []
 
     def stop(self):
         """Best effort: ask REW to cancel the running measurement. REW owns its own playback."""
         self._cancel_requested = True
         try:
-            self.client.call('command', {'command': 'Cancel'})
+            self.client.command('cancel', timeout=min(5.0, self.client.timeout))
         except OpsError:
             return 0
         return 1
 
+    def _blocking(self):
+        """REW's current blocking mode (None if it cannot be read)."""
+        try:
+            value = self.client.call('blocking_get')
+        except OpsError:
+            return None
+        if isinstance(value, dict):  # tolerate {"blocking": bool} as well as a bare bool
+            value = value.get('blocking', value.get('value'))
+        return value if isinstance(value, bool) else None
+
     def sweep(self, *, f1, f2, seconds, rate, level_dbfs, title, should_stop, deadline):
-        before = self._ids()
-        self.client.call('blocking', True)
-        self.client.call('level', {'value': round(level_dbfs, 2), 'unit': 'dBFS'})
-        length = 1 << max(16, min(22, int(math.log2(max(1.0, seconds * rate)))))
-        self.client.call('sweep_config', {'startFreq': f1, 'endFreq': f2, 'length': length})
-        self.client.call('naming', {'title': title[:60]})
-        self.client.call('command', {'command': 'Measure'})
-        new = None
-        while new is None:
+        p = self.client.protocol
+        before = set(self._ids())
+        previous = self._blocking()
+        if previous is None:
+            self.notes.append("REW's blocking mode could not be read; it is left enabled after the measurement.")
+        self.client.call('blocking_set', True)
+        try:
+            self.client.call('level', {'value': round(level_dbfs, 2), 'unit': 'dBFS'})
+            length = 1 << max(16, min(22, int(math.log2(max(1.0, seconds * rate)))))
+            self.client.call('sweep_config', {p['field.sweep_start']: f1, p['field.sweep_end']: f2,
+                                              p['field.sweep_length']: length})
+            self.client.call('naming', {'title': title[:60]})
+            outcome = self._measure(should_stop, deadline)
+            if outcome is not None:
+                return outcome
+            new = self._new_id(before, should_stop, deadline)
+            if isinstance(new, dict):
+                return new
+            return {'status': 'ok', 'rew_measurement_id': new, **self._fetch(new, f1, f2)}
+        finally:
+            if previous is False:  # it was off before: switch it back off
+                try:
+                    self.client.call('blocking_set', previous)
+                except OpsError:
+                    self.notes.append("REW's blocking mode could not be restored.")
+
+    def _measure(self, should_stop, deadline):
+        """Run the blocking measure command in a worker; None when it finished, else an aborted/timeout result."""
+        box = {}
+        done = threading.Event()
+
+        def work():
+            try:
+                self.client.command('measure', timeout=max(1.0, deadline - time.monotonic()))
+            except BaseException as error:  # noqa: BLE001 - handed to the caller thread
+                box['error'] = error
+            finally:
+                done.set()
+
+        worker = threading.Thread(target=work, name='rew-measure', daemon=True)
+        worker.start()
+        while not done.wait(POLL_S):
+            status = None
             if should_stop() or self._cancel_requested:
+                status = 'aborted'
+            elif time.monotonic() >= deadline:
+                status = 'timeout'
+            if status:
                 self.stop()
-                return {'status': 'aborted'}
-            if time.monotonic() >= deadline:
-                self.stop()
-                return {'status': 'timeout'}
+                done.wait(CANCEL_JOIN_S)
+                return {'status': status}
+        if self._cancel_requested or should_stop():
+            return {'status': 'aborted'}
+        if 'error' in box:
+            raise box['error']
+        return None
+
+    def _new_id(self, before, should_stop, deadline):
+        until = min(deadline, time.monotonic() + RESULT_WAIT_S)
+        while True:
             added = [i for i in self._ids() if i not in before]
             if added:
-                new = added[-1]
-                break
+                return added[-1]
+            if should_stop() or self._cancel_requested:
+                return {'status': 'aborted'}
+            if time.monotonic() >= until:
+                raise OpsError('rew_error', 'REW finished the measure command but no new measurement appeared (is a '
+                               'REW Pro licence active? see measurement.rew in docs/ops-mcp-measurement.md)')
             time.sleep(POLL_S)
-        return {'status': 'ok', 'rew_measurement_id': new, **self._fetch(new, f1, f2)}
 
     def _ids(self):
         value = self.client.call('measurements')
+        base = self.client.protocol['index_base']
         if isinstance(value, dict):
             return [str(k) for k in value]
         if isinstance(value, list):
-            return [str(item.get('id', i)) if isinstance(item, dict) else str(item) for i, item in enumerate(value)]
+            return [str(item.get('id', i)) if isinstance(item, dict) else str(item)
+                    for i, item in enumerate(value, start=base)]
         raise OpsError('rew_error', 'REW measurement list has an unexpected shape')
 
     def _fetch(self, ident, f1, f2):

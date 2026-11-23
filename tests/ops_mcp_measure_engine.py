@@ -22,7 +22,7 @@ import wave
 from pathlib import Path
 
 from garage_audio.ops_mcp import measure, room_model, tools
-from garage_audio.ops_mcp.errors import OpsError
+from garage_audio.ops_mcp.errors import ConfigError, OpsError
 
 ROOT = Path(__file__).parents[1]
 FIXTURES = Path(__file__).parent / 'fixtures/ops_mcp'
@@ -199,6 +199,20 @@ class Quality(unittest.TestCase):
                 self.assertEqual(result['verdict'], verdict)
                 self.assertEqual(room.played, [])  # the noise check plays nothing
 
+    def test_inverse_filter_is_finite_for_narrow_sweeps(self):
+        # A two-octave sweep (the narrowest allowed) and a sub-capped reference chirp leave almost no inner
+        # normalisation band; the inverse filter must still be finite (it used to be NaN: median of nothing).
+        import numpy as np
+        from garage_audio.ops_mcp import measure_math as mm
+        for f1, f2, seconds in ((60.0, 240.0, 1.0), (31.25, 250.0, 0.5), (20.0, 20000.0, 1.0)):
+            with self.subTest(band=(f1, f2)):
+                inv = mm.inverse_filter(mm.log_sweep(f1, f2, seconds, 48000, -30.0), f1, f2, seconds, 48000)
+                self.assertTrue(np.isfinite(inv).all())
+        h = sim.harness(fakes, self, room=sim.default_room(loop=(3, 1)))
+        result = tools.call(h.ctx, 'measure_sweep', {'channel': 'left', 'user_confirmed': True, 'sweep_seconds': 1.5,
+                                                     'freq_min_hz': 100.0, 'freq_max_hz': 400.0})
+        self.assertTrue(math.isfinite(result['timing']['arrival_ms']))
+
 
 @unittest.skipIf(sim is None, 'numpy (measurement extra) not installed')
 class Persistence(unittest.TestCase):
@@ -289,11 +303,16 @@ class Calibration(unittest.TestCase):
 
 
 class FakeRew:
-    """Fake REW REST API: a measurement appears a few polls after the Measure command."""
+    """Fake REW REST API. In blocking mode the measure command returns only when the measurement is
+    done (after ``measure_seconds``) or cancelled; measurements are numbered from 1."""
 
-    def __init__(self, appear_after=1, rate=48000):
-        self.calls, self.measurements, self.pending = [], [], None
-        self.appear_after, self.rate = appear_after, rate
+    def __init__(self, measure_seconds=0.05, rate=48000, as_list=False, blocking=False, existing=0,
+                 measure_command='Measure'):
+        self.calls, self.measurements = [], [str(i + 1) for i in range(existing)]
+        self.measure_seconds, self.rate, self.as_list = measure_seconds, rate, as_list
+        self.blocking, self.measure_command = blocking, measure_command
+        self.cancelled = threading.Event()
+        self.lock = threading.Lock()
 
     @staticmethod
     def floats(values):
@@ -301,17 +320,31 @@ class FakeRew:
 
     def __call__(self, method, url, body, timeout):
         path = url.split('4735', 1)[1]
-        self.calls.append((method, path, body))
-        if path == '/measurements':
-            if self.pending is not None:
-                self.pending -= 1
-                if self.pending <= 0:
-                    self.measurements.append(str(len(self.measurements) + 1))
-                    self.pending = None
-            return 200, {m: {'title': 't'} for m in self.measurements}
-        if path == '/measure/command' and body == {'command': 'Measure'}:
-            self.pending = self.appear_after
+        with self.lock:
+            self.calls.append((method, path, body))
+        if path == '/application/blocking':
+            if method == 'GET':
+                return 200, self.blocking
+            self.blocking = body
             return 200, None
+        if path == '/measurements':
+            with self.lock:
+                items = list(self.measurements)
+            return 200, ([{'title': 't'} for _ in items] if self.as_list else {m: {'title': 't'} for m in items})
+        if path == '/measure/command' and body == {'command': 'Cancel'}:
+            self.cancelled.set()
+            return 200, None
+        if path == '/measure/command' and body == {'command': self.measure_command}:
+            assert self.blocking is True, 'the measure command must run in blocking mode'
+            if self.cancelled.wait(min(self.measure_seconds, timeout)):
+                return 200, None  # cancelled: nothing stored
+            if self.measure_seconds > timeout:
+                raise OSError('timed out')
+            with self.lock:
+                self.measurements.append(str(len(self.measurements) + 1))
+            return 200, None
+        if path == '/measure/command':
+            return 400, None
         if path.endswith('/frequency-response'):
             mags = [80.0 + 3.0 * math.exp(-0.5 * (math.log2(20.0 * 2 ** (i / 48.0) / 60.0) / 0.2) ** 2)
                     for i in range(48 * 10)]
@@ -326,17 +359,25 @@ class FakeRew:
 
 @unittest.skipIf(sim is None, 'numpy (measurement extra) not installed')
 class RewBackend(unittest.TestCase):
-    def make(self, rew):
-        h = sim.harness(fakes, self, measurement={'backend': 'rew', 'rew': {'url': 'http://127.0.0.1:4735'}})
+    def make(self, rew, **rew_config):
+        h = sim.harness(fakes, self, measurement={'backend': 'rew',
+                                                  'rew': {'url': 'http://127.0.0.1:4735', **rew_config}})
         h.ctx.measure_capture = None
         h.ctx.rew_transport = rew
         return h
 
     def test_sweep_via_rew(self):
-        rew = FakeRew()
+        rew = FakeRew(existing=2)
         h = self.make(rew)
         result = sweep(h, 'left')
         self.assertEqual(result['settings']['backend'], 'rew')
+        self.assertEqual(result['settings']['rew_measurement_id'], '3')  # 1-based: two existed before
+        self.assertIn(('GET', '/measurements/3/frequency-response', None), rew.calls)
+        # Blocking mode read first, switched on for the measure command, then restored to off.
+        blocking = [(m, b) for m, p, b in rew.calls if p == '/application/blocking']
+        self.assertEqual(blocking, [('GET', None), ('POST', True), ('POST', False)])
+        self.assertIs(rew.blocking, False)
+        self.assertTrue(any('Pro licence' in n for n in result['notes']))
         self.assertEqual(result['timing']['timing_source'], 'rew')
         self.assertAlmostEqual(result['timing']['arrival_ms'], 4.0, places=3)
         self.assertEqual(result['quality']['status'], 'warn')
@@ -351,7 +392,7 @@ class RewBackend(unittest.TestCase):
             self.assertEqual(caught.exception.code, 'not_supported')
 
     def test_rew_abort_cancels(self):
-        rew = FakeRew(appear_after=10 ** 6)
+        rew = FakeRew(measure_seconds=60)  # the blocking measure call would hang for a minute
         h = self.make(rew)
         out = {}
 
@@ -365,11 +406,48 @@ class RewBackend(unittest.TestCase):
         deadline = time.monotonic() + 5
         while measure.runtime(h.ctx).active is None and time.monotonic() < deadline:
             time.sleep(0.01)
+        while not any(b == {'command': 'Measure'} for _m, _p, b in rew.calls) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        started = time.monotonic()
         tools.call(h.ctx, 'measure_abort', {})
         worker.join(5)
         self.assertFalse(worker.is_alive())
+        self.assertLess(time.monotonic() - started, 3.0)  # did not wait for the blocking call to time out
         self.assertEqual(out.get('code'), 'measurement_aborted')
         self.assertIn(('POST', '/measure/command', {'command': 'Cancel'}), rew.calls)
+        self.assertIs(rew.blocking, False)  # restored even on abort
+
+    def test_rew_deadline_cancels_blocking_measure(self):
+        from garage_audio.ops_mcp import measure_rew
+        rew = FakeRew(measure_seconds=60, blocking=True)
+        backend = measure_rew.RewBackend(measure_rew.RewClient('http://127.0.0.1:4735', 30, rew))
+        started = time.monotonic()
+        result = backend.sweep(f1=20, f2=20000, seconds=1, rate=48000, level_dbfs=-40, title='t',
+                               should_stop=lambda: False, deadline=time.monotonic() + 0.3)
+        self.assertEqual(result, {'status': 'timeout'})
+        self.assertLess(time.monotonic() - started, 3.0)
+        self.assertIn(('POST', '/measure/command', {'command': 'Cancel'}), rew.calls)
+        self.assertIs(rew.blocking, True)  # it was on before: left on
+        self.assertEqual(rew.measurements, [])
+
+    def test_list_shaped_measurements_are_one_based(self):
+        rew = FakeRew(as_list=True, existing=1)
+        h = self.make(rew)
+        result = sweep(h, 'left')
+        self.assertEqual(result['settings']['rew_measurement_id'], '2')
+        self.assertIn(('GET', '/measurements/2/impulse-response', None), rew.calls)
+
+    def test_protocol_table_is_configurable_and_validated(self):
+        rew = FakeRew(measure_command='SweepMeasure')
+        h = self.make(rew, protocol={'command.measure': 'SweepMeasure'})
+        self.assertEqual(sweep(h, 'left')['settings']['rew_measurement_id'], '1')
+        self.assertIn(('POST', '/measure/command', {'command': 'SweepMeasure'}), rew.calls)
+        for bad in ({'path.nope': '/x'}, {'path.measurements': '/a/../b'}, {'path.frequency_response': '/m/fr'},
+                    {'path.command': 'http://elsewhere/x'}, {'command.cancel': 'Cancel; rm'}, {'index_base': 2},
+                    {'index_base': True}):
+            with self.subTest(bad=bad), self.assertRaises(ConfigError):
+                sim.harness(fakes, self, measurement={'backend': 'rew', 'rew': {'url': 'http://127.0.0.1:4735',
+                                                                                'protocol': bad}})
 
     def test_unreachable(self):
         def down(*_args):

@@ -243,10 +243,13 @@ TOOLS = [
          obj({'session_id': ID, 'seconds': {'type': 'number', 'minimum': 1, 'maximum': 10},
               'accept_noisy': {'type': 'boolean'}}), measure_session.noise_check_tool),
     Tool('measure_level_check', MEASURE, 'AUDIBLE: short test tones on one channel, starting gentle and rising in '
-         'capped steps until the target SNR or the mic headroom is reached (never above the level cap). Tell the '
-         'user first; user_confirmed=true only after they agreed.',
+         'capped steps until the target SNR or the mic headroom is reached (never above the level cap). The '
+         'confirmed level expires (limits.level_ttl_seconds) and is bound to the main volume, mute, routing, '
+         'capture device and calibration_id (default: the session\'s). Tell the user first; user_confirmed=true '
+         'only after they agreed.',
          obj({'channel': MCHANNEL, 'session_id': ID, 'user_confirmed': {'type': 'boolean'},
-              'start_level_dbfs': {'type': 'number', 'minimum': -90, 'maximum': 0}}, ['channel', 'user_confirmed']),
+              'start_level_dbfs': {'type': 'number', 'minimum': -90, 'maximum': 0},
+              'calibration_id': ID}, ['channel', 'user_confirmed']),
          measure_session.level_check_tool),
     Tool('measure_sweep', MEASURE, 'AUDIBLE: one log sweep on one channel through the stack (CamillaDSP limits '
          'apply), analysed (response, phase, group delay, arrival time, SNR, clipping), quality-checked and stored '
@@ -263,9 +266,11 @@ TOOLS = [
     Tool('measure_abort', STOP, 'Stop the running measurement now (only the player/recorder this server started). '
          'Always allowed.', obj(), measure.abort),
     Tool('measure_average', LOCAL, 'Average 2-16 stored measurements (power = level average, position independent; '
-         'vector = complex average, needs phase and time-aligned sweeps) into a new history measurement.',
+         'vector = complex average of peak-referenced phase; refused unless every input has high-confidence '
+         'loopback timing, or allow_low_confidence=true, which flags the result) into a new history measurement.',
          obj({'measurement_ids': {'type': 'array', 'items': ID, 'minItems': 2, 'maxItems': 16, 'uniqueItems': True},
-              'method': AVERAGE, 'channel': MCHANNEL, 'label': {'type': 'string', 'maxLength': 100}},
+              'method': AVERAGE, 'channel': MCHANNEL, 'label': {'type': 'string', 'maxLength': 100},
+              'allow_low_confidence': {'type': 'boolean'}},
              ['measurement_ids']), measure_session.average_tool),
     # 8 Guided measurement session ---------------------------------------------------
     Tool('measure_session_start', LOCAL, 'Start a guided multi-position measurement session from the room profile '
@@ -289,7 +294,8 @@ TOOLS = [
          measure_session.advance),
     Tool('measure_session_finish', LOCAL, 'Average the completed positions per channel (power or vector), store '
          'the averages in the measurement history and hand off to room_compare_to_target / room_propose_peq.',
-         obj({'session_id': ID, 'method': AVERAGE, 'allow_partial': {'type': 'boolean'}}, ['session_id']),
+         obj({'session_id': ID, 'method': AVERAGE, 'allow_partial': {'type': 'boolean'},
+              'allow_low_confidence': {'type': 'boolean'}}, ['session_id']),
          measure_session.finish),
     Tool('measure_session_cancel', LOCAL, 'Cancel a session (aborts its running measurement; keeps stored '
          'measurements).', obj({'session_id': ID}, ['session_id']), measure_session.cancel),

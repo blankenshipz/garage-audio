@@ -4,6 +4,7 @@ refusals and configuration that can only tighten. Synthetic only (fakes, simulat
 """
 import importlib.util
 import json
+import math
 import os
 import subprocess
 import sys
@@ -274,6 +275,259 @@ class Preflight(unittest.TestCase):
         h.ctx.measure_capture = None
         self.refused(h, 'not_implemented')
 
+    def test_music_assistant_configured_but_unreachable_fails_closed(self):
+        h = sim.harness(fakes, self)
+        h.ma.reachable = False
+        error = self.refused(h, 'ma_unreachable')
+        self.assertIn('cannot be confirmed that nothing else is playing', error.message)
+        self.assertEqual(error.details['cause'], 'ma_unreachable')
+        with self.assertRaises(OpsError) as caught:  # the level check (audible) is refused the same way
+            tools.call(h.ctx, 'measure_level_check', {'channel': 'left', 'user_confirmed': True})
+        self.assertEqual(caught.exception.code, 'ma_unreachable')
+        self.assertEqual(h.room.played, [])
+
+    def test_music_assistant_not_configured_proceeds_with_a_note(self):
+        h = sim.harness(fakes, self)
+
+        def not_configured(*_args, **_kwargs):
+            raise OpsError('ma_not_configured', 'music_assistant.token_file is not configured')
+        h.ma.call = not_configured
+        result = tools.call(h.ctx, 'measure_sweep', {'channel': 'left', 'user_confirmed': True, 'sweep_seconds': 1.5})
+        self.assertTrue(any('Music Assistant is not configured' in n for n in result['notes']))
+        self.assertEqual(len(h.room.played), 1)
+
+
+def confirm_level(h, channel, level, calibration_id=None):
+    """Record a confirmed level for ``channel`` bound to the stack as it is now (as a level check would)."""
+    _mm, stack, _notes = measure._preflight(h.ctx, channel)
+    measure.runtime(h.ctx).levels[channel] = {
+        'level_dbfs': level, 'at': h.ctx.clock(), 'reason': 'test', 'valid_for_seconds': 1800.0,
+        'snapshot': measure.level_snapshot(h.ctx, channel, stack, calibration_id)}
+
+
+def spectrum_above(play, column, freq, rate=48000):
+    """Largest spectral magnitude of ``play[:, column]`` above ``freq``, in dB relative to its maximum."""
+    import numpy as np
+    spectrum = np.abs(np.fft.rfft(play[:, column]))
+    freqs = np.fft.rfftfreq(len(play), 1 / rate)
+    return 20 * np.log10(spectrum[freqs > freq].max() / spectrum.max())
+
+
+@unittest.skipIf(sim is None, 'numpy (measurement extra) not installed')
+class AcousticReference(unittest.TestCase):
+    def harness(self, **measurement):
+        return sim.harness(fakes, self, measurement={'loopback': None, 'capture_channels': 1,
+                                                     'limits': {'sweep_level_max_dbfs': -12.0}, **measurement})
+
+    def test_unconfirmed_reference_chirp_stays_at_start_level(self):
+        # Right confirmed at -12 dBFS, left (the timing reference) never level-checked: the chirp on
+        # the left must not follow the right sweep up to -12; it stays at the gentle start level.
+        h = self.harness()
+        start = h.config.measure_policy.start_level_dbfs
+        confirm_level(h, 'right', -12.0)
+        result = tools.call(h.ctx, 'measure_sweep', {'channel': 'right', 'user_confirmed': True, 'sweep_seconds': 1.5})
+        self.assertEqual(result['settings']['level_dbfs'], -12.0)
+        peaks = h.room.played[-1]['peak_dbfs']
+        self.assertLessEqual(peaks[0], start + 0.01)       # the reference chirp on the left output
+        self.assertGreater(peaks[1], -12.5)                # the right sweep itself at its confirmed level
+
+    def test_confirmed_reference_chirp_limited_to_its_own_level(self):
+        h = self.harness()
+        confirm_level(h, 'right', -12.0)
+        confirm_level(h, 'left', -30.0)
+        tools.call(h.ctx, 'measure_sweep', {'channel': 'right', 'user_confirmed': True, 'sweep_seconds': 1.5})
+        peaks = h.room.played[-1]['peak_dbfs']
+        self.assertLessEqual(peaks[0], -30.0 + 0.01)
+        self.assertGreater(peaks[0], -31.0)
+
+    def test_expired_reference_confirmation_falls_back_to_start_level(self):
+        h = self.harness()
+        confirm_level(h, 'left', -20.0)
+        h.clock.advance(h.config.measure_policy.level_ttl_seconds + 1)
+        confirm_level(h, 'right', -12.0)
+        tools.call(h.ctx, 'measure_sweep', {'channel': 'right', 'user_confirmed': True, 'sweep_seconds': 1.5})
+        self.assertLessEqual(h.room.played[-1]['peak_dbfs'][0], h.config.measure_policy.start_level_dbfs + 0.01)
+
+
+@unittest.skipIf(sim is None, 'numpy (measurement extra) not installed')
+class SubOnlyOutputs(unittest.TestCase):
+    """The sub cap follows the outputs, not the channel name: sim map L/R/sub = 0/1/2, sum = [0, 1, 2]."""
+
+    def test_sub_only_output_detection(self):
+        def m(**cmap):
+            return {'channel_map': cmap}
+        dedicated = m(left=[0], right=[1], sub=[2], sum=[0, 1, 2])
+        self.assertEqual(measure._sub_only_outputs(dedicated), {2})
+        self.assertTrue(measure.sub_limited(dedicated, 'sum'))
+        self.assertTrue(measure.sub_limited(dedicated, 'sub'))
+        self.assertFalse(measure.sub_limited(dedicated, 'left'))
+        shared = m(left=[0], right=[1], sub=[0, 1], sum=[0, 1])  # the sub fed from the main outputs
+        self.assertEqual(measure._sub_only_outputs(shared), set())
+        self.assertFalse(measure.sub_limited(shared, 'sum'))
+        self.assertTrue(measure.sub_limited(shared, 'sub'))
+        odd = m(left=[0], right=[1, 2], sub=[2, 3], sum=[0, 3])
+        self.assertTrue(measure.sub_limited(odd, 'sum'))
+        self.assertFalse(measure.sub_limited(odd, 'right'))
+
+    def test_sum_sweep_including_the_sub_output_is_capped(self):
+        h = sim.harness(fakes, self)
+        cap = h.config.measure_policy.sub_sweep_max_hz
+        result = tools.call(h.ctx, 'measure_sweep', {'channel': 'sum', 'user_confirmed': True, 'sweep_seconds': 2})
+        self.assertEqual(result['settings']['freq_max_hz'], cap)
+        self.assertTrue(any('sum sweep upper frequency limited' in n and 'sub-only output' in n
+                            for n in result['notes']))
+        for column in (0, 1, 2):
+            with self.subTest(output=column):
+                self.assertLess(spectrum_above(h.room.last_play, column, cap * 1.5), -40)
+
+    def test_sum_without_sub_only_output_is_not_capped(self):
+        h = sim.harness(fakes, self, measurement={'channel_map': {'left': [0], 'right': [1], 'sub': [0, 1],
+                                                                  'sum': [0, 1]}})
+        result = tools.call(h.ctx, 'measure_sweep', {'channel': 'sum', 'user_confirmed': True, 'sweep_seconds': 2})
+        self.assertGreater(result['settings']['freq_max_hz'], h.config.measure_policy.sub_sweep_max_hz)
+
+    def test_level_check_tone_on_sum_and_dedicated_sub_is_low(self):
+        h = sim.harness(fakes, self)
+        cap = h.config.measure_policy.sub_sweep_max_hz
+        for channel in ('sum', 'sub'):
+            with self.subTest(channel=channel):
+                out = tools.call(h.ctx, 'measure_level_check', {'channel': channel, 'user_confirmed': True})
+                self.assertLessEqual(out['tone_hz'], cap / 2)
+                self.assertLess(spectrum_above(h.room.last_play, 2, cap * 1.5), -40)
+        left = tools.call(h.ctx, 'measure_level_check', {'channel': 'left', 'user_confirmed': True})
+        self.assertEqual(left['tone_hz'], 1000.0)
+
+    def test_timing_reference_must_not_include_a_sub_only_output(self):
+        for ref in ('sub', 'sum'):
+            with self.subTest(ref=ref), self.assertRaises(ConfigError):
+                sim.harness(fakes, self, measurement={'timing_reference': ref, 'loopback': None,
+                                                      'capture_channels': 1})
+        shared = sim.harness(fakes, self, measurement={'timing_reference': 'sum', 'loopback': None,
+                                                       'capture_channels': 1,
+                                                       'channel_map': {'left': [0], 'right': [1], 'sub': [0, 1],
+                                                                       'sum': [0, 1]}})
+        self.assertEqual(shared.config.measurement['timing_reference'], 'sum')
+
+    def test_reference_chirp_on_a_sub_only_output_is_capped(self):
+        # Defence in depth behind the configuration check: force such a reference and look at the chirp.
+        h = sim.harness(fakes, self, measurement={'loopback': None, 'capture_channels': 1})
+        h.config.measurement['timing_reference'] = 'sum'
+        cap = h.config.measure_policy.sub_sweep_max_hz
+        result = tools.call(h.ctx, 'measure_sweep', {'channel': 'right', 'user_confirmed': True, 'sweep_seconds': 1.5})
+        self.assertLessEqual(result['timing']['reference_band_hz'][1], cap)
+        self.assertTrue(math.isfinite(result['timing']['arrival_ms']))
+        self.assertIsNotNone(h.room.last_play)
+        self.assertLess(spectrum_above(h.room.last_play, 2, cap * 1.5), -40)  # output 2 carries only the chirp
+
+
+@unittest.skipIf(sim is None, 'numpy (measurement extra) not installed')
+class LevelExpiry(unittest.TestCase):
+    def setUp(self):
+        self.h = sim.harness(fakes, self, room=sim.default_room(noise_dbfs=-52.0, loop=(3, 1)))
+        self.start = self.h.config.measure_policy.start_level_dbfs
+
+    def level_check(self, **extra):
+        out = tools.call(self.h.ctx, 'measure_level_check', {'channel': 'left', 'user_confirmed': True, **extra})
+        self.assertGreater(out['chosen_level_dbfs'], self.start, out)  # the noisy room needs more than the start
+        self.assertEqual(out['confirmation']['valid_for_seconds'], self.h.config.measure_policy.level_ttl_seconds)
+        return out['chosen_level_dbfs']
+
+    def sweep_level(self, **extra):
+        out = tools.call(self.h.ctx, 'measure_sweep', {'channel': 'left', 'user_confirmed': True, 'sweep_seconds': 1.5,
+                                                       **extra})
+        return out['settings']['level_dbfs']
+
+    def refused_at(self, level, expect, **extra):
+        with self.assertRaises(OpsError) as caught:
+            self.sweep_level(level_dbfs=level, **extra)
+        self.assertEqual(caught.exception.code, 'safety_limit')
+        self.assertIn(expect, caught.exception.message)
+
+    def test_confirmation_expires(self):
+        confirmed = self.level_check()
+        self.h.clock.advance(self.h.config.measure_policy.level_ttl_seconds - 5)
+        self.assertEqual(self.sweep_level(), confirmed)
+        self.h.clock.advance(10)
+        self.assertEqual(self.sweep_level(), self.start)
+        self.refused_at(confirmed, 'expired')
+        status = tools.call(self.h.ctx, 'measure_status', {})['confirmed_levels']['left']
+        self.assertEqual(status['expires_in_seconds'], 0.0)
+
+    def test_clock_step_back_invalidates(self):
+        confirmed = self.level_check()
+        self.h.clock.advance(-60)
+        self.refused_at(confirmed, 'expired')
+
+    def test_volume_change_invalidates(self):
+        confirmed = self.level_check()
+        self.h.camilla.volume += 6.0
+        self.assertEqual(self.sweep_level(), self.start)
+        self.refused_at(confirmed, 'main_volume_db')
+        self.h.camilla.volume -= 6.0  # back to what was confirmed: valid again
+        self.assertEqual(self.sweep_level(), confirmed)
+
+    def test_dsp_routing_change_invalidates(self):
+        confirmed = self.level_check()
+        self.h.camilla.config['mixers']['to_out'] = {'channels': {'in': 2, 'out': 4}, 'mapping': []}
+        self.refused_at(confirmed, 'dsp_mixers_sha256')
+
+    def test_calibration_change_invalidates(self):
+        confirmed = self.level_check()
+        text = '"Sens Factor =-1dB, SERNO: 0000000"\n' + '\n'.join(f'{f} 0.0' for f in (20, 100, 1000, 10000, 20000))
+        cal = tools.call(self.h.ctx, 'measure_import_calibration', {'text': text, 'name': 'mic'})['calibration_id']
+        self.refused_at(confirmed, 'calibration_id', calibration_id=cal)
+        again = self.level_check(calibration_id=cal)
+        self.assertEqual(self.sweep_level(calibration_id=cal), again)
+        played = len(self.h.room.played)
+        with self.assertRaises(OpsError) as caught:  # a level check bound to an unknown calibration is refused
+            tools.call(self.h.ctx, 'measure_level_check', {'channel': 'left', 'user_confirmed': True,
+                                                           'calibration_id': cal[:-8] + ('0' * 8 if cal[-8:] != '0' * 8
+                                                                                         else '1' * 8)})
+        self.assertEqual(caught.exception.code, 'not_found')
+        self.assertEqual(len(self.h.room.played), played)  # refused before anything was played
+
+    def test_unreadable_volume_means_start_level(self):
+        confirmed = self.level_check()
+
+        def unreadable():
+            raise OpsError('camilladsp_unreachable', 'no')
+        self.h.camilla.get_volume = unreadable
+        self.refused_at(confirmed, 'could not be read')
+
+    def test_snapshot_fields_and_legacy_entries(self):
+        h = self.h
+        _mm, stack, _notes = measure._preflight(h.ctx, 'left')
+        snap = measure.level_snapshot(h.ctx, 'left', stack, None)
+        self.assertEqual(set(snap), {'main_volume_db', 'mute', 'outputs', 'dsp_mixers_sha256', 'capture_sha256',
+                                     'calibration_id'})
+        entry = {'level_dbfs': -20.0, 'at': h.ctx.clock(), 'snapshot': dict(snap)}
+        self.assertEqual(measure._confirmed_level(h.ctx, 'left', {'levels': {'left': entry}}, snap), (-20.0, None))
+        for key, value in (('outputs', [0, 2]), ('capture_sha256', 'x'), ('mute', None)):
+            with self.subTest(changed=key):
+                level, why = measure._confirmed_level(h.ctx, 'left', {'levels': {'left': entry}},
+                                                      {**snap, key: value})
+                self.assertIsNone(level)
+                self.assertIn(key, why)
+        level, why = measure._confirmed_level(h.ctx, 'left', {'levels': {'left': -20.0}}, snap)  # old session file
+        self.assertIsNone(level)
+        self.assertIn('predates', why)
+
+    def test_session_level_is_bound_too(self):
+        h = self.h
+        sid = tools.call(h.ctx, 'measure_session_start', {'positions': 4, 'channels': ['left']})['session_id']
+        tools.call(h.ctx, 'measure_session_confirm_placement', {'session_id': sid, 'position_id': 'P0'})
+        tools.call(h.ctx, 'measure_noise_check', {'session_id': sid, 'seconds': 1, 'accept_noisy': True})
+        out = tools.call(h.ctx, 'measure_level_check', {'channel': 'left', 'session_id': sid, 'user_confirmed': True})
+        stored = tools.call(h.ctx, 'measure_session_status', {'session_id': sid})['levels']['left']
+        self.assertEqual(stored['level_dbfs'], out['chosen_level_dbfs'])
+        self.assertIn('snapshot', stored)
+        measure.runtime(h.ctx).levels.clear()  # e.g. a restarted server: only the session file remains
+        h.clock.advance(h.config.measure_policy.level_ttl_seconds + 1)
+        with self.assertRaises(OpsError) as caught:
+            tools.call(h.ctx, 'measure_sweep', {'channel': 'left', 'session_id': sid, 'user_confirmed': True,
+                                                'sweep_seconds': 1.5, 'level_dbfs': out['chosen_level_dbfs']})
+        self.assertIn('expired', caught.exception.message)
+
 
 def sleeper_argv(pid_file):
     code = ('import os, sys, time\n'
@@ -417,6 +671,40 @@ class MeasurementConfig(unittest.TestCase):
         cfg = config_with({'play_argv': ['pw-play', '--target', 'stack-sink', '{file}'],
                            'record_argv': ['pw-record', '--rate', '{rate}', '--channels', '{channels}', '{file}']})
         self.assertEqual(cfg.measurement['play_argv'][0], 'pw-play')
+
+    def test_raw_alsa_names_and_bare_alsa_players_refused(self):
+        for argv in (['aplay', '-D', 'default:CARD=DAC', '{file}'], ['aplay', '-Dplug:dac', '{file}'],
+                     ['aplay', '--device=hw:1', '{file}'], ['aplay', '-D', 'plughw:1,0', '{file}'],
+                     ['aplay', '-D', 'surround51:CARD=X', '{file}'], ['aplay', '-D', 'front:CARD=X', '{file}'],
+                     ['aplay', '{file}'], ['/usr/bin/aplay', '-q', '{file}'], ['aplay', '-D', 'default', '{file}'],
+                     ['aplay', '{file}', '-D'], ['speaker-test', '-t', 'sine', '{file}'],
+                     ['pw-play', '--target', 'alsa_output.usb-dac', '{file}']):
+            with self.subTest(argv=argv), self.assertRaises(ConfigError):
+                config_with({'play_argv': argv})
+        for argv in (['aplay', '-D', 'pipewire', '{file}'], ['aplay', '--device=pulse', '{file}'],
+                     ['pw-play', '--target', 'stack-sink', '{file}']):
+            with self.subTest(argv=argv):
+                self.assertEqual(config_with({'play_argv': argv}).measurement['play_argv'][0], argv[0])
+
+    def test_list_devices_argv_only_read_only_listers(self):
+        for lists in ([['pw-play', '{file}']], [['aplay', '-l']], [['arecord', '-D', 'hw:0', 'x.wav']],
+                      [['pw-record', 'x.wav']], [['pactl', 'set-sink-volume', '@DEFAULT_SINK@', '100%']],
+                      [['wpctl', 'set-volume', '50', '1']], [['pw-cli', 'destroy', '42']], [['sh', '-c', 'ls']],
+                      [['pw-dump', '--monitor']], [['arecord', '-l', 'extra']]):
+            with self.subTest(lists=lists), self.assertRaises(ConfigError):
+                config_with({'list_devices_argv': lists})
+        ok = [['arecord', '-l'], ['arecord', '-L'], ['pw-record', '--list-targets'], ['pactl', 'list', 'sources']]
+        self.assertEqual(config_with({'list_devices_argv': ok}).measurement['list_devices_argv'], ok)
+        for lists in ([['pw-cli', 'ls', 'Node']], [['pw-dump', '-N']], [['wpctl', 'status']], [['pactl', 'info']]):
+            with self.subTest(lists=lists):
+                config_with({'list_devices_argv': lists})
+
+    def test_level_ttl_can_only_tighten(self):
+        self.assertEqual(config_with({}).measure_policy.level_ttl_seconds, 1800.0)
+        self.assertEqual(config_with({'limits': {'level_ttl_seconds': 300}}).measure_policy.level_ttl_seconds, 300.0)
+        for value in (3600, 5):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                config_with({'limits': {'level_ttl_seconds': value}})
 
     def test_channel_layout_validated(self):
         for measurement in ({'channel_map': {'left': [5]}}, {'mic_channel': 2},

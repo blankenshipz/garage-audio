@@ -6,6 +6,7 @@ import json
 import math
 import os
 import stat
+import threading
 import unittest
 from pathlib import Path
 
@@ -145,7 +146,9 @@ class Plan(unittest.TestCase):
 
 
 class Averaging(unittest.TestCase):
-    def rec(self, db, phase=None, ident='x'):
+    LOOPBACK = {'timing_source': 'loopback', 'timing_confidence': 'high'}
+
+    def rec(self, db, phase=None, ident='x', timing=LOOPBACK):
         points = []
         for i in range(97):
             f = 20.0 * 2 ** (i / 12.0)
@@ -155,7 +158,43 @@ class Averaging(unittest.TestCase):
             if phase is not None:
                 p['phase_deg'] = phase
             points.append(p)
-        return {'id': ident, 'points': points}
+        return {'id': ident, 'points': points, 'timing': timing}
+
+    def test_vector_refuses_mixed_or_low_confidence_timing(self):
+        acoustic = {'timing_source': 'acoustic_reference', 'timing_confidence': 'low'}
+        low_loop = {'timing_source': 'loopback', 'timing_confidence': 'low'}
+        cases = {'mixed sources': (self.LOOPBACK, {'timing_source': 'rew', 'timing_confidence': 'high'}),
+                 'acoustic (always low)': (acoustic, acoustic), 'low loopback': (self.LOOPBACK, low_loop),
+                 'no timing': (self.LOOPBACK, None)}
+        for name, (t1, t2) in cases.items():
+            records = [self.rec(0.0, 0.0, 'a', t1), self.rec(0.0, 5.0, 'b', t2)]
+            with self.subTest(name), self.assertRaises(OpsError) as caught:
+                measure_session.average_records(records, 'vector')
+            self.assertEqual(caught.exception.code, 'timing_low_confidence')
+            self.assertTrue(measure_session.vector_timing_issues(records))
+            # Explicit acceptance computes the average; power averaging never needs timing.
+            points, _ = measure_session.average_records(records, 'vector', allow_low_confidence=True)
+            self.assertTrue(points)
+            measure_session.average_records(records, 'power')
+        self.assertEqual(measure_session.vector_timing_issues([self.rec(0.0, 0.0), self.rec(0.0, 0.0)]), [])
+
+    def test_vector_low_confidence_result_is_flagged(self):
+        h = fakes.Harness(self)
+        acoustic = {'timing_source': 'acoustic_reference', 'timing_confidence': 'low'}
+        ids = [h.ctx.history.save({'kind': 'measurement', 'source': 'builtin_sweep', 'channel': 'left', 'label': 't',
+                                   **{k: v for k, v in self.rec(0.0, 10.0 * n, timing=acoustic).items() if k != 'id'}})['id']
+               for n in range(2)]
+        with self.assertRaises(OpsError) as caught:
+            call(h, 'measure_average', measurement_ids=ids, method='vector')
+        self.assertEqual(caught.exception.code, 'timing_low_confidence')
+        out = call(h, 'measure_average', measurement_ids=ids, method='vector', allow_low_confidence=True)
+        self.assertTrue(out['low_confidence'])
+        self.assertTrue(out['low_confidence_reasons'])
+        stored = h.ctx.history.get(out['measurement_id'])
+        self.assertTrue(stored['low_confidence'])
+        self.assertIn('LOW-CONFIDENCE', stored['notes'])
+        plain = call(h, 'measure_average', measurement_ids=ids)  # power: no flag
+        self.assertNotIn('low_confidence', plain)
 
     def test_power_average(self):
         points, spread = measure_session.average_records([self.rec(0.0), self.rec(-10.0)], 'power')
@@ -306,6 +345,51 @@ class Session(unittest.TestCase):
         self.assertTrue(partial['result']['partial'])
         self.assertEqual(partial['result']['averages']['left']['method'], 'single')
 
+    def _two_positions(self, h):
+        sid = call(h, 'measure_session_start', positions=4, channels=['left', 'right'])['session_id']
+        for pid in ('P0', 'P1'):
+            call(h, 'measure_session_confirm_placement', session_id=sid, position_id=pid)
+            call(h, 'measure_noise_check', session_id=sid, seconds=1)
+            for channel in ('left', 'right'):
+                timing = self.sweep(sid, channel)['timing']
+                self.assertEqual((timing['timing_source'], timing['timing_confidence']), ('loopback', 'high'))
+            call(h, 'measure_session_advance', session_id=sid, action='next', accept_quality=True)
+        return sid
+
+    def test_finish_vector_refuses_low_confidence_without_partial_saves(self):
+        h = self.h
+        sid = self._two_positions(h)
+        status = call(h, 'measure_session_status', session_id=sid)
+        weak = status['positions'][1]['channels']['right']['measurement_id']
+        real_get = h.ctx.history.get
+
+        def get(ident):  # one right-channel sweep with low-confidence timing (e.g. a weak loopback)
+            record = real_get(ident)
+            if ident == weak:
+                record = {**record, 'timing': {**record['timing'], 'timing_confidence': 'low'}}
+            return record
+        h.ctx.history.get = get
+        before = h.ctx.history.list(1000)
+        with self.assertRaises(OpsError) as caught:
+            call(h, 'measure_session_finish', session_id=sid, method='vector', allow_partial=True)
+        self.assertEqual(caught.exception.code, 'timing_low_confidence')
+        self.assertEqual(h.ctx.history.list(1000), before)  # left (fine) was not saved either
+        self.assertEqual(call(h, 'measure_session_status', session_id=sid)['status'], 'active')
+        flagged = call(h, 'measure_session_finish', session_id=sid, method='vector', allow_partial=True,
+                       allow_low_confidence=True)
+        averages = flagged['result']['averages']
+        self.assertNotIn('low_confidence', averages['left'])
+        self.assertTrue(averages['right']['low_confidence'])
+
+    def test_finish_vector_with_loopback_timing(self):
+        h = self.h
+        sid = self._two_positions(h)
+        finished = call(h, 'measure_session_finish', session_id=sid, method='vector', allow_partial=True)
+        for channel in ('left', 'right'):
+            with self.subTest(channel=channel):
+                self.assertEqual(finished['result']['averages'][channel]['method'], 'vector')
+                self.assertNotIn('low_confidence', finished['result']['averages'][channel])
+
     def test_quality_redo_must_be_handled(self):
         h = self.h
         h.ctx.measure_capture = sim.default_room(loop=(3, 1), disconnected=True)
@@ -322,6 +406,84 @@ class Session(unittest.TestCase):
         self.assertEqual(caught.exception.code, 'session_quality')
         again = call(h, 'measure_session_advance', session_id=sid, action='redo_position')
         self.assertEqual(again['phase'], 'await_placement')
+
+    def _ready_for_sweeps(self, h):
+        sid = call(h, 'measure_session_start', positions=4, channels=['left'])['session_id']
+        call(h, 'measure_session_confirm_placement', session_id=sid, position_id='P0')
+        call(h, 'measure_noise_check', session_id=sid, seconds=1)
+        return sid
+
+    def _paused_sweep(self, h, sid, during):
+        """Run a session sweep whose playback pauses so ``during()`` runs while it is in flight."""
+        room, inside, release = h.ctx.measure_capture, threading.Event(), threading.Event()
+
+        class Paused:
+            def __getattr__(self, name):
+                return getattr(room, name)
+
+            def play_and_record(self, **kwargs):
+                inside.set()
+                release.wait(10)
+                return room.play_and_record(**kwargs)
+
+        h.ctx.measure_capture = Paused()
+        out = {}
+
+        def run():
+            try:
+                out['result'] = self.sweep(sid, 'left')
+            except OpsError as error:
+                out['error'] = error
+        worker = threading.Thread(target=run)
+        worker.start()
+        self.assertTrue(inside.wait(10))
+        try:
+            during()
+        finally:
+            release.set()
+            worker.join(30)
+            h.ctx.measure_capture = room
+        self.assertFalse(worker.is_alive())
+        return out
+
+    def test_advance_refused_while_this_session_is_measuring(self):
+        h = self.h
+        sid = self._ready_for_sweeps(h)
+        refused = {}
+
+        def during():
+            for action in ('redo_position', 'redo_channel', 'skip_position', 'next'):
+                with self.assertRaises(OpsError) as caught:
+                    call(h, 'measure_session_advance', session_id=sid, action=action, channel='left')
+                refused[action] = caught.exception.code
+        out = self._paused_sweep(h, sid, during)
+        self.assertEqual(set(refused.values()), {'busy'}, refused)
+        self.assertEqual(out['result']['session']['phase'], 'position_review')  # attached normally
+        p0 = call(h, 'measure_session_status', session_id=sid)['positions'][0]
+        self.assertEqual(p0['channels']['left']['measurement_id'], out['result']['measurement_id'])
+
+    def test_result_discarded_when_the_step_changed_during_the_sweep(self):
+        # Another server process (its own runtime, so no in-process busy check) redoes the position while
+        # this one is sweeping: the finished sweep must not be attached to the redone position.
+        h = self.h
+        sid = self._ready_for_sweeps(h)
+        other = fakes.Harness(self, {'state_dir': str(h.state_dir)})
+        redo = {}
+
+        def during():
+            redo['view'] = tools.call(other.ctx, 'measure_session_advance', {'session_id': sid,
+                                                                             'action': 'redo_position'})
+        out = self._paused_sweep(h, sid, during)
+        self.assertEqual(redo['view']['phase'], 'await_placement')
+        result = out['result']
+        self.assertIn('not attached', result['session_note'])
+        status = call(h, 'measure_session_status', session_id=sid)
+        self.assertEqual(status['phase'], 'await_placement')  # placement and noise check still required
+        p0 = status['positions'][0]
+        self.assertEqual((p0['state'], p0['channels']), ('pending', {}))
+        h.ctx.history.get(result['measurement_id'])  # still stored in the history
+        with self.assertRaises(OpsError):
+            self.sweep(sid, 'left')
 
     def test_one_active_session_and_cancel(self):
         h = self.h

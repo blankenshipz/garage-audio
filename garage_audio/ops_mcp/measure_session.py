@@ -238,10 +238,23 @@ def confirm_placement(ctx, args):
     return _view(session)
 
 
+def _in_flight(ctx, session_id):
+    active = measure.runtime(ctx).active
+    return bool(active) and active.get('session_id') == session_id
+
+
 def advance(ctx, args):
     action = args['action']
+    if _in_flight(ctx, args['session_id']):
+        raise OpsError('busy', 'a measurement of this session is still running; wait for it to finish (or call '
+                       'measure_abort) before moving on or redoing', active=measure.runtime(ctx).active)
     with _locked(ctx) as directory:
         session = _load(directory, args['session_id'])
+        if _in_flight(ctx, args['session_id']):  # re-checked under the session lock
+            raise OpsError('busy', 'a measurement of this session is still running; wait for it to finish (or call '
+                           'measure_abort) before moving on or redoing', active=measure.runtime(ctx).active)
+        # Any step change invalidates results of measurements started before it (see _attach).
+        session['epoch'] = int(session.get('epoch', 0)) + 1
         pos = _current(session)
         state = session['positions'][pos['id']] if pos else None
         if action == 'next':
@@ -325,33 +338,40 @@ def plan_tool(ctx, args):
     return out
 
 
-def _attach(ctx, session_id, position_id, update):
-    """Re-load the session after a measurement and apply ``update`` if it is still at the same step."""
+def _attach(ctx, session_id, position_id, epoch, update):
+    """Re-load the session after a measurement and apply ``update`` only if it is still at the same step.
+
+    ``epoch`` is the session epoch captured when the measurement started; advance/redo/skip bump it,
+    so a result that finishes after such a change is never attached (no silent bypass of placement
+    confirmation or the noise check).
+    """
     with _locked(ctx) as directory:
         session = _load(directory, session_id)
         pos = _current(session)
-        if session['status'] != 'active' or pos is None or pos['id'] != position_id:
-            return None, 'the session changed while measuring (cancelled or moved on); the result was stored but ' \
-                         'not attached to the session'
+        if (session['status'] != 'active' or pos is None or pos['id'] != position_id
+                or int(session.get('epoch', 0)) != epoch):
+            return None, 'the session changed while measuring (cancelled, redone or moved on); the result was ' \
+                         'stored in the history but not attached to the session'
         update(session, session['positions'][pos['id']])
         _save(ctx, directory, session)
         return session, None
 
 
 def _begin(ctx, session_id, phases, channel=None):
+    """(session, current position, epoch) after checking the phase (and the channel)."""
     with _locked(ctx) as directory:
         session = _load(directory, session_id)
         _require(session, phases)
         if channel is not None and channel not in session['channels']:
             raise OpsError('invalid_argument', f'channel {channel!r} is not part of this session {session["channels"]}')
-        return session, _current(session)
+        return session, _current(session), int(session.get('epoch', 0))
 
 
 def noise_check_tool(ctx, args):
     sid = args.get('session_id')
     if not sid:
         return measure.noise_check(ctx, args)
-    session, pos = _begin(ctx, sid, ('await_noise_check', 'await_sweeps', 'position_review'))
+    session, pos, epoch = _begin(ctx, sid, ('await_noise_check', 'await_sweeps', 'position_review'))
     result = measure.noise_check(ctx, args, session)
     accept = bool(args.get('accept_noisy')) and result['verdict'] == 'too_noisy'
 
@@ -363,7 +383,7 @@ def noise_check_tool(ctx, args):
             state['state'] = 'measuring'
         _event(ctx, s, f"{pos['id']} noise check: {result['verdict']}" + (' (accepted by user)' if accept else ''))
 
-    updated, note = _attach(ctx, sid, pos['id'], update)
+    updated, note = _attach(ctx, sid, pos['id'], epoch, update)
     return {**result, 'session': _view(updated) if updated else None, **({'session_note': note} if note else {})}
 
 
@@ -372,15 +392,16 @@ def level_check_tool(ctx, args):
     sid = args.get('session_id')
     if not sid:
         return measure.level_check(ctx, args)
-    session, pos = _begin(ctx, sid, ('await_sweeps', 'position_review'), args['channel'])
+    session, pos, epoch = _begin(ctx, sid, ('await_sweeps', 'position_review'), args['channel'])
     result = measure.level_check(ctx, args, session)
 
     def update(s, _state):
-        if result['chosen_level_dbfs'] is not None:
-            s.setdefault('levels', {})[args['channel']] = result['chosen_level_dbfs']
+        if result.get('confirmation') is not None:
+            # The confirmation carries its time and stack snapshot: it expires and is matched at sweep time.
+            s.setdefault('levels', {})[args['channel']] = result['confirmation']
         _event(ctx, s, f"level check {args['channel']}: {result['chosen_level_dbfs']} dBFS ({result['stop_reason']})")
 
-    updated, note = _attach(ctx, sid, pos['id'], update)
+    updated, note = _attach(ctx, sid, pos['id'], epoch, update)
     return {**result, 'session': _view(updated) if updated else None, **({'session_note': note} if note else {})}
 
 
@@ -389,7 +410,7 @@ def sweep_tool(ctx, args):
     sid = args.get('session_id')
     if not sid:
         return measure.sweep(ctx, args)
-    session, pos = _begin(ctx, sid, ('await_sweeps', 'position_review'), args['channel'])
+    session, pos, epoch = _begin(ctx, sid, ('await_sweeps', 'position_review'), args['channel'])
     context = {'session_id': sid, 'position_id': pos['id'], 'calibration_id': session.get('calibration_id'),
                'levels': session.get('levels', {})}
     result = measure.sweep(ctx, args, context)
@@ -404,7 +425,7 @@ def sweep_tool(ctx, args):
         s['phase'] = 'position_review' if not _pending(s) else 'await_sweeps'
         _event(ctx, s, f"{pos['id']} sweep {channel}: {result['quality']['status']}")
 
-    updated, note = _attach(ctx, sid, pos['id'], update)
+    updated, note = _attach(ctx, sid, pos['id'], epoch, update)
     return {**result, 'session': _view(updated) if updated else None, **({'session_note': note} if note else {})}
 
 
@@ -422,8 +443,30 @@ def _unwrap_deg(values):
     return out
 
 
-def average_records(records, method='power'):
-    """Average measurement records on a common log grid. Returns (points, spread_summary)."""
+def vector_timing_issues(records):
+    """Why the timing of these records does not support a trustworthy vector average ([] = fine).
+
+    Phase in a built-in sweep is referenced to that sweep's own impulse-response peak (the arrival
+    delay is removed; see measure_math.windowed_spectrum), so a vector average assumes every capture
+    found its direct-sound peak the same way. That is only trusted for one timing method at high
+    confidence (a loopback); acoustic-reference timing is always low confidence.
+    """
+    issues = []
+    sources = {(r.get('timing') or {}).get('timing_source') for r in records}
+    if len(sources) > 1:
+        issues.append(f'the inputs mix timing sources {sorted(map(str, sources))}')
+    low = [r.get('id') for r in records if (r.get('timing') or {}).get('timing_confidence') != 'high']
+    if low:
+        issues.append(f'timing confidence is low or unknown for {low}')
+    return issues
+
+
+def average_records(records, method='power', allow_low_confidence=False):
+    """Average measurement records on a common log grid. Returns (points, spread_summary).
+
+    ``method='vector'`` refuses inputs whose timing is mixed or not high confidence unless
+    ``allow_low_confidence`` (the caller then flags the result).
+    """
     if len(records) < 2:
         raise OpsError('invalid_argument', 'averaging needs at least two measurements')
     curves = []
@@ -442,6 +485,11 @@ def average_records(records, method='power'):
         if not all('phase_deg' in p for c in curves for p in c):
             raise OpsError('invalid_argument', 'vector averaging needs phase in every measurement (built-in sweeps '
                            'have it; imported magnitude-only files do not): use method=power')
+        issues = vector_timing_issues(records)
+        if issues and not allow_low_confidence:
+            raise OpsError('timing_low_confidence', 'vector averaging needs consistent, high-confidence timing (a '
+                           'loopback) for every input: ' + '; '.join(issues) + '. Use method=power (recommended), '
+                           'or pass allow_low_confidence=true if the user accepts a flagged result.', issues=issues)
         phases = [interpolate(list(zip([p['frequency_hz'] for p in c], _unwrap_deg([p['phase_deg'] for p in c]))),
                               grid) for c in curves]
         points = []
@@ -461,13 +509,18 @@ def average_records(records, method='power'):
                     'max_std_db': round(max(spread), 2)}
 
 
-def _save_average(ctx, records, method, channel, label, extra):
-    points, spread = average_records(records, method)
+def _save_average(ctx, records, method, channel, label, extra, allow_low_confidence=False):
+    points, spread = average_records(records, method, allow_low_confidence)
+    flags = vector_timing_issues(records) if method == 'vector' else []
+    notes = f'{method} average of {len(records)} measurements'
+    if flags:
+        notes += ' (LOW-CONFIDENCE vector average accepted by the user: ' + '; '.join(flags) + ')'
+        extra = {**extra, 'low_confidence': True, 'low_confidence_reasons': flags}
     record = ctx.history.save({
         'kind': 'measurement', 'source': f'{method}_average', 'channel': channel, 'label': label[:100],
-        'distance_m': None, 'notes': f'{method} average of {len(records)} measurements', 'sha256': None,
+        'distance_m': None, 'notes': notes[:500], 'sha256': None,
         'headers': [], 'inputs': [r['id'] for r in records], 'spread': spread, **extra, 'points': points})
-    return record, spread
+    return record, spread, flags
 
 
 def average_tool(ctx, args):
@@ -480,10 +533,12 @@ def average_tool(ctx, args):
             raise OpsError('invalid_argument', f'the measurements are for different channels {sorted(map(str, channels))}; '
                            'pass channel to label the average explicitly')
         channel = channels.pop()
-    record, spread = _save_average(ctx, records, method, channel,
-                                   args.get('label') or f'{channel} {method} average ({len(records)})', {})
+    record, spread, flags = _save_average(ctx, records, method, channel,
+                                          args.get('label') or f'{channel} {method} average ({len(records)})', {},
+                                          bool(args.get('allow_low_confidence')))
     return {'measurement_id': record['id'], 'channel': channel, 'method': method, 'inputs': len(records),
             'spread': spread, 'points': len(record['points']),
+            **({'low_confidence': True, 'low_confidence_reasons': flags} if flags else {}),
             'next': 'room_compare_to_target / room_propose_peq with this measurement_id'}
 
 
@@ -501,23 +556,30 @@ def finish(ctx, args):
             raise OpsError('session_state', f'positions {remaining} are not complete; finish them or pass '
                            'allow_partial=true', remaining=remaining)
         method = args.get('method', session['average'])
-        results, main_ids = {}, {}
+        results, main_ids, per_channel = {}, {}, {}
         for channel in session['channels']:
             ids = [session['positions'][p]['channels'][channel]['measurement_id'] for p in done
                    if channel in session['positions'][p]['channels']]
             if 'P0' in done and channel in session['positions']['P0']['channels']:
                 main_ids[channel] = session['positions']['P0']['channels'][channel]['measurement_id']
-            if not ids:
-                continue
-            records = [ctx.history.get(i) for i in ids]
+            if ids:
+                per_channel[channel] = (ids, [ctx.history.get(i) for i in ids])
+        if method == 'vector' and not args.get('allow_low_confidence'):
+            # Check every channel before storing anything, so a refusal leaves no partial averages behind.
+            for _ids, records in per_channel.values():
+                if len(records) > 1:
+                    average_records(records, method)
+        for channel, (ids, records) in per_channel.items():
             if len(records) == 1:
                 results[channel] = {'measurement_id': ids[0], 'positions': 1, 'method': 'single'}
                 continue
-            record, spread = _save_average(ctx, records, method, channel,
-                                           f'{channel} session average ({len(records)} positions)',
-                                           {'session_id': session['session_id']})
+            record, spread, flags = _save_average(ctx, records, method, channel,
+                                                  f'{channel} session average ({len(records)} positions)',
+                                                  {'session_id': session['session_id']},
+                                                  bool(args.get('allow_low_confidence')))
             results[channel] = {'measurement_id': record['id'], 'positions': len(records), 'method': method,
-                                'spread': spread}
+                                'spread': spread,
+                                **({'low_confidence': True, 'low_confidence_reasons': flags} if flags else {})}
         session['result'] = {'averages': results, 'main_position_measurement_ids': main_ids,
                              'partial': bool(remaining), 'positions_used': done}
         session['status'], session['phase'] = 'finished', 'finished'

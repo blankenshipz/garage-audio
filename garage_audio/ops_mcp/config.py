@@ -76,7 +76,7 @@ DEFAULT = {
         'smoothing': '1/48',
         'retention': 100,
         'limits': {},
-        'rew': {'url': None, 'timeout_seconds': 60},
+        'rew': {'url': None, 'timeout_seconds': 60, 'protocol': {}},
         'plan': {'radius_m': 0.3, 'positions': 6},
     },
 }
@@ -84,7 +84,19 @@ MEASURE_CHANNELS = ('left', 'right', 'sub', 'sum')
 SMOOTHING = {'none': 0.0, '1/1': 1.0, '1/3': 1 / 3, '1/6': 1 / 6, '1/12': 1 / 12, '1/24': 1 / 24, '1/48': 1 / 48}
 PLACEHOLDERS = ('{file}', '{rate}', '{channels}', '{seconds}')
 # Playback must go into the stack's sink (PipeWire -> CamillaDSP), never to a raw ALSA device.
-DIRECT_DAC = re.compile(r'(?i)hw:|dmix|dsnoop|sysdefault|iec958|front:|/dev/snd/|alsa_output\.')
+DIRECT_DAC = re.compile(r'(?i)hw:|plug:|default:card=|dmix|dsnoop|sysdefault|iec958|front:|surround\d|/dev/snd/'
+                        r'|alsa_output\.')
+# ALSA players that fall back to the ALSA default device (possibly the DAC) without an explicit -D/--device.
+ALSA_PLAYERS = frozenset({'aplay', 'speaker-test'})
+# measurement.list_devices_argv: read-only listing programs only, so the "local" tool can never play.
+LISTERS = {
+    'arecord': lambda a: a in (['-l'], ['-L'], ['--list-devices'], ['--list-pcms']),
+    'pw-record': lambda a: a == ['--list-targets'],
+    'pw-cli': lambda a: 1 <= len(a) <= 2 and a[0] in ('ls', 'list-objects', 'info', 'i'),
+    'pw-dump': lambda a: len(a) <= 2 and all(x in ('-N', '--no-colors') or not x.startswith('-') for x in a),
+    'pactl': lambda a: 1 <= len(a) <= 3 and a[0] in ('list', 'info'),
+    'wpctl': lambda a: 1 <= len(a) <= 2 and a[0] in ('status', 'inspect'),
+}
 SAMPLE_RATES = (44100, 48000, 88200, 96000)
 _PLACEHOLDER = re.compile(r'\{[^{}]*\}')
 SHELLS = frozenset({'sh', 'bash', 'dash', 'zsh', 'ksh', 'fish', 'csh', 'tcsh', 'busybox', 'env', 'sudo', 'doas',
@@ -108,6 +120,18 @@ def _template(name, value, required=('{file}',)):
     return list(value)
 
 
+def _alsa_device(args):
+    """The -D/--device value of an ALSA player argv (None when absent)."""
+    for i, a in enumerate(args):
+        if a in ('-D', '--device'):
+            return args[i + 1].strip().lower() if i + 1 < len(args) else ''
+        if a.startswith('--device='):
+            return a[len('--device='):].strip().lower()
+        if a.startswith('-D'):
+            return a[2:].strip().lower()
+    return None
+
+
 def _int(name, value, low, high):
     return _number(name, value, low, high, integer=True)
 
@@ -129,8 +153,12 @@ def _measurement(data, policy):
         argv = _template('measurement.play_argv', m['play_argv'])
         if any(DIRECT_DAC.search(item) for item in argv):
             raise ConfigError('measurement.play_argv must target the stack sink that feeds CamillaDSP, never a raw '
-                              'ALSA/DAC device (hw:, plughw:, dmix, /dev/snd, alsa_output.*): the supervisor owns '
-                              'the DAC and the DSP limits must apply to measurement signals')
+                              'ALSA/DAC device (hw:, plughw:, plug:, default:CARD=, dmix, /dev/snd, alsa_output.*): '
+                              'the supervisor owns the DAC and the DSP limits must apply to measurement signals')
+        if os.path.basename(argv[0]) in ALSA_PLAYERS and _alsa_device(argv[1:]) in (None, '', 'default'):
+            raise ConfigError('measurement.play_argv runs an ALSA player without an explicit device (-D): it would '
+                              'play to the ALSA default, which may be the DAC. Name the stack sink explicitly '
+                              '(e.g. -D pipewire) or use pw-play --target <stack sink>.')
         out['play_argv'] = argv
     out['record_argv'] = None if m['record_argv'] is None else _template('measurement.record_argv', m['record_argv'])
     out['sink_check_argv'] = (None if m['sink_check_argv'] is None
@@ -139,6 +167,12 @@ def _measurement(data, policy):
     if not isinstance(lists, list) or len(lists) > 4:
         raise ConfigError('measurement.list_devices_argv must be a list of at most 4 argv lists')
     out['list_devices_argv'] = [_argv('measurement.list_devices_argv[]', item) for item in lists]
+    for item in out['list_devices_argv']:
+        check = LISTERS.get(os.path.basename(item[0]))
+        if check is None or not check(item[1:]):
+            raise ConfigError('measurement.list_devices_argv entries must be read-only device listings (arecord '
+                              '-l/-L, pw-record --list-targets, pw-cli ls/info, pw-dump, pactl list/info, wpctl '
+                              'status/inspect)', argv=item[:3])
     out['output_channels'] = _int('measurement.output_channels', m['output_channels'], 1, 8)
     out['capture_channels'] = _int('measurement.capture_channels', m['capture_channels'], 1, 8)
     out['mic_channel'] = _int('measurement.mic_channel', m['mic_channel'], 0, out['capture_channels'] - 1)
@@ -164,8 +198,12 @@ def _measurement(data, policy):
         if any(lo in chans for chans in out['channel_map'].values()):
             raise ConfigError('measurement.loopback.output_channel must not be a speaker channel in channel_map')
         out['loopback'] = {'output_channel': lo, 'capture_channel': lc}
-    if m['timing_reference'] not in out['channel_map'] or m['timing_reference'] == 'sub':
-        raise ConfigError('measurement.timing_reference must be a full-range channel present in channel_map')
+    cmap_out = out['channel_map']
+    sub_only = set(cmap_out.get('sub', ())) - set(cmap_out.get('left', ())) - set(cmap_out.get('right', ()))
+    ref = m['timing_reference']
+    if ref not in cmap_out or ref == 'sub' or set(cmap_out[ref]) & sub_only:
+        raise ConfigError('measurement.timing_reference must be a full-range channel present in channel_map '
+                          '(not the sub, and not a channel that includes a sub-only output)')
     out['timing_reference'] = m['timing_reference']
     if type(m['require_owner_ready']) is not bool:
         raise ConfigError('measurement.require_owner_ready must be true or false')
@@ -192,8 +230,14 @@ def _measurement(data, policy):
         url = url.rstrip('/')
     if out['backend'] == 'rew' and url is None:
         raise ConfigError('measurement.backend "rew" needs measurement.rew.url')
+    from .measure_rew import validate_protocol  # stdlib-only module
+    try:
+        protocol = validate_protocol(rew['protocol'])
+    except ValueError as error:
+        raise ConfigError(str(error)) from None
     out['rew'] = {'url': url, 'timeout_seconds': _number('measurement.rew.timeout_seconds',
-                                                          rew['timeout_seconds'], 5, 300)}
+                                                          rew['timeout_seconds'], 5, 300),
+                  'protocol': protocol}
     plan = m['plan']
     out['plan'] = {'radius_m': _number('measurement.plan.radius_m', plan['radius_m'], 0.1, 1.0),
                    'positions': _int('measurement.plan.positions', plan['positions'], 4, 8)}
@@ -220,7 +264,7 @@ def _merge(base, override, path=()):
         here = path + (key,)
         if key not in base:
             raise ConfigError(f"unknown configuration key {'.'.join(here)}")
-        if key in ('limits', 'channels', 'channel_map') or not isinstance(base[key], dict):
+        if key in ('limits', 'channels', 'channel_map', 'protocol') or not isinstance(base[key], dict):
             result[key] = copy.deepcopy(value) if key != 'channels' else {**base[key], **(value if isinstance(value, dict) else {'_': value})}
         else:
             result[key] = _merge(base[key], value, here)

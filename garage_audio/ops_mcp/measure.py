@@ -14,7 +14,9 @@ Safety (code-enforced; configuration can only tighten, see safety.MEASURE_HARD):
 the level of every generated signal is capped; the first level-check tone starts at a
 gentle level and rises in bounded steps, stopping at the capture headroom limit, the
 target SNR or the cap; a sweep may not be louder than the level confirmed by the level
-check (or the gentle start level); sub sweeps are band-limited; sweep length and total
+check (or the gentle start level), and a confirmation expires (TTL) and is bound to the
+main volume, mute, routing, capture device and calibration it was made with; signals on
+the sub or on any sub-only output are band-limited; sweep length and total
 audible time are bounded and enforced by a watchdog; one measurement runs at a time
 (thread lock + state-dir flock); ``measure_abort`` stops only the children this server
 started. All of it needs allow_write AND allow_measure.
@@ -22,6 +24,7 @@ started. All of it needs allow_write AND allow_measure.
 import contextlib
 import fcntl
 import hashlib
+import json
 import math
 import os
 import re
@@ -186,7 +189,7 @@ def _rew_backend(ctx):
     from .measure_rew import RewBackend, RewClient
     m = ctx.config.measurement
     transport = getattr(ctx, 'rew_transport', None)  # tests inject a fake REW here
-    return RewBackend(RewClient(m['rew']['url'], m['rew']['timeout_seconds'], transport))
+    return RewBackend(RewClient(m['rew']['url'], m['rew']['timeout_seconds'], transport, m['rew']['protocol']))
 
 
 def _preflight(ctx, channel, audible=True):
@@ -229,15 +232,23 @@ def _preflight(ctx, channel, audible=True):
     if mute is True:
         raise OpsError('stack_muted', 'CamillaDSP main output is muted. Measurement never unmutes; unmute '
                        'deliberately (dsp_set_mute) and retry.')
+    stack['mute'] = mute
     try:
         stack['main_volume_db'] = cam.get_volume()
     except OpsError:
         stack['main_volume_db'] = None
-    stack['ops_delays_ms'] = _ops_delays(cam)
+    stack['ops_delays_ms'], stack['dsp_mixers_sha256'] = _dsp_snapshot(cam)
     try:
         players = ctx.clients.ma.call('players/all')
-    except OpsError:
-        notes.append('Music Assistant not reachable: could not confirm that nothing else is playing.')
+    except OpsError as error:
+        if error.code != 'ma_not_configured':
+            # Fail closed: with Music Assistant configured but unreachable nobody can tell whether music is
+            # playing into the same sink, and a sweep must not mix with programme material.
+            raise OpsError('ma_unreachable', 'Music Assistant is configured but not reachable, so it cannot be '
+                           'confirmed that nothing else is playing; a measurement must not mix with music. Check '
+                           'Music Assistant (get_status) and retry. On a host without Music Assistant, leave '
+                           'music_assistant.token_file unset.', cause=error.code) from None
+        notes.append('Music Assistant is not configured (no token file): other playback was not checked.')
         players = []
     allowed = set(ctx.config.ma_players)
     busy = [p.get('display_name') or p.get('player_id') for p in players if isinstance(p, dict)
@@ -253,14 +264,20 @@ def _preflight(ctx, channel, audible=True):
     return mm, stack, notes
 
 
-def _ops_delays(cam):
-    """Alignment delays (ops_<channel>_delay) active while measuring, so alignment can be made absolute."""
+def _dsp_snapshot(cam):
+    """(alignment delays active while measuring, digest of the DSP mixer routing/gains).
+
+    The delays (ops_<channel>_delay) let alignment be made absolute; the mixer digest binds a
+    confirmed level to the channel routing it was measured with. Both are None if unreadable.
+    """
     try:
         config = cam.get_config()
     except OpsError:
-        return None
-    filters = (config.get('filters') or {}) if isinstance(config, dict) else {}
-    rate = (config.get('devices') or {}).get('samplerate') if isinstance(config, dict) else None
+        return None, None
+    if not isinstance(config, dict):
+        return None, None
+    filters = config.get('filters') or {}
+    rate = (config.get('devices') or {}).get('samplerate')
     out = {}
     for channel in ('left', 'right', 'sub'):
         item = filters.get(f'ops_{channel}_delay')
@@ -268,7 +285,8 @@ def _ops_delays(cam):
             out[channel] = 0.0
             continue
         out[channel] = safety.delay_ms(item.get('parameters') or {}, rate)
-    return out
+    mixers = json.dumps(config.get('mixers'), sort_keys=True, default=str)
+    return out, hashlib.sha256(mixers.encode()).hexdigest()
 
 
 @contextlib.contextmanager
@@ -345,23 +363,73 @@ def _peak_check(mm, frames, policy):
         raise SafetyError('generated signal would exceed the measurement level cap')
 
 
-def _confirmed_level(ctx, channel, session):
-    confirmed = (session or {}).get('levels', {}).get(channel)
-    if confirmed is None and channel in runtime(ctx).levels:
-        confirmed = runtime(ctx).levels[channel]['level_dbfs']
-    return confirmed
+def level_snapshot(ctx, channel, stack, calibration_id):
+    """What a confirmed level is bound to: a change of any of these needs a new level check."""
+    m = ctx.config.measurement
+    capture = json.dumps({'record_argv': m['record_argv'], 'capture': m['capture'], 'mic_channel': m['mic_channel'],
+                          'capture_channels': m['capture_channels']}, sort_keys=True)
+    return {'main_volume_db': stack.get('main_volume_db'), 'mute': stack.get('mute'),
+            'outputs': list(m['channel_map'][channel]), 'dsp_mixers_sha256': stack.get('dsp_mixers_sha256'),
+            'capture_sha256': hashlib.sha256(capture.encode()).hexdigest(), 'calibration_id': calibration_id}
 
 
-def _allowed_level(ctx, channel, session):
+def _snapshot_usable(snapshot):
+    return snapshot.get('main_volume_db') is not None and snapshot.get('dsp_mixers_sha256') is not None
+
+
+def _confirmed_level(ctx, channel, session, snapshot):
+    """(level, None) for a level check that is still valid for ``snapshot``, else (None, why not).
+
+    A confirmation is valid for policy.level_ttl_seconds and only while the main volume, mute,
+    channel outputs, DSP mixer routing, capture device and calibration are unchanged.
+    """
+    ttl = ctx.config.measure_policy.level_ttl_seconds
+    now = ctx.clock()
+    why = 'no level check yet'
+    for entry in ((session or {}).get('levels', {}).get(channel), runtime(ctx).levels.get(channel)):
+        if entry is None:
+            continue
+        if not isinstance(entry, dict) or not isinstance(entry.get('snapshot'), dict):
+            why = 'the level check predates expiry tracking; run it again'
+            continue
+        age = now - float(entry.get('at', 0.0))
+        if not 0.0 <= age <= ttl:
+            why = f'the level check expired (valid for {ttl:g} s)'
+            continue
+        if not _snapshot_usable(snapshot):
+            why = 'the DSP main volume or configuration could not be read, so the level check cannot be matched'
+            continue
+        changed = sorted(k for k in snapshot if entry['snapshot'].get(k) != snapshot[k])
+        if changed:
+            why = f'the level check no longer matches the stack (changed: {", ".join(changed)})'
+            continue
+        return float(entry['level_dbfs']), None
+    return None, why
+
+
+def _allowed_level(ctx, channel, session, snapshot):
     policy = ctx.config.measure_policy
-    confirmed = _confirmed_level(ctx, channel, session)
+    confirmed, why = _confirmed_level(ctx, channel, session, snapshot)
     if confirmed is None:
-        return policy.start_level_dbfs, 'start_level (no level check yet)'
-    return min(float(confirmed), policy.sweep_level_max_dbfs), 'level_check'
+        return policy.start_level_dbfs, f'start_level ({why})'
+    return min(confirmed, policy.sweep_level_max_dbfs), 'level_check'
 
 
-def _tone_freq(channel, policy):
-    return min(60.0, policy.sub_sweep_max_hz / 2.0) if channel == 'sub' else 1000.0
+def _sub_only_outputs(m):
+    cmap = m['channel_map']
+    mains = set(cmap.get('left', ())) | set(cmap.get('right', ()))
+    return set(cmap.get('sub', ())) - mains
+
+
+def sub_limited(m, channel):
+    """True when the sub frequency cap applies to ``channel``: the sub itself, or any channel whose
+    outputs include a sub-only output (mapped to the sub and to neither main), e.g. a sum that
+    includes a dedicated sub input."""
+    return channel == 'sub' or bool(set(m['channel_map'].get(channel, ())) & _sub_only_outputs(m))
+
+
+def _tone_freq(m, channel, policy):
+    return min(60.0, policy.sub_sweep_max_hz / 2.0) if sub_limited(m, channel) else 1000.0
 
 
 # ---- noise floor -----------------------------------------------------------------------
@@ -413,8 +481,12 @@ def level_check(ctx, args, session=None):
         raise SafetyError(f'start_level_dbfs={start} is above the gentle start level {policy.start_level_dbfs}',
                           maximum=policy.start_level_dbfs)
     mm, stack, notes = _preflight(ctx, channel)
+    cal_id = args.get('calibration_id') or (session or {}).get('calibration_id')
+    if cal_id:
+        get_calibration(ctx, cal_id)  # must exist: the confirmation is bound to it
+    snapshot = level_snapshot(ctx, channel, stack, cal_id)
     rate = m['sample_rate']
-    freq = _tone_freq(channel, policy)
+    freq = _tone_freq(m, channel, policy)
     chans = m['channel_map'][channel]
     lead = int(LEAD_S * rate)
     length = lead + int(TONE_SECONDS * rate) + int(0.05 * rate)
@@ -463,10 +535,15 @@ def level_check(ctx, args, session=None):
             level = min(policy.sweep_level_max_dbfs, round(level + increase, 2))
     if chosen is None:
         chosen = steps[-1]['level_dbfs'] if steps else None
+    confirmation = None
     if chosen is not None:
         chosen = round(min(chosen, policy.sweep_level_max_dbfs), 2)
-        rt = runtime(ctx)
-        rt.levels[channel] = {'level_dbfs': chosen, 'at': round(ctx.clock(), 3), 'reason': reason}
+        confirmation = {'level_dbfs': chosen, 'at': round(ctx.clock(), 3), 'reason': reason,
+                        'valid_for_seconds': policy.level_ttl_seconds, 'snapshot': snapshot}
+        runtime(ctx).levels[channel] = confirmation
+        if not _snapshot_usable(snapshot):
+            notes.append('The DSP main volume or configuration could not be read: this level check cannot be '
+                         'matched later, so sweeps stay at the start level until it can.')
     last = steps[-1] if steps else {}
     ok = reason in ('target_snr', 'capture_headroom') or (reason == 'level_cap' and last.get('snr_db', 0) >= m['min_snr_db'])
     advice = {
@@ -482,7 +559,10 @@ def level_check(ctx, args, session=None):
     }[reason]
     return {'channel': channel, 'tone_hz': freq, 'chosen_level_dbfs': chosen, 'stop_reason': reason, 'ok': ok,
             'advice': advice, 'steps': steps, 'target_snr_db': target, 'level_cap_dbfs': policy.sweep_level_max_dbfs,
-            'stack': stack, 'notes': notes}
+            'confirmation': confirmation, 'stack': stack, 'notes': notes,
+            'expiry': (f'The confirmed level is valid for {policy.level_ttl_seconds:g} s and only while the main '
+                       'volume, mute, channel routing, capture device and calibration stay unchanged; otherwise '
+                       'sweeps fall back to the start level until the level check is repeated.')}
 
 
 # ---- sweep -----------------------------------------------------------------------------
@@ -497,8 +577,10 @@ def _sweep_range(ctx, channel, args):
     if f2 > top:
         raise SafetyError(f'freq_max_hz={f2} is above the sweep ceiling {top} Hz', maximum=top)
     limited = None
-    if channel == 'sub' and f2 > policy.sub_sweep_max_hz:
-        f2, limited = policy.sub_sweep_max_hz, f'sub sweep upper frequency limited to {policy.sub_sweep_max_hz} Hz'
+    if sub_limited(m, channel) and f2 > policy.sub_sweep_max_hz:
+        f2 = policy.sub_sweep_max_hz
+        limited = (f'{channel} sweep upper frequency limited to {policy.sub_sweep_max_hz} Hz'
+                   + ('' if channel == 'sub' else ' (its outputs include a sub-only output)'))
     if f2 < 4 * f1:
         raise OpsError('invalid_argument', 'the sweep must span at least two octaves')
     seconds = float(args.get('sweep_seconds', m['sweep_seconds']))
@@ -514,17 +596,20 @@ def sweep(ctx, args, session=None):
     channel = args['channel']
     m, policy = ctx.config.measurement, ctx.config.measure_policy
     f1, f2, seconds, limited = _sweep_range(ctx, channel, args)
-    allowed, basis = _allowed_level(ctx, channel, session)
+    if 'level_dbfs' in args:
+        safety.check_measure_level(policy, float(args['level_dbfs']))
+    smoothing = args.get('smoothing', m['smoothing'])
+    cal_id = args.get('calibration_id') or session.get('calibration_id')
+    cal = get_calibration(ctx, cal_id) if cal_id else None
+    mm, stack, notes = _preflight(ctx, channel)
+    # The confirmed level is matched against the stack as it is now (volume, routing, capture, calibration).
+    allowed, basis = _allowed_level(ctx, channel, session, level_snapshot(ctx, channel, stack, cal_id))
     level = float(args.get('level_dbfs', allowed))
     safety.check_measure_level(policy, level)
     if level > allowed + 1e-9:
         raise SafetyError(f'level_dbfs={level} is above the level allowed for {channel} ({allowed} dBFS, from '
                           f'{basis}); run measure_level_check first: it raises the level stepwise within the cap',
                           maximum=allowed)
-    smoothing = args.get('smoothing', m['smoothing'])
-    cal_id = args.get('calibration_id') or session.get('calibration_id')
-    cal = get_calibration(ctx, cal_id) if cal_id else None
-    mm, stack, notes = _preflight(ctx, channel)
     if limited:
         notes.append(limited)
     if m['backend'] == 'rew':
@@ -540,13 +625,18 @@ def sweep(ctx, args, session=None):
     if loop:
         placements.append((lead, sw, chans + [loop['output_channel']]))
     elif channel != ref_channel:
-        # The chirp is never louder than the target sweep, nor than the reference speaker's confirmed level.
-        ref_confirmed = _confirmed_level(ctx, ref_channel, session)
-        ref_level = level if ref_confirmed is None else min(level, float(ref_confirmed))
-        top = min(REF_BAND_HZ[1], policy.sweep_max_hz, 0.48 * rate)
-        rsw = mm.log_sweep(REF_BAND_HZ[0], top, REF_SECONDS, rate, ref_level)
-        ref = {'start': lead, 'sweep': rsw, 'inverse': mm.inverse_filter(rsw, REF_BAND_HZ[0], top, REF_SECONDS, rate),
-               'level_dbfs': ref_level}
+        # The chirp is never louder than the target sweep, nor than the reference speaker's own (still valid)
+        # confirmed level; without one it is held at the gentle start level.
+        ref_confirmed, _why = _confirmed_level(ctx, ref_channel, session,
+                                               level_snapshot(ctx, ref_channel, stack, cal_id))
+        ref_level = min(level, policy.start_level_dbfs if ref_confirmed is None else ref_confirmed)
+        ref_lo, top = REF_BAND_HZ[0], min(REF_BAND_HZ[1], policy.sweep_max_hz, 0.48 * rate)
+        if sub_limited(m, ref_channel):  # defence in depth: configuration refuses such a timing reference
+            top = min(top, policy.sub_sweep_max_hz)
+            ref_lo = min(ref_lo, top / 8.0)  # keeps a usable inverse-filter band (2*lo .. top/2)
+        rsw = mm.log_sweep(ref_lo, top, REF_SECONDS, rate, ref_level)
+        ref = {'start': lead, 'sweep': rsw, 'inverse': mm.inverse_filter(rsw, ref_lo, top, REF_SECONDS, rate),
+               'level_dbfs': ref_level, 'band_hz': [ref_lo, top]}
         placements.append((lead, rsw, list(m['channel_map'][ref_channel])))
         main_start = lead + len(rsw) + int(REF_GAP_S * rate)
         placements.append((main_start, sw, chans))
@@ -573,6 +663,7 @@ def sweep(ctx, args, session=None):
     elif ref is not None:
         result['timing']['reference_channel'] = ref_channel
         result['timing']['reference_level_dbfs'] = round(ref['level_dbfs'], 2)
+        result['timing']['reference_band_hz'] = [round(f, 2) for f in ref['band_hz']]
     grid = [float(f) for f in result['grid']]
     mags = [float(d) for d in result['magnitude_db']]
     if cal is not None:
@@ -876,6 +967,9 @@ def _rew_sweep(ctx, args, session, channel, f1, f2, seconds, level, smoothing, c
             result = backend.sweep(f1=f1, f2=f2, seconds=seconds, rate=m['sample_rate'], level_dbfs=level,
                                    title=args.get('label') or f'ops {channel}', should_stop=rt.should_stop,
                                    deadline=time.monotonic() + policy.max_duration_seconds)
+    notes.extend(backend.notes)
+    notes.append('REW API names used here are unverified against a live REW (measurement.rew.protocol overrides '
+                 'them); automated REW sweeps need a REW Pro licence.')
     if result['status'] != 'ok':
         _stopped(result['status'])
     grid, mags = result['grid'], result['magnitude_db']
@@ -895,12 +989,17 @@ def _rew_sweep(ctx, args, session, channel, f1, f2, seconds, level, smoothing, c
 def status(ctx, _args):
     m = ctx.config.measurement
     rt = runtime(ctx)
+    ttl, now = ctx.config.measure_policy.level_ttl_seconds, ctx.clock()
+    levels = {c: {'level_dbfs': v['level_dbfs'], 'reason': v.get('reason'),
+                  'expires_in_seconds': round(max(0.0, v['at'] + ttl - now), 1),
+                  'note': 'also invalid once volume, mute, routing, capture or calibration change'}
+              for c, v in rt.levels.items()}
     return {'allow_write': ctx.config.allow_write, 'allow_measure': ctx.config.allow_measure,
             'extra': extra_status(), 'backend': m['backend'], 'capture': m['capture'],
             'player_configured': bool(m['play_argv']), 'recorder_configured': bool(m['record_argv']),
             'channels': sorted(m['channel_map']), 'loopback': m['loopback'], 'timing_reference': m['timing_reference'],
             'limits': ctx.config.measure_policy.as_dict(), 'active': rt.active,
-            'confirmed_levels': dict(rt.levels), 'target_snr_db': m['target_snr_db'], 'min_snr_db': m['min_snr_db'],
+            'confirmed_levels': levels, 'target_snr_db': m['target_snr_db'], 'min_snr_db': m['min_snr_db'],
             'how_it_plays': 'player argv -> stack sink (PipeWire) -> CamillaDSP (limits, crossover, volume ceiling) '
                             '-> DAC owned by the supervisor-managed stack'}
 
