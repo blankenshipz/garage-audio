@@ -128,7 +128,7 @@ Without it the server starts and every other tool works; `measure_noise_check`,
 | `measurement.smoothing` | `1/48` | Stored response smoothing (`none`, `1/1` … `1/48`); `measure_get` can re-smooth |
 | `measurement.retention` | `100` | Measurement file sets kept (oldest removed first) |
 | `measurement.limits.*` | see below | Safety limits; can only be tightened |
-| `measurement.rew.url` / `.timeout_seconds` | `null` / `60` | REW API (loopback `http://127.0.0.1:4735` by default) |
+| `measurement.rew.url` / `.timeout_seconds` | `null` / `60` | REW API base URL, e.g. `http://127.0.0.1:4735` (no credentials, path or query) |
 | `measurement.plan.radius_m` / `.positions` | `0.3` / `6` | Default plan pattern (4–8 positions) |
 
 Example with PipeWire tools (placeholders; find the names with `measure_list_devices`):
@@ -184,8 +184,9 @@ Further rules:
 * **Max duration and watchdog:** an action whose planned audible time exceeds
   `max_duration_seconds` is refused before anything plays; a watchdog stops the children if
   they overrun it by more than 5 s (`measurement_timeout`).
-* **Abort:** `measure_abort` stops the player and recorder **this server started** (their
-  process groups), never any other process. From another server process sharing the same
+* **Abort:** `measure_abort` stops the player and recorder processes **this server started**
+  (signalled through their process handles, so a reused pid is never hit), never any other
+  process. From another server process sharing the same
   `state_dir`, it signals the running one through a file in `state_dir`. An aborted
   measurement returns `measurement_aborted`; its files are discarded.
 
@@ -259,7 +260,9 @@ with a crawl). It also accepts what-if dimensions without storing them.
 ## REW backend (optional, default off)
 
 `measurement.backend = "rew"` drives REW 5.40+ through its REST API
-(`measurement.rew.url`, loopback by default) for `measure_sweep`; results are stored the same
+(`measurement.rew.url`, unset by default; normally `http://127.0.0.1:4735` on the same machine.
+The REW API has no authentication, so only point it at a REW on a host and network you
+control) for `measure_sweep`; results are stored the same
 way (`timing_source=rew`). REW plays through the output device configured **inside REW**;
 that must be the stack sink, never the DAC. The server cannot verify REW's routing and says
 so in every result. Noise and level checks are not available through this backend

@@ -425,9 +425,13 @@ class MeasurementConfig(unittest.TestCase):
             with self.subTest(m=measurement), self.assertRaises(ConfigError):
                 config_with(measurement)
 
-    def test_rew_url_must_be_local_by_default(self):
-        with self.assertRaises(ConfigError):
-            config_with({'backend': 'rew', 'rew': {'url': 'ftp://127.0.0.1:4735'}})
+    def test_rew_url_validated_and_default_off(self):
+        self.assertIsNone(DEFAULT['measurement']['rew']['url'])
+        for url in ('ftp://127.0.0.1:4735', 'http://user:pw@127.0.0.1:4735', 'http://127.0.0.1:4735/api?x=1'):
+            with self.subTest(url=url), self.assertRaises(ConfigError):
+                config_with({'backend': 'rew', 'rew': {'url': url}})
+        with self.assertRaises(ConfigError):  # the rew backend needs a URL
+            config_with({'backend': 'rew'})
         cfg = config_with({'backend': 'rew', 'rew': {'url': 'http://127.0.0.1:4735'}})
         self.assertEqual(cfg.measurement['backend'], 'rew')
 

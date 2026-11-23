@@ -125,6 +125,19 @@ class SyntheticRecovery(unittest.TestCase):
         with self.assertRaises(OpsError):
             tools.call(h.ctx, 'room_propose_alignment', {'measurement_ids': ids, 'distances_m': {'left': 2.0}})
 
+    def test_acoustic_alignment_removes_active_dsp_delay(self):
+        h = sim.harness(fakes, self, measurement={'loopback': None, 'capture_channels': 1})
+        # 2.0 ms of ops delay is active on the right channel (the reference is the left speaker).
+        h.camilla.config['filters']['ops_right_delay'] = {'type': 'Delay', 'parameters': {'delay': 2.0, 'unit': 'ms'}}
+        h.room.speakers[1].delay_ms = 3.6 + 2.0
+        ids = [sweep(h, ch, sweep_seconds=2)['measurement_id'] for ch in ('left', 'right')]
+        proposal = tools.call(h.ctx, 'room_propose_alignment', {'measurement_ids': ids})
+        self.assertEqual(proposal['delay_method'], 'measured_acoustic_reference')
+        self.assertEqual(proposal['timing']['timing_confidence'], 'low')
+        self.assertIn('LOW', proposal['note'])
+        self.assertAlmostEqual(proposal['delay_ms']['left'], 0.6, delta=DELAY_TOL_MS)
+        self.assertAlmostEqual(proposal['delay_ms']['right'], 0.0, delta=DELAY_TOL_MS)
+
     def test_mixed_timing_sources_are_refused(self):
         h = sim.harness(fakes, self)
         loop_id = sweep(h, 'left')['measurement_id']
