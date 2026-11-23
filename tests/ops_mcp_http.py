@@ -129,8 +129,11 @@ class Http(unittest.TestCase):
         listed = self.post(rpc('tools/list', ident=2), **{'mcp-protocol-version': '2025-06-18'})
         self.assertEqual(listed.status_code, 200, listed.text)
         names = {t['name']: t for t in listed.json()['result']['tools']}
-        self.assertEqual(len(names), 37)
+        self.assertEqual(len(names), 57)
         self.assertFalse(names['dsp_set_main_volume']['_meta']['garage-audio/enabled'])
+        self.assertFalse(names['measure_sweep']['_meta']['garage-audio/enabled'])
+        self.assertTrue(names['measure_sweep']['annotations']['destructiveHint'])
+        self.assertTrue(names['measure_abort']['_meta']['garage-audio/enabled'])
         status = self.post(rpc('tools/call', {'name': 'get_status', 'arguments': {}}, 3),
                            **{'mcp-protocol-version': '2025-06-18'}).json()['result']
         self.assertFalse(status['isError'])
@@ -144,9 +147,9 @@ class Http(unittest.TestCase):
         self.assertNotIn('validate', self.h.camilla.events)
         self.assertFalse([e for e in self.h.camilla.events if isinstance(e, tuple)])
         resources = self.post(rpc('resources/list', ident=5), **{'mcp-protocol-version': '2025-06-18'})
-        self.assertEqual(len(resources.json()['result']['resources']), 3)
+        self.assertEqual(len(resources.json()['result']['resources']), 6)
         prompts = self.post(rpc('prompts/list', ident=6), **{'mcp-protocol-version': '2025-06-18'})
-        self.assertEqual(len(prompts.json()['result']['prompts']), 3)
+        self.assertEqual(len(prompts.json()['result']['prompts']), 4)
 
     def test_foreign_host_header_rejected(self):
         response = self.post(INIT, host='attacker.example.invalid')

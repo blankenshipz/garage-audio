@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from .errors import ConfigError
-from .safety import build_policy
+from .safety import build_measure_policy, build_policy
 
 ENV_PREFIX = 'GARAGE_OPS_MCP_'
 UNIT_PATTERN = re.compile(r'^[A-Za-z0-9@._:-]{1,128}\.service$')
@@ -52,10 +52,156 @@ DEFAULT = {
                         'freq_max_hz': 300.0, 'smoothing_octaves': 1 / 6,
                         'tilt_db_per_octave': 0.0, 'bass_shelf_db': 0.0, 'bass_shelf_hz': 100.0,
                         'tolerance_db': 1.0, 'sample_rate': 48000, 'history_retention': 200},
+    'allow_measure': False,
+    'measurement': {
+        'backend': 'builtin',          # builtin | rew
+        'capture': 'process',          # process | phone (design stub, not implemented)
+        'sample_rate': 48000,
+        'play_argv': None,             # e.g. ["pw-play", "--target", "<sink>", "{file}"]
+        'record_argv': None,           # e.g. ["pw-record", "--target", "<mic>", "--channels", "{channels}", "{file}"]
+        'sink_check_argv': None,       # optional read-only probe that exits 0 when the sink exists
+        'list_devices_argv': [['arecord', '-l'], ['pw-record', '--list-targets']],
+        'output_channels': 2,
+        'channel_map': {'left': [0], 'right': [1], 'sub': [0, 1], 'sum': [0, 1]},
+        'capture_channels': 1,
+        'mic_channel': 0,
+        'loopback': None,              # {"output_channel": N, "capture_channel": M}
+        'timing_reference': 'left',
+        'require_owner_ready': True,
+        'sweep_seconds': 6.0,
+        'sweep_min_hz': 20.0,
+        'sweep_max_hz': 20000.0,
+        'target_snr_db': 35.0,
+        'min_snr_db': 20.0,
+        'smoothing': '1/48',
+        'retention': 100,
+        'limits': {},
+        'rew': {'url': None, 'timeout_seconds': 60},
+        'plan': {'radius_m': 0.3, 'positions': 6},
+    },
 }
+MEASURE_CHANNELS = ('left', 'right', 'sub', 'sum')
+SMOOTHING = {'none': 0.0, '1/1': 1.0, '1/3': 1 / 3, '1/6': 1 / 6, '1/12': 1 / 12, '1/24': 1 / 24, '1/48': 1 / 48}
+PLACEHOLDERS = ('{file}', '{rate}', '{channels}', '{seconds}')
+# Playback must go into the stack's sink (PipeWire -> CamillaDSP), never to a raw ALSA device.
+DIRECT_DAC = re.compile(r'(?i)hw:|dmix|dsnoop|sysdefault|iec958|front:|/dev/snd/|alsa_output\.')
+SAMPLE_RATES = (44100, 48000, 88200, 96000)
+_PLACEHOLDER = re.compile(r'\{[^{}]*\}')
+SHELLS = frozenset({'sh', 'bash', 'dash', 'zsh', 'ksh', 'fish', 'csh', 'tcsh', 'busybox', 'env', 'sudo', 'doas',
+                    'su', 'xargs', 'nohup', 'setsid', 'ssh'})
+
+
+def _template(name, value, required=('{file}',)):
+    """A measurement argv template: no shell, only known placeholders, required ones present."""
+    if (not isinstance(value, list) or not 1 <= len(value) <= 16
+            or not all(isinstance(v, str) and v and '\x00' not in v and len(v) <= 256 for v in value)):
+        raise ConfigError(f'{name} must be a non-empty argv list of strings (no shell)')
+    if os.path.basename(value[0]) in SHELLS:
+        raise ConfigError(f'{name} must run the player/recorder directly, not through a shell, env or sudo')
+    joined = '\n'.join(value)
+    unknown = sorted(set(_PLACEHOLDER.findall(joined)) - set(PLACEHOLDERS))
+    if unknown:
+        raise ConfigError(f'{name} uses unknown placeholder(s) {unknown}; allowed: {list(PLACEHOLDERS)}')
+    for item in required:
+        if item not in joined:
+            raise ConfigError(f'{name} must contain {item}')
+    return list(value)
+
+
+def _int(name, value, low, high):
+    return _number(name, value, low, high, integer=True)
+
+
+def _measurement(data, policy):
+    """Validated measurement section (see docs/ops-mcp-measurement.md)."""
+    m = data
+    out = {}
+    if m['backend'] not in ('builtin', 'rew'):
+        raise ConfigError('measurement.backend must be "builtin" or "rew"')
+    if m['capture'] not in ('process', 'phone'):
+        raise ConfigError('measurement.capture must be "process" or "phone"')
+    out['backend'], out['capture'] = m['backend'], m['capture']
+    if m['sample_rate'] not in SAMPLE_RATES or isinstance(m['sample_rate'], bool):
+        raise ConfigError(f'measurement.sample_rate must be one of {list(SAMPLE_RATES)}')
+    out['sample_rate'] = m['sample_rate']
+    out['play_argv'] = None
+    if m['play_argv'] is not None:
+        argv = _template('measurement.play_argv', m['play_argv'])
+        if any(DIRECT_DAC.search(item) for item in argv):
+            raise ConfigError('measurement.play_argv must target the stack sink that feeds CamillaDSP, never a raw '
+                              'ALSA/DAC device (hw:, plughw:, dmix, /dev/snd, alsa_output.*): the supervisor owns '
+                              'the DAC and the DSP limits must apply to measurement signals')
+        out['play_argv'] = argv
+    out['record_argv'] = None if m['record_argv'] is None else _template('measurement.record_argv', m['record_argv'])
+    out['sink_check_argv'] = (None if m['sink_check_argv'] is None
+                              else _template('measurement.sink_check_argv', m['sink_check_argv'], required=()))
+    lists = m['list_devices_argv']
+    if not isinstance(lists, list) or len(lists) > 4:
+        raise ConfigError('measurement.list_devices_argv must be a list of at most 4 argv lists')
+    out['list_devices_argv'] = [_argv('measurement.list_devices_argv[]', item) for item in lists]
+    out['output_channels'] = _int('measurement.output_channels', m['output_channels'], 1, 8)
+    out['capture_channels'] = _int('measurement.capture_channels', m['capture_channels'], 1, 8)
+    out['mic_channel'] = _int('measurement.mic_channel', m['mic_channel'], 0, out['capture_channels'] - 1)
+    cmap = m['channel_map']
+    if not isinstance(cmap, dict) or not cmap or set(cmap) - set(MEASURE_CHANNELS):
+        raise ConfigError(f'measurement.channel_map keys must be among {list(MEASURE_CHANNELS)}')
+    out['channel_map'] = {}
+    for key, value in cmap.items():
+        if (not isinstance(value, list) or not value or len(set(value)) != len(value)
+                or not all(type(v) is int and 0 <= v < out['output_channels'] for v in value)):
+            raise ConfigError(f'measurement.channel_map.{key} must be a non-empty list of distinct output '
+                              f'channel indexes below {out["output_channels"]}')
+        out['channel_map'][key] = list(value)
+    loop = m['loopback']
+    out['loopback'] = None
+    if loop is not None:
+        if not isinstance(loop, dict) or set(loop) != {'output_channel', 'capture_channel'}:
+            raise ConfigError('measurement.loopback must be null or {"output_channel": N, "capture_channel": M}')
+        lo = _int('measurement.loopback.output_channel', loop['output_channel'], 0, out['output_channels'] - 1)
+        lc = _int('measurement.loopback.capture_channel', loop['capture_channel'], 0, out['capture_channels'] - 1)
+        if lc == out['mic_channel']:
+            raise ConfigError('measurement.loopback.capture_channel must differ from mic_channel')
+        if any(lo in chans for chans in out['channel_map'].values()):
+            raise ConfigError('measurement.loopback.output_channel must not be a speaker channel in channel_map')
+        out['loopback'] = {'output_channel': lo, 'capture_channel': lc}
+    if m['timing_reference'] not in out['channel_map'] or m['timing_reference'] == 'sub':
+        raise ConfigError('measurement.timing_reference must be a full-range channel present in channel_map')
+    out['timing_reference'] = m['timing_reference']
+    if type(m['require_owner_ready']) is not bool:
+        raise ConfigError('measurement.require_owner_ready must be true or false')
+    out['require_owner_ready'] = m['require_owner_ready']
+    out['sweep_seconds'] = _number('measurement.sweep_seconds', m['sweep_seconds'], 0.5, policy.sweep_seconds_max)
+    out['sweep_min_hz'] = _number('measurement.sweep_min_hz', m['sweep_min_hz'], policy.sweep_min_hz, 1000)
+    out['sweep_max_hz'] = _number('measurement.sweep_max_hz', m['sweep_max_hz'], 1000,
+                                  min(policy.sweep_max_hz, 0.48 * out['sample_rate']))
+    if out['sweep_min_hz'] * 4 > out['sweep_max_hz']:
+        raise ConfigError('measurement sweep range must span at least two octaves')
+    out['target_snr_db'] = _number('measurement.target_snr_db', m['target_snr_db'], 10, 80)
+    out['min_snr_db'] = _number('measurement.min_snr_db', m['min_snr_db'], 6, out['target_snr_db'])
+    if m['smoothing'] not in SMOOTHING:
+        raise ConfigError(f'measurement.smoothing must be one of {list(SMOOTHING)}')
+    out['smoothing'] = m['smoothing']
+    out['retention'] = _int('measurement.retention', m['retention'], 1, 1000)
+    rew = m['rew']
+    url = rew['url']
+    if url is not None:
+        parts = urlsplit(url) if isinstance(url, str) else None
+        if (parts is None or parts.scheme not in ('http', 'https') or not parts.hostname or parts.username
+                or parts.password or parts.query or parts.fragment or parts.path not in ('', '/')):
+            raise ConfigError('measurement.rew.url must be http(s)://host[:port] without credentials, path or query')
+        url = url.rstrip('/')
+    if out['backend'] == 'rew' and url is None:
+        raise ConfigError('measurement.backend "rew" needs measurement.rew.url')
+    out['rew'] = {'url': url, 'timeout_seconds': _number('measurement.rew.timeout_seconds',
+                                                          rew['timeout_seconds'], 5, 300)}
+    plan = m['plan']
+    out['plan'] = {'radius_m': _number('measurement.plan.radius_m', plan['radius_m'], 0.1, 1.0),
+                   'positions': _int('measurement.plan.positions', plan['positions'], 4, 8)}
+    return out
+
 
 ENV = {
-    'ALLOW_WRITE': ('allow_write',), 'ALLOW_PLAYBACK': ('allow_playback',),
+    'ALLOW_WRITE': ('allow_write',), 'ALLOW_PLAYBACK': ('allow_playback',), 'ALLOW_MEASURE': ('allow_measure',),
     'STATE_DIR': ('state_dir',), 'HOST': ('server', 'host'), 'PORT': ('server', 'port'),
     'TOKEN_FILE': ('server', 'token_file'),
     'MA_URL': ('music_assistant', 'url'), 'MA_TOKEN_FILE': ('music_assistant', 'token_file'),
@@ -63,7 +209,7 @@ ENV = {
     'SUPERVISOR_UNIT': ('supervisor', 'unit'), 'RECOVERY_ROOT': ('supervisor', 'status_root'),
 }
 INT_FIELDS = {('server', 'port'), ('camilladsp', 'port')}
-BOOL_FIELDS = {('allow_write',), ('allow_playback',)}
+BOOL_FIELDS = {('allow_write',), ('allow_playback',), ('allow_measure',)}
 
 
 def _merge(base, override, path=()):
@@ -74,7 +220,7 @@ def _merge(base, override, path=()):
         here = path + (key,)
         if key not in base:
             raise ConfigError(f"unknown configuration key {'.'.join(here)}")
-        if key in ('limits', 'channels') or not isinstance(base[key], dict):
+        if key in ('limits', 'channels', 'channel_map') or not isinstance(base[key], dict):
             result[key] = copy.deepcopy(value) if key != 'channels' else {**base[key], **(value if isinstance(value, dict) else {'_': value})}
         else:
             result[key] = _merge(base[key], value, here)
@@ -152,7 +298,8 @@ class Config:
         self.source = source
         self.allow_write = data['allow_write']
         self.allow_playback = data['allow_playback']
-        for key in ('allow_write', 'allow_playback'):
+        self.allow_measure = data['allow_measure']
+        for key in ('allow_write', 'allow_playback', 'allow_measure'):
             if type(data[key]) is not bool:
                 raise ConfigError(f'{key} must be true or false')
         self.state_dir = Path(_optional_path('state_dir', data['state_dir']) or default_state_dir())
@@ -242,6 +389,10 @@ class Config:
         }
         if self.room['freq_min_hz'] >= self.room['freq_max_hz']:
             raise ConfigError('room_correction.freq_min_hz must be below freq_max_hz')
+        if not isinstance(data['measurement'], dict):
+            raise ConfigError('measurement must be an object')
+        self.measure_policy = build_measure_policy(data['measurement']['limits'])
+        self.measurement = _measurement(data['measurement'], self.measure_policy)
 
     @staticmethod
     def _names(label, value):
@@ -276,6 +427,8 @@ class Config:
             'camilladsp': {'host': self.camilla_host, 'port': self.camilla_port, 'channels': self.channels,
                            'backup_retention': self.backup_retention},
             'room_correction': dict(self.room),
+            'allow_measure': self.allow_measure,
+            'measurement': {**copy.deepcopy(self.measurement), 'limits': self.measure_policy.as_dict()},
         }
 
 

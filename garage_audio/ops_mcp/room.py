@@ -206,6 +206,8 @@ def list_measurements(ctx, args):
         pts = rec.get('points') or []
         out.append({'id': ident, 'channel': rec.get('channel'), 'label': rec.get('label'),
                     'saved_at': rec.get('saved_at'), 'points': len(pts), 'distance_m': rec.get('distance_m'),
+                    'source': rec.get('source', 'rew_import'), 'quality': rec.get('quality'),
+                    'position_id': rec.get('position_id'), 'session_id': rec.get('session_id'),
                     'freq_range_hz': [pts[0]['frequency_hz'], pts[-1]['frequency_hz']] if pts else None})
     return {'measurements': out, 'directory': str(ctx.history.directory)}
 
@@ -262,6 +264,10 @@ def propose_peq(ctx, args):
     record = ctx.history.get(args['measurement_id'])
     channel = args.get('channel') or record.get('channel')
     if channel not in CHANNELS:
+        if channel == 'sum':
+            raise OpsError('invalid_argument', 'this is a "sum" (all speakers) measurement: EQ filters are per '
+                           'channel, so pass channel=left, right or sub explicitly if this curve should drive that '
+                           "channel's EQ (usually measure each channel separately instead)")
         raise OpsError('invalid_argument', 'channel must be left, right or sub')
     points = _points(record)
     s = _settings(ctx, args, points)
@@ -285,23 +291,76 @@ def _check_filter(ctx, item, max_boost):
     return checked
 
 
+def measured_peaks(ctx, ids):
+    """Acoustic arrival per channel from stored ops sweeps, minus the ops delays active while measuring."""
+    peaks, sources, refs, positions, confidence = {}, set(), set(), set(), 'high'
+    for ident in ids:
+        rec = ctx.history.get(ident)
+        channel, timing = rec.get('channel'), rec.get('timing') or {}
+        if channel not in ('left', 'right', 'sub'):
+            raise OpsError('invalid_argument', f'measurement {ident} is for {channel!r}; alignment needs left/right/sub')
+        if channel in peaks:
+            raise OpsError('invalid_argument', f'two measurements for {channel}; pass one per channel')
+        arrival = timing.get('arrival_ms')
+        delays = rec.get('ops_delays_ms')
+        if not isinstance(arrival, (int, float)) or timing.get('timing_source') not in ('loopback', 'acoustic_reference'):
+            raise OpsError('invalid_argument', f'measurement {ident} has no usable arrival time (only built-in '
+                           'measure_sweep results carry one)')
+        if not isinstance(delays, dict) or not isinstance(delays.get(channel), (int, float)):
+            raise OpsError('invalid_argument', f'measurement {ident} did not record the DSP delay that was active '
+                           'while measuring, so an absolute delay cannot be derived; re-measure')
+        peaks[channel] = round(float(arrival) - float(delays[channel]), 3)
+        sources.add(timing['timing_source'])
+        refs.add(timing.get('reference_channel') or (channel if timing['timing_source'] == 'acoustic_reference'
+                                                      else None))
+        positions.add(rec.get('position_id'))
+        if timing.get('timing_confidence') != 'high':
+            confidence = 'low'
+    if len(peaks) < 2:
+        raise OpsError('invalid_argument', 'alignment needs measurements of at least two channels')
+    if len(sources) != 1:
+        raise OpsError('invalid_argument', 'the measurements mix loopback and acoustic timing; use one kind')
+    if sources == {'acoustic_reference'} and len(refs) != 1:
+        raise OpsError('invalid_argument', 'the measurements use different acoustic reference speakers')
+    notes = []
+    if len(positions) > 1:
+        notes.append('the measurements are from different mic positions; delays are only valid for one position '
+                     '(use the main listening position)')
+    return peaks, {'timing_source': sources.pop(), 'timing_confidence': confidence, 'notes': notes}
+
+
 def propose_alignment(ctx, args):
     distances = args.get('distances_m')
     peaks = args.get('impulse_peaks_ms')
     levels = args.get('levels_db')
+    timing = None
+    if args.get('measurement_ids'):
+        if peaks or distances:
+            raise OpsError('invalid_argument', 'pass measurement_ids OR impulse_peaks_ms/distances_m, not both')
+        peaks, timing = measured_peaks(ctx, args['measurement_ids'])
     if not (distances or peaks or levels):
-        raise OpsError('invalid_argument', 'provide distances_m, impulse_peaks_ms and/or levels_db')
+        raise OpsError('invalid_argument', 'provide measurement_ids, distances_m, impulse_peaks_ms and/or levels_db')
     result = alignment(distances, peaks, levels)
+    if timing is not None:
+        result['timing'] = timing
+        result['delay_method'] = f"measured_{timing['timing_source']}"
     policy = ctx.config.policy
     for channel, value in result['delay_ms'].items():
         safety.check_delay_ms(policy, value, f'{channel} delay_ms')
     for channel, value in result['gain_db'].items():
         safety.check_channel_gain(policy, value, f'{channel} gain_db')
     saved = proposals(ctx).save({'kind': 'alignment', **result, 'inputs': {'distances_m': distances,
-                                 'impulse_peaks_ms': peaks, 'levels_db': levels}})
-    return {'proposal_id': saved['id'], **result,
-            'note': 'Impulse peaks (from the same loopback-timed REW sweep) include electronic latency and are '
-                    'preferred over distances. Level trims are cut-only, aligning to the quietest channel.'}
+                                 'impulse_peaks_ms': peaks, 'levels_db': levels,
+                                 'measurement_ids': args.get('measurement_ids')}})
+    note = ('Impulse peaks (from the same loopback-timed REW sweep) include electronic latency and are '
+            'preferred over distances. Level trims are cut-only, aligning to the quietest channel.')
+    if timing is not None:
+        note = ('Delays come from measure_sweep arrival times with the DSP delays that were active while measuring '
+                'removed, so they are absolute values for room_apply_correction. ')
+        if timing['timing_confidence'] == 'low':
+            note += ('Timing confidence is LOW (acoustic reference, no loopback): electronic latency differences '
+                     'between channels (e.g. a sub with its own DSP) are not seen; verify by ear or with a loopback. ')
+    return {'proposal_id': saved['id'], **result, 'note': note}
 
 
 def _yaml_scalar(value):

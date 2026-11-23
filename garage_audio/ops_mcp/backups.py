@@ -40,9 +40,13 @@ def _ensure_private_dir(path):
 
 def atomic_write_json(path, value):
     """Write ``value`` as JSON to ``path`` atomically with mode 0600."""
+    return atomic_write_bytes(path, json.dumps(value, indent=2, sort_keys=True).encode('utf-8'))
+
+
+def atomic_write_bytes(path, data, limit=MAX_FILE_BYTES):
+    """Write ``data`` to ``path`` atomically (temp file, fsync, rename, dir fsync) with mode 0600."""
     path = Path(path)
-    data = json.dumps(value, indent=2, sort_keys=True).encode('utf-8')
-    if len(data) > MAX_FILE_BYTES:
+    if len(data) > limit:
         raise OpsError('state_too_large', 'record exceeds the state file size limit')
     temp = path.with_name(f'.{path.name}.{uuid.uuid4().hex}.tmp')
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)

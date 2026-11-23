@@ -20,11 +20,12 @@ ROOT = Path(__file__).parents[1]
 
 class Registry(unittest.TestCase):
     def test_every_tool_has_strict_schema_and_description(self):
-        self.assertEqual(len(tools.TOOLS), 37)
+        self.assertEqual(len(tools.TOOLS), 57)
         for tool in tools.TOOLS:
             with self.subTest(tool=tool.name):
                 self.assertRegex(tool.name, r'^[a-z][a-z0-9_]{2,63}$')
-                self.assertIn(tool.access, (tools.READ, tools.LOCAL, tools.WRITE, tools.PLAYBACK))
+                self.assertIn(tool.access, (tools.READ, tools.LOCAL, tools.WRITE, tools.PLAYBACK, tools.MEASURE,
+                                            tools.STOP))
                 self.assertEqual(tool.schema['type'], 'object')
                 self.assertIs(tool.schema['additionalProperties'], False)
                 self.assertGreater(len(tool.description), 20)
@@ -93,7 +94,9 @@ class Content(unittest.TestCase):
         h = fakes.Harness(self)
         h.recovery_state('ready')
         uris = [r['uri'] for r in content.list_resources()]
-        self.assertEqual(uris, ['garage-audio://status', 'garage-audio://dsp/config', 'garage-audio://measurements'])
+        self.assertEqual(uris, ['garage-audio://status', 'garage-audio://dsp/config', 'garage-audio://measurements',
+                                'garage-audio://room/profile', 'garage-audio://measure/plan',
+                                'garage-audio://measure/session'])
         self.assertEqual(content.read_resource(h.ctx, 'garage-audio://status')['recovery']['state'], 'ready')
         self.assertIn('config', content.read_resource(h.ctx, 'garage-audio://dsp/config'))
         self.assertEqual(content.read_resource(h.ctx, 'garage-audio://measurements')['measurements'], [])
@@ -105,7 +108,8 @@ class Content(unittest.TestCase):
 
     def test_prompts(self):
         names = [p['name'] for p in content.list_prompts()]
-        self.assertEqual(names, ['diagnose-garage-audio', 'room-correction-walkthrough', 'listening-session'])
+        self.assertEqual(names, ['diagnose-garage-audio', 'room-correction-walkthrough', 'listening-session',
+                                 'guided-room-measurement'])
         text = content.get_prompt('diagnose-garage-audio', {'symptom': 'no sound'})['text']
         self.assertIn('no sound', text)
         self.assertIn('backoff', text)
@@ -117,7 +121,7 @@ class Content(unittest.TestCase):
         # Every tool a prompt names exists.
         known = set(tools.BY_NAME)
         for prompt in content.PROMPTS.values():
-            for word in re.findall(r'\b(?:ma|dsp|room|get|recover|plan)_[a-z_]+\b', prompt['text']):
+            for word in re.findall(r'\b(?:ma|dsp|room|get|recover|plan|measure)_[a-z_]+\b', prompt['text']):
                 self.assertIn(word, known)
 
 

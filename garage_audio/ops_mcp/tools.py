@@ -11,19 +11,22 @@ Access levels:
 - ``write``    changes the running system (recovery, DSP, pause/stop); needs allow_write.
 - ``playback`` starts/changes audible playback or volume in Music Assistant; needs
                allow_write AND allow_playback.
+- ``measure``  plays measurement signals through the stack / records the measurement
+               microphone; needs allow_write AND allow_measure.
+- ``stop``     measure_abort: only stops what this server started; always allowed.
 """
 import logging
 from dataclasses import dataclass
 from typing import Callable
 
-from . import dsp, health, music, recovery, room
-from .config import CHANNELS
+from . import dsp, health, measure, measure_session, music, recovery, room, room_model
+from .config import CHANNELS, MEASURE_CHANNELS, SMOOTHING
 from .errors import OpsError
 from .schema import validate
 
 LOG = logging.getLogger('garage_audio.ops_mcp')
 
-READ, LOCAL, WRITE, PLAYBACK = 'read', 'local', 'write', 'playback'
+READ, LOCAL, WRITE, PLAYBACK, MEASURE, STOP = 'read', 'local', 'write', 'playback', 'measure', 'stop'
 
 
 @dataclass(frozen=True)
@@ -56,6 +59,27 @@ CORRECTION = {'measurement_id': ID,
               'freq_max_hz': {'type': 'number', 'minimum': 20, 'maximum': 20000},
               'smoothing_octaves': {'type': 'number', 'minimum': 0, 'maximum': 1},
               'tolerance_db': {'type': 'number', 'minimum': 0.1, 'maximum': 10}}
+MCHANNEL = {'type': 'string', 'enum': list(MEASURE_CHANNELS)}
+UNITS = {'type': 'string', 'enum': list(room_model.UNITS), 'description': 'Length unit of the values (default m).'}
+LEN = {'type': 'number', 'minimum': 0, 'maximum': 5000}  # any unit; metric bounds are checked after conversion
+POINT = obj({'x': LEN, 'y': LEN, 'z': LEN})
+DIMS = obj({'length': LEN, 'width': LEN, 'height': LEN})
+LISTEN_NAMES = ('main',) + tuple(f'seat{i}' for i in range(2, 9))
+LISTEN = {'type': 'string', 'enum': list(LISTEN_NAMES)}
+TEXT = {'type': 'string', 'maxLength': 500}
+PROFILE = obj({
+    'dimensions_m': DIMS,
+    'shape': TEXT, 'notes': {'type': 'string', 'maxLength': 2000},
+    'speakers': obj({name: POINT for name in room_model.SPEAKERS}),
+    'listening_positions': obj({name: obj({'x': LEN, 'y': LEN, 'ear_height': LEN, 'label': TEXT})
+                                for name in LISTEN_NAMES}),
+    'seating': obj({'width': LEN, 'depth': LEN}),
+    'obstacles': {'type': 'array', 'items': TEXT, 'maxItems': 20}})
+AVERAGE = {'type': 'string', 'enum': ['power', 'vector']}
+PLAN = {'positions': {'type': 'integer', 'minimum': 4, 'maximum': 8},
+        'radius_m': {'type': 'number', 'minimum': 0.1, 'maximum': 1.5},
+        'ear_height_m': {'type': 'number', 'minimum': 0.3, 'maximum': 2.5},
+        'listening_position': LISTEN, 'mic_orientation': {'type': 'string', 'enum': ['90', '0']}}
 
 TOOLS = [
     # 1 Health -----------------------------------------------------------------------
@@ -170,30 +194,125 @@ TOOLS = [
          'range). Stored as a proposal; does not change DSP.',
          obj({**CORRECTION, 'channel': CHANNEL, 'max_filters': {'type': 'integer', 'minimum': 1, 'maximum': 10},
               'max_boost_db': {'type': 'number', 'minimum': 0, 'maximum': 6}}, ['measurement_id']), room.propose_peq),
-    Tool('room_propose_alignment', LOCAL, 'Propose mains+sub delay and level alignment from distances, impulse peak '
+    Tool('room_propose_alignment', LOCAL, 'Propose mains+sub delay and level alignment from measure_sweep results '
+         '(measurement_ids: arrival times, DSP delays active while measuring removed), distances, impulse peak '
          'times and/or measured levels. Stored as a proposal; does not change DSP.',
-         obj({'distances_m': PER_CHANNEL(0.1, 30), 'impulse_peaks_ms': PER_CHANNEL(-1000, 1000),
+         obj({'measurement_ids': {'type': 'array', 'items': ID, 'minItems': 2, 'maxItems': 3, 'uniqueItems': True},
+              'distances_m': PER_CHANNEL(0.1, 30), 'impulse_peaks_ms': PER_CHANNEL(-1000, 1000),
               'levels_db': PER_CHANNEL(-200, 200)}), room.propose_alignment),
     Tool('room_preview_yaml', READ, 'CamillaDSP YAML fragment for a proposal (filters and pipeline steps).',
          obj({'proposal_id': ID}, ['proposal_id']), room.preview_yaml),
     Tool('room_apply_correction', WRITE, 'Apply a stored proposal to CamillaDSP (re-validated; backup first; replaces '
          'earlier ops_rc_* filters for that channel).', obj({'proposal_id': ID}, ['proposal_id']), room.apply),
+    # 6 Room model and measurement plan ---------------------------------------------
+    Tool('room_profile_get', READ, 'The stored room profile (dimensions, speakers, listening positions, seating, '
+         'obstacles, notes; metres) and which fields are still missing.', obj(), room_model.get_profile),
+    Tool('room_profile_update', LOCAL, 'Partially update the room profile: objects in "set" are merged (send only '
+         'what changed), lists/text replace; "remove" deletes fields (e.g. "speakers.sub2"). Lengths in "units". '
+         'x from the left side wall, y from the front (speaker) wall, z / ear_height from the floor.',
+         obj({'set': PROFILE, 'remove': {'type': 'array', 'maxItems': 20,
+                                         'items': {'type': 'string', 'pattern': r'^[a-z_]{1,32}(\.[a-z0-9_]{1,32})?$'}},
+              'units': UNITS}), room_model.update_profile),
+    Tool('room_modes', READ, 'Axial room modes, expected problem frequencies (stacked modes, gaps), how strongly each '
+         'mode couples at the seat and the sub, and simple placement advice. Uses the stored profile; '
+         'dimensions_m overrides it for a what-if.',
+         obj({'dimensions_m': DIMS, 'units': UNITS, 'max_hz': {'type': 'number', 'minimum': 50, 'maximum': 500},
+              'listening_position': LISTEN}), room_model.modes_tool),
+    Tool('measure_plan', READ, 'Preview the microphone plan: main seat plus 4-8 nearby positions around it at ear '
+         'height, each described in plain words (metric and imperial), with the mic orientation.',
+         obj(PLAN), measure_session.plan_tool),
+    # 7 Measurement ------------------------------------------------------------------
+    Tool('measure_status', READ, 'Measurement readiness: measurement extra installed, backend, player/recorder '
+         'configured, channels, loopback/timing reference, level limits, confirmed levels, running measurement.',
+         obj(), measure.status),
+    Tool('measure_list_devices', READ, 'List capture devices via the configured read-only commands (e.g. arecord -l, '
+         'pw-record --list-targets).', obj(), measure.list_devices),
+    Tool('measure_import_calibration', LOCAL, 'Import a microphone calibration file (UMIK/miniDSP text with "Sens '
+         'Factor" header, or generic "freq dB" lines; 0- or 90-degree variant).',
+         obj({'text': {'type': 'string', 'minLength': 1, 'maxLength': 262144},
+              'name': {'type': 'string', 'minLength': 1, 'maxLength': 100},
+              'orientation': {'type': 'string', 'enum': ['0', '90']}}, ['text', 'name']), measure.import_calibration),
+    Tool('measure_list_calibrations', READ, 'Imported microphone calibrations.', obj(), measure.list_calibrations),
+    Tool('measure_get', READ, 'One stored measurement: settings, timing (source/confidence), quality, octave '
+         'summary, exported files (.frd, REW .txt, impulse WAV); include_points for the full curve.',
+         obj({'measurement_id': ID, 'include_points': {'type': 'boolean'}}, ['measurement_id']),
+         measure.get_measurement),
+    Tool('measure_noise_check', MEASURE, 'Record ~3 s of background noise from the measurement mic (plays nothing) '
+         'and judge it: ok / too_noisy / suspiciously_silent. With session_id it advances the session; '
+         'accept_noisy=true only if the user accepts a noisy room.',
+         obj({'session_id': ID, 'seconds': {'type': 'number', 'minimum': 1, 'maximum': 10},
+              'accept_noisy': {'type': 'boolean'}}), measure_session.noise_check_tool),
+    Tool('measure_level_check', MEASURE, 'AUDIBLE: short test tones on one channel, starting gentle and rising in '
+         'capped steps until the target SNR or the mic headroom is reached (never above the level cap). Tell the '
+         'user first; user_confirmed=true only after they agreed.',
+         obj({'channel': MCHANNEL, 'session_id': ID, 'user_confirmed': {'type': 'boolean'},
+              'start_level_dbfs': {'type': 'number', 'minimum': -90, 'maximum': 0}}, ['channel', 'user_confirmed']),
+         measure_session.level_check_tool),
+    Tool('measure_sweep', MEASURE, 'AUDIBLE: one log sweep on one channel through the stack (CamillaDSP limits '
+         'apply), analysed (response, phase, group delay, arrival time, SNR, clipping), quality-checked and stored '
+         'with REW-importable exports. Level is limited to the level-check result. Tell the user first; '
+         'user_confirmed=true only after they agreed.',
+         obj({'channel': MCHANNEL, 'session_id': ID, 'user_confirmed': {'type': 'boolean'},
+              'level_dbfs': {'type': 'number', 'minimum': -90, 'maximum': 0},
+              'freq_min_hz': {'type': 'number', 'minimum': 5, 'maximum': 24000},
+              'freq_max_hz': {'type': 'number', 'minimum': 5, 'maximum': 24000},
+              'sweep_seconds': {'type': 'number', 'minimum': 1, 'maximum': 60},
+              'smoothing': {'type': 'string', 'enum': list(SMOOTHING)},
+              'calibration_id': ID, 'label': {'type': 'string', 'maxLength': 100}},
+             ['channel', 'user_confirmed']), measure_session.sweep_tool),
+    Tool('measure_abort', STOP, 'Stop the running measurement now (only the player/recorder this server started). '
+         'Always allowed.', obj(), measure.abort),
+    Tool('measure_average', LOCAL, 'Average 2-16 stored measurements (power = level average, position independent; '
+         'vector = complex average, needs phase and time-aligned sweeps) into a new history measurement.',
+         obj({'measurement_ids': {'type': 'array', 'items': ID, 'minItems': 2, 'maxItems': 16, 'uniqueItems': True},
+              'method': AVERAGE, 'channel': MCHANNEL, 'label': {'type': 'string', 'maxLength': 100}},
+             ['measurement_ids']), measure_session.average_tool),
+    # 8 Guided measurement session ---------------------------------------------------
+    Tool('measure_session_start', LOCAL, 'Start a guided multi-position measurement session from the room profile '
+         '(resumable; persisted). Returns the plan and the first step. Plays nothing.',
+         obj({**PLAN, 'channels': {'type': 'array', 'items': MCHANNEL, 'minItems': 1, 'maxItems': 4,
+                                   'uniqueItems': True},
+              'calibration_id': ID, 'average': AVERAGE, 'replace': {'type': 'boolean'}}),
+         measure_session.start),
+    Tool('measure_session_status', READ, 'Progress of a measurement session (default: the active or latest one) '
+         'and the exact next step.', obj({'session_id': ID, 'include_plan': {'type': 'boolean'}}),
+         measure_session.status),
+    Tool('measure_session_confirm_placement', LOCAL, 'Record that the USER confirmed the mic is placed at the '
+         'current position. Call only after the user said so.',
+         obj({'session_id': ID, 'position_id': {'type': 'string', 'pattern': r'^P[0-9]$'}},
+             ['session_id', 'position_id']), measure_session.confirm_placement),
+    Tool('measure_session_advance', LOCAL, 'After the quality check: next position, redo one channel, redo the '
+         'position, or skip a nearby position.',
+         obj({'session_id': ID, 'action': {'type': 'string',
+                                           'enum': ['next', 'redo_channel', 'redo_position', 'skip_position']},
+              'channel': MCHANNEL, 'accept_quality': {'type': 'boolean'}}, ['session_id', 'action']),
+         measure_session.advance),
+    Tool('measure_session_finish', LOCAL, 'Average the completed positions per channel (power or vector), store '
+         'the averages in the measurement history and hand off to room_compare_to_target / room_propose_peq.',
+         obj({'session_id': ID, 'method': AVERAGE, 'allow_partial': {'type': 'boolean'}}, ['session_id']),
+         measure_session.finish),
+    Tool('measure_session_cancel', LOCAL, 'Cancel a session (aborts its running measurement; keeps stored '
+         'measurements).', obj({'session_id': ID}, ['session_id']), measure_session.cancel),
 ]
 BY_NAME = {tool.name: tool for tool in TOOLS}
 assert len(BY_NAME) == len(TOOLS)
 
 
 def enabled(config, tool):
-    if tool.access in (READ, LOCAL):
+    if tool.access in (READ, LOCAL, STOP):
         return True
     if tool.access == WRITE:
         return config.allow_write
+    if tool.access == MEASURE:
+        return config.allow_write and config.allow_measure
     return config.allow_write and config.allow_playback
 
 
 def gate_message(tool):
     if tool.access == PLAYBACK:
         return 'disabled: needs allow_write=true and allow_playback=true in the ops server configuration'
+    if tool.access == MEASURE:
+        return 'disabled: needs allow_write=true and allow_measure=true in the ops server configuration'
     return 'disabled: needs allow_write=true in the ops server configuration'
 
 
@@ -202,14 +321,15 @@ def describe(config):
     out = []
     for tool in TOOLS:
         on = enabled(config, tool)
-        prefix = {READ: '[read-only] ', LOCAL: '[local state only] ', WRITE: '[WRITE] ', PLAYBACK: '[PLAYBACK] '}
+        prefix = {READ: '[read-only] ', LOCAL: '[local state only] ', WRITE: '[WRITE] ', PLAYBACK: '[PLAYBACK] ',
+                  MEASURE: '[MEASURE] ', STOP: '[STOP] '}
         description = prefix[tool.access] + tool.description
         if not on:
             description += f' ({gate_message(tool)}; calls are refused server-side)'
         out.append({'name': tool.name, 'description': description, 'inputSchema': tool.schema,
                     'access': tool.access, 'enabled': on,
                     'annotations': {'readOnlyHint': tool.access in (READ, LOCAL),
-                                    'destructiveHint': tool.access in (WRITE, PLAYBACK),
+                                    'destructiveHint': tool.access in (WRITE, PLAYBACK, MEASURE),
                                     'idempotentHint': tool.access == READ, 'openWorldHint': False}})
     return out
 
@@ -227,12 +347,12 @@ def call(ctx, name, arguments):
     try:
         result = tool.handler(ctx, args)
     except OpsError as error:
-        if tool.access in (WRITE, PLAYBACK):
+        if tool.access in (WRITE, PLAYBACK, MEASURE, STOP):
             LOG.info('write tool %s failed: %s', name, error.code)
         raise
     except Exception as error:  # never leak raw exception text to the agent
         LOG.exception('tool %s failed unexpectedly', name)
         raise OpsError('internal', f'{name} failed unexpectedly ({type(error).__name__}); see the server log') from None
-    if tool.access in (WRITE, PLAYBACK):
+    if tool.access in (WRITE, PLAYBACK, MEASURE, STOP):
         LOG.info('write tool %s ok', name)
     return result

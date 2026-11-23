@@ -303,6 +303,86 @@ def audit_config(policy, config):
     return problems
 
 
+MEASURE_HARD = {
+    'sweep_level_max_dbfs': -6.0,    # peak digital level of any measurement signal (sweep, tone)
+    'start_level_dbfs': -30.0,       # first level-check tone is never louder than this
+    'level_step_max_db': 6.0,        # largest increase per level-check step
+    'sub_sweep_max_hz': 250.0,       # upper bound of any sweep or tone sent to the sub channel
+    'sweep_seconds_max': 20.0,       # longest single sweep
+    'max_duration_seconds': 60.0,    # longest audible time of one measurement action
+    'sweep_min_hz': 10.0,            # lowest sweep frequency
+    'sweep_max_hz': 22000.0,         # highest sweep frequency (also below the Nyquist frequency)
+}
+MEASURE_DIRECTION = {
+    'sweep_level_max_dbfs': 'max', 'start_level_dbfs': 'max', 'level_step_max_db': 'max',
+    'sub_sweep_max_hz': 'max', 'sweep_seconds_max': 'max', 'max_duration_seconds': 'max',
+    'sweep_min_hz': 'min', 'sweep_max_hz': 'max',
+}
+MEASURE_DEFAULTS = {
+    'sweep_level_max_dbfs': -18.0, 'start_level_dbfs': -40.0, 'level_step_max_db': 3.0,
+    'sub_sweep_max_hz': 200.0, 'sweep_seconds_max': 10.0, 'max_duration_seconds': 30.0,
+    'sweep_min_hz': 15.0, 'sweep_max_hz': 20000.0,
+}
+MEASURE_LEVEL_FLOOR_DBFS = -90.0
+CAPTURE_CLIP_DBFS = -0.5           # a capture peak at or above this counts as clipped
+CAPTURE_CLIP_RISK_DBFS = -6.0      # the level check stops raising the level above this capture peak
+
+
+@dataclass(frozen=True)
+class MeasurePolicy:
+    sweep_level_max_dbfs: float
+    start_level_dbfs: float
+    level_step_max_db: float
+    sub_sweep_max_hz: float
+    sweep_seconds_max: float
+    max_duration_seconds: float
+    sweep_min_hz: float
+    sweep_max_hz: float
+
+    def as_dict(self):
+        return {f.name: getattr(self, f.name) for f in fields(self)}
+
+
+def build_measure_policy(overrides=None):
+    """Effective measurement limits = MEASURE_DEFAULTS updated by overrides; loosening is a ConfigError."""
+    overrides = {} if overrides is None else overrides
+    if not isinstance(overrides, dict):
+        raise ConfigError('measurement.limits must be an object')
+    unknown = set(overrides) - set(MEASURE_HARD)
+    if unknown:
+        raise ConfigError('unknown measurement limit keys', keys=sorted(unknown))
+    values = dict(MEASURE_DEFAULTS)
+    for key, value in overrides.items():
+        if not _finite(value):
+            raise ConfigError(f'measurement limit {key} must be a finite number')
+        hard = MEASURE_HARD[key]
+        if (MEASURE_DIRECTION[key] == 'max' and value > hard) or (MEASURE_DIRECTION[key] == 'min' and value < hard):
+            raise ConfigError(f'measurement limit {key}={value} would loosen the hard limit {hard}; configuration '
+                              'may only tighten', key=key, hard_limit=hard)
+        values[key] = float(value)
+    checks = [
+        (values['sweep_level_max_dbfs'] >= MEASURE_LEVEL_FLOOR_DBFS,
+         f'sweep_level_max_dbfs must be >= {MEASURE_LEVEL_FLOOR_DBFS}'),
+        (MEASURE_LEVEL_FLOOR_DBFS <= values['start_level_dbfs'] <= values['sweep_level_max_dbfs'],
+         'start_level_dbfs must be between -90 and sweep_level_max_dbfs'),
+        (values['level_step_max_db'] >= 0.5, 'level_step_max_db must be >= 0.5'),
+        (values['sweep_min_hz'] < values['sub_sweep_max_hz'], 'sub_sweep_max_hz must be above sweep_min_hz'),
+        (values['sweep_min_hz'] * 4 <= values['sweep_max_hz'], 'sweep range must span at least two octaves'),
+        (values['sweep_seconds_max'] >= 0.5, 'sweep_seconds_max must be >= 0.5'),
+        (values['max_duration_seconds'] >= values['sweep_seconds_max'],
+         'max_duration_seconds must be >= sweep_seconds_max'),
+    ]
+    for ok, message in checks:
+        if not ok:
+            raise ConfigError(message)
+    return MeasurePolicy(**values)
+
+
+def check_measure_level(policy, value, name='level_dbfs'):
+    """A requested measurement signal level (dBFS peak) must be inside the floor..cap range."""
+    return check_range(name, value, MEASURE_LEVEL_FLOOR_DBFS, policy.sweep_level_max_dbfs)
+
+
 def hard_policy():
     """The absolute caps as a Policy (no operator tightening)."""
     return build_policy(HARD)

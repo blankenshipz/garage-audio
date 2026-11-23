@@ -90,6 +90,11 @@ class WriteGate(unittest.TestCase):
         enabled = {d['name'] for d in tools.describe(fakes.Harness(self, {'allow_write': True,
                                                                           'allow_playback': True}).config)
                    if d['enabled']}
+        measure_tools = {t.name for t in tools.TOOLS if t.access == tools.MEASURE}
+        self.assertEqual(enabled, set(described) - measure_tools)  # measuring also needs allow_measure
+        enabled = {d['name'] for d in tools.describe(fakes.Harness(self, {'allow_write': True, 'allow_playback': True,
+                                                                          'allow_measure': True}).config)
+                   if d['enabled']}
         self.assertEqual(enabled, set(described))
 
     def test_read_tools_work_when_read_only(self):

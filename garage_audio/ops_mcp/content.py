@@ -1,14 +1,30 @@
 """MCP resources and prompts (stdlib only; the transport adapts them to the SDK)."""
-from . import dsp, health, room
+from . import dsp, health, measure_session, room, room_model
 from .errors import OpsError
+
+
+def _plan(ctx):
+    view = measure_session.status(ctx, {'include_plan': True})
+    if view.get('status') == 'active':
+        return {'session_id': view['session_id'], 'plan': view['plan']}
+    return {'session_id': None, 'plan': measure_session.plan_tool(ctx, {}),
+            'note': 'preview from the room profile; no active measurement session'}
+
 
 RESOURCES = {
     'garage-audio://status': ('System status', 'Overall stack status (same as get_status).',
                               lambda ctx: health.overall_status(ctx)),
     'garage-audio://dsp/config': ('Current DSP config', 'Active CamillaDSP configuration with limit violations.',
                                   lambda ctx: dsp.active_config(ctx)),
-    'garage-audio://measurements': ('Measurement history', 'Imported REW measurements (newest first).',
+    'garage-audio://measurements': ('Measurement history', 'Imported and measured responses (newest first).',
                                     lambda ctx: room.list_measurements(ctx, {})),
+    'garage-audio://room/profile': ('Room profile', 'Room dimensions, speaker/sub/listening positions and notes '
+                                    '(metres), plus missing fields.', lambda ctx: room_model.get_profile(ctx, {})),
+    'garage-audio://measure/plan': ('Measurement plan', 'Mic positions of the active session (or a preview from '
+                                    'the room profile).', _plan),
+    'garage-audio://measure/session': ('Measurement session progress', 'Phase, per-position progress and the next '
+                                       'step of the active or latest session.',
+                                       lambda ctx: measure_session.status(ctx, {})),
 }
 
 
@@ -74,6 +90,44 @@ PROMPTS = {
             '4. Playback needs allow_write and allow_playback. Set a modest volume first (ma_set_volume well below '
             'the cap), then ma_play_media. Check dsp_get_levels for clipping after a few seconds.\n'
             '5. If playback tools are disabled, tell the operator what to play and where, and stop there.'),
+    },
+    'guided-room-measurement': {
+        'title': 'Guided room measurement',
+        'description': 'Measure the room with the built-in engine: room details, mic placement, noise check, '
+                       'level check, sweeps per position, averaging, then the EQ tools. Never sweeps without '
+                       'the user\'s confirmation.',
+        'arguments': [{'name': 'channels', 'description': 'Channels to measure, e.g. "left,right,sub".',
+                       'required': False},
+                      {'name': 'units', 'description': 'Preferred units: metric or imperial.', 'required': False}],
+        'text': (
+            'Guide the user through a room measurement. Channels: {channels}. Preferred units: {units}.\n'
+            'Rules: every audible step (measure_level_check, measure_sweep) needs the user\'s explicit go-ahead '
+            'right before it; pass user_confirmed=true only then. Never assume the mic is placed: wait for the '
+            'user to say so. If the user says stop, call measure_abort immediately. Speak plainly and give one '
+            'instruction at a time.\n'
+            '1. measure_status: if the measurement extra is missing, measure tools are disabled, or the player/'
+            'recorder are not configured, explain what the operator must change and stop. measure_list_devices '
+            'and measure_list_calibrations help them configure the mic.\n'
+            '2. room_profile_get. Ask for the missing room details one or two at a time (length, width, ceiling '
+            'height, where the speakers and sub are, where the main seat is, ear height, seating width, big '
+            'obstacles) and store each answer with room_profile_update (units as the user gives them).\n'
+            '3. room_modes: explain the expected problem frequencies and any placement advice in plain words; '
+            'offer to move the seat or sub before measuring.\n'
+            '4. If the user has a calibration file, measure_import_calibration (pick the 90-degree file for a mic '
+            'pointing up).\n'
+            '5. measure_session_start (with calibration_id). Read out the first position exactly as described '
+            '(metric or imperial per the user), the mic orientation, and ask them to confirm when it is in place.\n'
+            '6. For each position: after the user confirms, measure_session_confirm_placement; ask for quiet and '
+            'measure_noise_check with session_id (if too noisy, explain and repeat); for each channel without a '
+            'confirmed level, warn the user and after their go-ahead run measure_level_check; then for each '
+            'channel warn the user a sweep will play and after their go-ahead run measure_sweep with session_id. '
+            'Explain the quality result; redo or advance with measure_session_advance as measure_session_status '
+            'says.\n'
+            '7. measure_session_finish; then room_compare_to_target and room_propose_peq on the averaged '
+            'measurements, room_propose_alignment with the main-position measurement_ids, room_preview_yaml, and '
+            'only with the user\'s agreement room_apply_correction (backup first). Offer a verification sweep '
+            'afterwards.\n'
+            'See docs/ops-mcp-measurement.md.'),
     },
 }
 
