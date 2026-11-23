@@ -11,6 +11,8 @@ policies are unchanged. The ops server is an operator tool. It is read-only unle
 operator turns writes on in its own configuration.
 
 The room-correction workflow is described in [ops MCP room correction](ops-mcp-room-correction.md).
+Built-in room measurement (log sweeps through the stack, guided mic placement, room model)
+is described in [ops MCP measurement](ops-mcp-measurement.md).
 
 ## Normal journey
 
@@ -66,6 +68,7 @@ keys, wrong types and out-of-range values stop startup.
 |---|---|---|
 | `allow_write` | `false` | Enables write tools (recovery, DSP changes, pause/stop, room apply) |
 | `allow_playback` | `false` | Together with `allow_write`: start/resume playback, player volume/mute/grouping, DSP unmute |
+| `allow_measure` | `false` | Together with `allow_write`: measurement signals (noise check, level-check tones, sweeps) through the stack sink ([measurement](ops-mcp-measurement.md)) |
 | `state_dir` | `$XDG_STATE_HOME/garage-audio-ops-mcp` | Backups, measurements, proposals. Created with mode 0700 if missing. An existing directory must be owned by the server user with mode 0700; otherwise state writes are refused with `state_dir_unsafe` (it is not chmod-ed for you) |
 | `server.host` / `server.port` | `127.0.0.1` / `8766` | HTTP bind address |
 | `server.token_file` | none | HTTP bearer token file (preferred) |
@@ -84,13 +87,14 @@ keys, wrong types and out-of-range values stop startup.
 | `camilladsp.channels` | unset | Pipeline channel index for `left`, `right` and `sub` |
 | `camilladsp.backup_retention` | `50` | Number of DSP backups kept (5 to 1000) |
 | `room_correction.*` | see the [workflow](ops-mcp-room-correction.md) | Proposal bounds and smoothing |
+| `measurement.*` | see [measurement](ops-mcp-measurement.md#configuration) | Player/recorder argv, channels, loopback, measurement limits (tighten-only), REW backend |
 
 Environment overrides (applied after the file):
 
 | Variable | Overrides |
 |---|---|
 | `GARAGE_OPS_MCP_CONFIG` | config path when `--config` is not given |
-| `GARAGE_OPS_MCP_ALLOW_WRITE`, `GARAGE_OPS_MCP_ALLOW_PLAYBACK` | `allow_write`, `allow_playback` (`true`/`false`) |
+| `GARAGE_OPS_MCP_ALLOW_WRITE`, `GARAGE_OPS_MCP_ALLOW_PLAYBACK`, `GARAGE_OPS_MCP_ALLOW_MEASURE` | `allow_write`, `allow_playback`, `allow_measure` (`true`/`false`) |
 | `GARAGE_OPS_MCP_STATE_DIR` | `state_dir` |
 | `GARAGE_OPS_MCP_HOST`, `GARAGE_OPS_MCP_PORT` | `server.host`, `server.port` |
 | `GARAGE_OPS_MCP_TOKEN_FILE` | `server.token_file` |
@@ -101,14 +105,16 @@ Environment overrides (applied after the file):
 
 ## Security model
 
-* **Read-only by default.** All 37 tools are always listed, so an agent can see what
-  exists. Each description starts with `[read-only]`, `[local state only]`, `[WRITE]`
-  or `[PLAYBACK]`, and disabled tools say so. A disabled tool is **refused
-  server-side** with `write_disabled` before its arguments are parsed or any client
-  is touched. Hiding a tool is not the protection. The gate is.
+* **Read-only by default.** All 57 tools are always listed, so an agent can see what
+  exists. Each description starts with `[read-only]`, `[local state only]`, `[WRITE]`,
+  `[PLAYBACK]`, `[MEASURE]` or `[STOP]`, and disabled tools say so. A disabled tool is
+  **refused server-side** with `write_disabled` before its arguments are parsed or any
+  client is touched. Hiding a tool is not the protection. The gate is.
 * **Access levels.** `read` and `local` tools are always available (`local` writes
   only to `state_dir`). `write` needs `allow_write=true`. `playback` needs
-  `allow_write=true` **and** `allow_playback=true`.
+  `allow_write=true` **and** `allow_playback=true`. `measure` (audible measurement
+  signals) needs `allow_write=true` **and** `allow_measure=true`; audible steps also need
+  `user_confirmed=true`. `stop` (`measure_abort`) is always available.
 * **HTTP bearer token.**
   * HTTP refuses to start without a token.
   * Prefer `server.token_file`: a regular file (not a symlink), owned by the server
@@ -305,12 +311,34 @@ in `state_dir`.
 | `room_propose_alignment` | local | Mains and sub delay and level alignment |
 | `room_preview_yaml` | read | CamillaDSP YAML fragment for a proposal |
 | `room_apply_correction` | write | Apply a proposal (re-validated, backed up first) |
+| `room_profile_get` | read | Room profile (dimensions, speakers, seats, notes) and missing fields |
+| `room_profile_update` | local | Partial room-profile update in m/cm/ft/in |
+| `room_modes` | read | Axial modes, seat coupling and placement advice |
+| `measure_plan` | read | Mic positions around a seat with plain metric/imperial descriptions |
+| `measure_status` | read | Measurement extra installed?, running measurement, confirmed levels, limits |
+| `measure_list_devices` | read | Capture-device listings from configured read-only commands |
+| `measure_import_calibration` | local | Import a UMIK-style or generic mic calibration file |
+| `measure_list_calibrations` | read | Stored mic calibrations |
+| `measure_noise_check` | measure | Record background noise (plays nothing) |
+| `measure_level_check` | measure | Stepwise level check with a short tone (audible) |
+| `measure_sweep` | measure | Log-sweep measurement of one channel (audible) |
+| `measure_abort` | stop | Stop the running measurement (only this server's children) |
+| `measure_get` | read | A stored measurement with files and optional re-smoothing |
+| `measure_average` | local | Power or vector average of stored measurements |
+| `measure_session_start` | local | Start a guided measurement session (plan + state machine) |
+| `measure_session_status` | read | Session progress and the exact next step |
+| `measure_session_confirm_placement` | local | The person confirmed the mic is at the position |
+| `measure_session_advance` | local | Next position, redo a channel/position, or skip |
+| `measure_session_finish` | local | Average across positions and store the result |
+| `measure_session_cancel` | local | Cancel a session (aborts its running measurement) |
 
-The server also exposes three read-only resources and three prompts:
+The server also exposes six read-only resources and four prompts:
 
-* Resources: `garage-audio://status`, `garage-audio://dsp/config` and
-  `garage-audio://measurements`.
-* Prompts: diagnose a problem, a room-correction session, and play something.
+* Resources: `garage-audio://status`, `garage-audio://dsp/config`,
+  `garage-audio://measurements`, `garage-audio://room/profile`,
+  `garage-audio://measure/plan` and `garage-audio://measure/session`.
+* Prompts: diagnose a problem, a room-correction session, play something, and
+  `guided-room-measurement`.
 
 Errors are structured as `{"error": {"code", "message", "details"?}}`. Codes include:
 
@@ -320,6 +348,9 @@ Errors are structured as `{"error": {"code", "message", "details"?}}`. Codes inc
 * `camilladsp_unreachable`, `ma_unreachable`
 * `docker_unavailable`, `logs_unavailable`
 * `invalid_argument`, `busy`
+* measurement: `measurement_extra_missing`, `measurement_unconfigured`, `confirmation_required`,
+  `stack_not_ready`, `stack_muted`, `stack_busy`, `sink_unavailable`, `measurement_aborted`,
+  `measurement_timeout`, `playback_failed`, `capture_failed`, `session_state`, `session_quality`
 
 Raw exception text is never returned.
 
@@ -331,12 +362,16 @@ Raw exception text is never returned.
   `room_apply_correction` tools report `camilladsp_unreachable` by design. **Do not
   proxy or publish the raw websocket to make them work.** That would undo the
   isolation. The DSP tools are for deployments where the websocket is already
-  reachable on the host's loopback. Health, recovery, Music Assistant and the
-  measurement and proposal tools work either way. `diagnose` explains that an
+  reachable on the host's loopback. Health, recovery, Music Assistant, measurement
+  import, the room model and the proposal tools work either way. `diagnose` explains that an
   unreachable private websocket alone is not a fault, but it does not report
   `healthy: true` without DSP evidence.
 * **Unverified against real hardware.** The tools are tested against fakes for
   CamillaDSP, Music Assistant, `systemctl`, `docker` and `journalctl`. No live
   deployment, audible result or amplifier behaviour is claimed by this document.
+* **Measurement needs a reachable CamillaDSP.** The measurement tools refuse to play
+  when CamillaDSP cannot be checked (mute, state, active delays), so in the isolated
+  deployment above they report `stack_not_ready`. Measurement is also verified only
+  against a simulated room ([measurement](ops-mcp-measurement.md#verification)).
 * **Limits protect against bad parameters, not every hazard.** Keep amplifier gain
   structure and hardware protection in place.

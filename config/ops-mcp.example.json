@@ -1,8 +1,10 @@
 {
   "_comment": "EXAMPLE ONLY - garage-audio ops MCP server configuration. Copy to a private location (for example /etc/garage-audio-ops-mcp/config.json), edit the placeholders and point --config or GARAGE_OPS_MCP_CONFIG at it. No script installs this file. See docs/ops-mcp.md.",
   "_comment_safety": "Read-only by default. allow_write enables recovery, DSP edits and pause/stop. allow_playback (together with allow_write) lets the agent start playback and change player volume. Limits can only be tightened below the hard caps in garage_audio/ops_mcp/safety.py; looser values are rejected at startup.",
+  "_comment_measure": "allow_measure (together with allow_write) lets the agent play measurement signals (level-check tones, sweeps) through the stack sink. Requires the optional measurement extra (pip install '.[measurement]', numpy==2.2.6). See docs/ops-mcp-measurement.md. In measurement, replace every <placeholder>: play_argv must target the stack sink that feeds CamillaDSP (never hw:/plughw:/alsa_output.* or a shell); find the microphone with pw-record --list-targets, arecord -l or the measure_list_devices tool.",
   "allow_write": false,
   "allow_playback": false,
+  "allow_measure": false,
   "state_dir": "/var/lib/garage-audio-ops-mcp",
   "server": {
     "host": "127.0.0.1",
@@ -55,5 +57,29 @@
     "tolerance_db": 1.0,
     "sample_rate": 48000,
     "history_retention": 200
+  },
+  "measurement": {
+    "backend": "builtin",
+    "capture": "process",
+    "sample_rate": 48000,
+    "play_argv": ["pw-play", "--target", "<stack-sink-name>", "{file}"],
+    "record_argv": ["pw-record", "--target", "<measurement-mic-name>", "--rate", "{rate}", "--channels", "{channels}", "--format", "s24", "{file}"],
+    "sink_check_argv": ["pw-cli", "info", "<stack-sink-name>"],
+    "output_channels": 2,
+    "channel_map": {"left": [0], "right": [1], "sub": [0, 1], "sum": [0, 1]},
+    "capture_channels": 1,
+    "mic_channel": 0,
+    "loopback": null,
+    "timing_reference": "left",
+    "sweep_seconds": 6.0,
+    "target_snr_db": 35.0,
+    "smoothing": "1/48",
+    "retention": 100,
+    "limits": {
+      "sweep_level_max_dbfs": -18.0,
+      "sub_sweep_max_hz": 200.0
+    },
+    "rew": {"url": null, "timeout_seconds": 60},
+    "plan": {"radius_m": 0.3, "positions": 6}
   }
 }

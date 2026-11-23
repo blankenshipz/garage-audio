@@ -1,9 +1,17 @@
 # Ops MCP room-correction workflow
 
-How an agent uses the [ops MCP server](ops-mcp.md) to turn REW measurements into
-bounded CamillaDSP corrections for the two mains and the sub. Measuring is done by a
-person with REW and a microphone. The server never plays a test signal, never runs
-a sweep and never moves the microphone.
+How an agent uses the [ops MCP server](ops-mcp.md) to turn measurements into bounded
+CamillaDSP corrections for the two mains and the sub. Measurements come from either:
+
+* **the server's own measurement engine** ([ops MCP measurement](ops-mcp-measurement.md)):
+  with `allow_write=true` and `allow_measure=true` the agent runs a guided session (mic
+  placement, noise check, level check, log sweeps per channel, averaging across positions)
+  and the averaged results land in the same history as imports. Steps 1–2 below are then
+  replaced by `measure_session_*`; or
+* **a person with REW**, exporting text files that the agent imports (steps 1–2).
+
+Without `allow_measure` the server never plays a test signal. It never moves the microphone:
+a person does, after the agent explains where.
 
 The dashboard's own [measurement workflow](measurement-workflow.md) and calibration
 records are separate and unchanged. This workflow keeps its own history in the ops
@@ -90,6 +98,12 @@ and after, as predicted by the filter math. It is stored as a proposal
 
 `room_propose_alignment` takes any of:
 
+* `measurement_ids`: two or three `measure_sweep` results (one each for left, right, sub,
+  from the same position, e.g. the session's `main_position_measurement_ids`). Their arrival
+  times are used after removing the `ops_<channel>_delay` delays that were active while
+  measuring. Loopback timing gives `timing_confidence=high`; acoustic-reference timing gives
+  `low`. Mixed timing sources or references are refused. Cannot be combined with
+  `impulse_peaks_ms` or `distances_m`.
 * `impulse_peaks_ms` per channel (preferred, measured with a shared timing
   reference). Every channel is delayed to match the latest arrival.
 * `distances_m` per channel. Delay = (farthest − this distance) / 343 m/s.
@@ -125,8 +139,8 @@ Review it, or merge it by hand through your normal configuration process.
 
 ## 8. Verify and roll back
 
-Re-measure each channel at the **same** microphone position and import the new
-measurements. Then run `room_compare_to_target` on old and new and compare
+Re-measure each channel at the **same** microphone position (or the same session plan with
+`measure_session_start`) and import the new measurements if they came from REW. Then run `room_compare_to_target` on old and new and compare
 `rms_deviation_db`. Listen at a modest level. If the result is worse, run
 `dsp_restore_backup` with the `backup_id` from step 7. The restore is validated and
 backed up too.

@@ -12,6 +12,11 @@ license = {file = "LICENSE"}
 authors = [{name = "Zach"}]
 dynamic = ["dependencies"]
 
+[project.optional-dependencies]
+# Built-in room measurement engine of the ops MCP server (garage_audio.ops_mcp.measure*).
+# Same pin as research/requirements.txt. Everything else runs without it.
+measurement = ["numpy==2.2.6"]
+
 [tool.setuptools.dynamic]
 dependencies = {file = ["requirements.txt"]}
 

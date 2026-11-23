@@ -390,7 +390,7 @@ remain separate. A source package is not a commissioned audio appliance.
 * [Everyday Spotify listening](docs/spotify-only-quickstart.md)
 * [Installation and deployment](docs/docker-install.md) · [Container audio topology](docs/container-audio.md)
 * [Dashboard access](docs/dashboard.md) · [MCP agent guide](docs/agents.md)
-* [Operator MCP server (opt-in, read-only by default)](docs/ops-mcp.md) · [Ops MCP room correction](docs/ops-mcp-room-correction.md)
+* [Operator MCP server (opt-in, read-only by default)](docs/ops-mcp.md) · [Ops MCP room correction](docs/ops-mcp-room-correction.md) · [Ops MCP measurement](docs/ops-mcp-measurement.md)
 * [Room/profile API](API_CONTRACT_ROOM.md) · [Measurement workflow](docs/measurement-workflow.md)
 * [Capability and publication boundaries](docs/publication.md)
 * [Architecture and roadmap](docs/architecture-roadmap.md) · [Experimental active-control research](docs/active-control-research.md)
