@@ -66,8 +66,10 @@ measurement WAV -> play_argv (e.g. pw-play) -> stack sink (PipeWire) -> CamillaD
 
 * The ops server **never opens the DAC**. The DAC stays owned by the supervisor-managed
   stack. The configuration refuses `play_argv` that names a raw ALSA or PipeWire ALSA
-  device (`hw:`, `plughw:`, `dmix`, `alsa_output.*`, `/dev/snd/…`) or runs through a shell,
-  `env` or `sudo`.
+  device (`hw:`, `plughw:`, `plug:`, `default:CARD=`, `sysdefault`, `front:`, `surround…`,
+  `iec958`, `dmix`, `dsnoop`, `alsa_output.*`, `/dev/snd/…`), runs an ALSA player (`aplay`,
+  `speaker-test`) without an explicit device (`-D`/`--device`, and not `default`, which may
+  be the DAC), or runs through a shell, `env` or `sudo`.
 * Every signal passes CamillaDSP, so its main volume, the volume ceiling, the limits and the
   crossovers apply. The measured response is what you hear, including the current DSP.
 * Before anything audible plays, the engine **refuses (never auto-fixes)** when:
@@ -77,6 +79,10 @@ measurement WAV -> play_argv (e.g. pw-play) -> stack sink (PipeWire) -> CamillaD
     unavailable, by design (see [ops MCP known limits](ops-mcp.md#known-limits-and-open-risks));
   * CamillaDSP is muted (`stack_muted`). Measurement never unmutes;
   * Music Assistant is playing on an allowed player (`stack_busy`). Pause it first;
+  * Music Assistant is configured (`music_assistant.token_file` set) but not reachable
+    (`ma_unreachable`): nobody can confirm that nothing else is playing, so the engine fails
+    closed. Only when Music Assistant is not configured at all does it proceed, with a note
+    that other playback was not checked;
   * the optional `sink_check_argv` probe fails (`sink_unavailable`);
   * the player/recorder is not configured (`measurement_unconfigured`).
 * The DSP main volume and the `ops_<channel>_delay` delays active at that moment are stored
@@ -90,9 +96,17 @@ measurement WAV -> play_argv (e.g. pw-play) -> stack sink (PipeWire) -> CamillaD
 sent to the sink. The generated multichannel WAV carries the signal only in those channels.
 
 The stack's sink is usually stereo and **the sub is fed by CamillaDSP's crossover from L+R**.
-Then `sub` must map to `[0, 1]` (the default) and its sweep is limited to the sub band, and a
-`left` sweep includes the part of the sub that the crossover sends from the left input. If
-your sink exposes a dedicated sub input, map `sub` to that channel instead.
+Then `sub` must map to `[0, 1]` (the default), and a `left` sweep includes the part of the
+sub that the crossover sends from the left input. If your sink exposes a dedicated sub input,
+map `sub` to that channel instead.
+
+The sub frequency cap (`sub_sweep_max_hz`) follows the **outputs**, not the channel name. A
+*sub-only output* is an output in `channel_map.sub` that is in neither `left` nor `right`.
+The cap applies to every sweep, level-check tone and timing chirp on `sub` **and on any
+channel whose outputs include a sub-only output**. For example, with `sub: [2]` and
+`sum: [0, 1, 2]`, a `sum` sweep is capped. With the default map (sub fed from `[0, 1]`) there
+is no sub-only output, so only `sub` itself is capped. A `timing_reference` that includes a
+sub-only output is refused by the configuration.
 
 ## Configuration
 
@@ -116,12 +130,12 @@ Without it the server starts and every other tool works; `measure_noise_check`,
 | `measurement.play_argv` | none | Player argv, no shell; must target the stack sink. Placeholders `{file}`, `{rate}`, `{channels}`, `{seconds}` |
 | `measurement.record_argv` | none | Recorder argv writing a WAV to `{file}` from the measurement mic |
 | `measurement.sink_check_argv` | none | Optional read-only probe that exits 0 when the stack sink exists |
-| `measurement.list_devices_argv` | `[["arecord","-l"],["pw-record","--list-targets"]]` | Read-only listings for `measure_list_devices` |
+| `measurement.list_devices_argv` | `[["arecord","-l"],["pw-record","--list-targets"]]` | Listings for `measure_list_devices`. Only read-only listing programs are accepted: `arecord -l/-L`, `pw-record --list-targets`, `pw-cli ls/info`, `pw-dump` (no `--monitor`), `pactl list/info`, `wpctl status/inspect`; anything else (a player, a recorder, a setter) stops startup |
 | `measurement.output_channels` | `2` | Channels of the played WAV (the sink's channel count) |
 | `measurement.channel_map` | L `[0]`, R `[1]`, sub `[0,1]`, sum `[0,1]` | Output channels per measured channel |
 | `measurement.capture_channels` / `.mic_channel` | `1` / `0` | Recorded channels and which one is the mic |
 | `measurement.loopback` | `null` | `{"output_channel": N, "capture_channel": M}` for absolute timing |
-| `measurement.timing_reference` | `left` | Reference speaker for acoustic timing without loopback |
+| `measurement.timing_reference` | `left` | Reference speaker for acoustic timing without loopback (full range: not `sub`, no sub-only output) |
 | `measurement.require_owner_ready` | `true` | Refuse unless the owner reports `ready` |
 | `measurement.sweep_seconds`, `.sweep_min_hz`, `.sweep_max_hz` | `6`, `20`, `20000` | Default sweep |
 | `measurement.target_snr_db` / `.min_snr_db` | `35` / `20` | Level-check target; below the minimum a sweep must be redone |
@@ -129,6 +143,7 @@ Without it the server starts and every other tool works; `measure_noise_check`,
 | `measurement.retention` | `100` | Measurement file sets kept (oldest removed first) |
 | `measurement.limits.*` | see below | Safety limits; can only be tightened |
 | `measurement.rew.url` / `.timeout_seconds` | `null` / `60` | REW API base URL, e.g. `http://127.0.0.1:4735` (no credentials, path or query) |
+| `measurement.rew.protocol` | `{}` | Per-key overrides of the REW endpoint/command table (below); validated |
 | `measurement.plan.radius_m` / `.positions` | `0.3` / `6` | Default plan pattern (4–8 positions) |
 
 Example with PipeWire tools (placeholders; find the names with `measure_list_devices`):
@@ -161,10 +176,11 @@ Hard limits live in `garage_audio/ops_mcp/safety.py` (`MEASURE_HARD`). The confi
 | `sweep_level_max_dbfs` | −18 | −6 | Peak digital level of any measurement signal |
 | `start_level_dbfs` | −40 | −30 | First level-check tone; also the sweep level before any level check |
 | `level_step_max_db` | 3 | 6 | Largest increase per level-check step |
-| `sub_sweep_max_hz` | 200 | 250 | Upper frequency of any sweep/tone sent to the sub |
+| `sub_sweep_max_hz` | 200 | 250 | Upper frequency of any sweep/tone/chirp on the sub or on a sub-only output |
 | `sweep_seconds_max` | 10 | 20 | Longest single sweep |
 | `max_duration_seconds` | 30 | 60 | Longest audible time of one action (sweep + pre/post roll, or all level-check steps) |
 | `sweep_min_hz` / `sweep_max_hz` | 15 / 20000 | 10 / 22000 | Sweep range |
+| `level_ttl_seconds` | 1800 | 1800 (min 10) | How long a confirmed level (level check) stays valid |
 
 Further rules:
 
@@ -177,10 +193,23 @@ Further rules:
   by at most `level_step_max_db` per step (at most 8 steps). It stops at the target SNR, when
   the mic capture gets within 6 dB of full scale, on clipping (then it backs off 12 dB), at
   the level cap, or when the duration budget is used.
-* **Sweeps never exceed the confirmed level:** without a level check, a sweep plays at
-  `start_level_dbfs`; after one, at most at the level it chose.
+* **Sweeps never exceed the confirmed level:** without a valid level check, a sweep plays at
+  `start_level_dbfs`; with one, at most at the level it chose. An explicit `level_dbfs`
+  above that is refused (`safety_limit`) with the reason.
+* **Confirmed levels expire and are bound to the stack:** a confirmation records when it
+  was made and a snapshot of the DSP main volume, mute, the channel's outputs, a digest of the
+  DSP mixer routing, the capture settings (recorder argv, mic channel, channel count) and the
+  calibration id. It is valid for `level_ttl_seconds` (default and maximum 30 min) and only
+  while that snapshot still matches. A change, an unreadable volume or DSP configuration, a
+  clock step back or a session file from before this rule means: back to the start level
+  until a new level check. `measure_status` shows each confirmation with its expiry.
+* **Timing chirp level:** without loopback, the short reference chirp on the
+  `timing_reference` speaker plays at most at the sweep level **and** at most at that
+  speaker's own valid confirmed level. If the reference speaker has no valid confirmation,
+  the chirp is held at `start_level_dbfs`, even when the swept speaker was confirmed louder.
 * **Every generated file is checked** for its peak level before it is played.
-* **Sub:** sweeps and tones on `sub` are limited to `sub_sweep_max_hz`.
+* **Sub:** sweeps, tones and chirps on `sub` or on any sub-only output are limited to
+  `sub_sweep_max_hz` (see "Channels").
 * **Max duration and watchdog:** an action whose planned audible time exceeds
   `max_duration_seconds` is refused before anything plays; a watchdog stops the children if
   they overrun it by more than 5 s (`measurement_timeout`).
@@ -209,7 +238,8 @@ structure and hardware protection in place, and start with the DSP main volume l
     `timing_source=loopback`, `timing_confidence=high` (low if the loopback is weak).
   * Without loopback, each sweep is preceded by a short reference chirp on the
     `timing_reference` speaker: arrivals are **relative to that speaker**,
-    `timing_source=acoustic_reference`, `timing_confidence=low`.
+    `timing_source=acoustic_reference`, `timing_confidence=low`. The result records the
+    chirp's level and band (`reference_level_dbfs`, `reference_band_hz`).
   * `room_propose_alignment` with `measurement_ids` uses these arrivals, removes the DSP delays
     that were active while measuring, and refuses mixing timing sources or references.
 * **Calibration:** `measure_import_calibration` accepts UMIK/miniDSP files (`"Sens Factor
@@ -238,9 +268,28 @@ Phases: `await_placement` → `await_noise_check` → `await_sweeps` → `positi
   (`accept_quality=true`).
 * The main position (P0) cannot be skipped. `measure_session_finish` needs every position
   measured unless `allow_partial=true`.
-* Averages: power average (default; robust, magnitude only) or vector average (keeps phase;
-  only meaningful with consistent timing, e.g. loopback). The per-channel averages and the
-  main-position sweeps are returned with the next steps.
+* While a measurement of the session is running in this server, `measure_session_advance`
+  (`next`, `redo_channel`, `redo_position`, `skip_position`) is refused with `busy`: wait for
+  it or call `measure_abort`. Every advance also bumps a session **epoch**. A measurement
+  that started before the step changed (for example a second server process redid the
+  position meanwhile) is kept in the history but **not attached** to the session
+  (`session_note` says so), so the redone position still needs placement and a noise check.
+* Averages: power average (default; robust, magnitude only) or vector average (keeps phase).
+  The per-channel averages and the main-position sweeps are returned with the next steps.
+* **What phase a vector average uses:** each sweep's impulse response is windowed around
+  **its own** impulse peak, and that peak's (fractional) delay is removed before the phase is
+  computed. So the vector average combines *peak-aligned* phase, not phase on a shared
+  absolute clock. Loopback or acoustic timing is not used to align the phase. Arrival
+  differences between positions are therefore removed, not averaged. If a position's
+  strongest peak is a reflection rather than the direct sound, its phase is referenced to
+  the wrong instant and skews the average.
+* Vector averaging is refused (`timing_low_confidence`) when the inputs mix timing sources
+  or any input has low or unknown timing confidence (acoustic-reference and REW timings are
+  always low). `allow_low_confidence=true` (on `measure_average` and
+  `measure_session_finish`) computes it anyway; the result is then flagged
+  (`low_confidence`, `low_confidence_reasons`, `LOW-CONFIDENCE` in its notes). The finish
+  step checks every channel before saving anything, so a refusal leaves no partial averages.
+  Power averaging never needs timing.
 * Resources: `garage-audio://room/profile`, `garage-audio://measure/plan`,
   `garage-audio://measure/session`.
 
@@ -266,10 +315,49 @@ control) for `measure_sweep`; results are stored the same
 way (`timing_source=rew`). REW plays through the output device configured **inside REW**;
 that must be the stack sink, never the DAC. The server cannot verify REW's routing and says
 so in every result. Noise and level checks are not available through this backend
-(`not_supported`). The endpoint table in `garage_audio/ops_mcp/measure_rew.py` was written
-from the REW API description and has **not** been checked against a live REW instance; check
-it against your REW build's API page before relying on it. Some automation may require a
-REW Pro licence.
+(`not_supported`). The sweep level sent to REW is still capped by the same policy (start
+level unless a valid level check was made with the builtin backend).
+
+**A REW Pro licence is required.** Starting a sweep and reading results back through the API
+is a Pro feature; without it REW refuses the measure command and the tool returns
+`rew_error`.
+
+Behaviour:
+
+* REW's **blocking mode** is read first, switched on for the measurement and switched back
+  off afterwards if it was off. If it could not be read it is left on, and the result notes
+  that.
+* The blocking measure call runs in a **worker thread**. `measure_abort` or the action's
+  deadline sends REW's cancel command and returns without waiting for REW to finish
+  (`measurement_aborted` / `measurement_timeout`).
+* Measurement **indices are 1-based** (REW's numbering); a list-shaped `/measurements` answer
+  is numbered from 1 (configurable with `index_base`).
+* Every result carries a note that REW's routing and the protocol table are unverified.
+
+**Protocol table: unverified against a live REW.** Every endpoint path, command name and
+payload field lives in one table (`PROTOCOL` in `garage_audio/ops_mcp/measure_rew.py`). It
+follows the published API description as far as it could be read; it has **not** been
+checked against a running REW, and the tests use a fake. The installed REW serves its own
+API description on the API port, and that is authoritative. Override any key with
+`measurement.rew.protocol` (validated: plain absolute paths, `{id}` where the default has
+it, plain identifiers for names, `index_base` 0 or 1; unknown keys stop startup):
+
+| Key | Default (unverified) | Used for |
+|---|---|---|
+| `path.version` | `/version` | Reachability/version check |
+| `path.blocking` | `/application/blocking` | Read (GET) and set (POST) blocking mode |
+| `path.level` | `/measure/level` | Sweep level (dBFS) |
+| `path.sweep_config` | `/measure/sweep/configuration` | Sweep start/end frequency and length |
+| `path.naming` | `/measure/naming` | Measurement title |
+| `path.command` | `/measure/command` | Measure / cancel commands |
+| `path.measurements` | `/measurements` | List of measurements (keyed by index) |
+| `path.frequency_response` | `/measurements/{id}/frequency-response` | Response of the new measurement |
+| `path.impulse_response` | `/measurements/{id}/impulse-response` | Impulse of the new measurement |
+| `command.measure` | `Measure` | The sweep command (REW also has an SPL command) |
+| `command.cancel` | `Cancel` | Abort / deadline |
+| `field.command` | `command` | Command field in the command body |
+| `field.sweep_start` / `.sweep_end` / `.sweep_length` | `startFreq` / `endFreq` / `length` | Sweep configuration fields |
+| `index_base` | `1` | First measurement index of a list-shaped answer |
 
 ## Phone microphone (design only)
 
@@ -315,12 +403,18 @@ Design if it is ever built:
   (a simulated room with room-mode resonances, speaker delays, noise, start latency and
   optional clipping/disconnection). Stated tolerances: arrival/delay ±0.1 ms (loopback and
   acoustic reference), magnitude ±1 dB over 30 Hz–16 kHz against the analytic response, room
-  modes within 3 % in frequency and 1 dB in level; calibration flattening; exports; REW
-  backend against a fake; behaviour without numpy.
+  modes within 3 % in frequency and 1 dB in level; calibration flattening; exports; narrow
+  (two-octave) sweeps; REW backend against a fake (blocking mode restore, cancel on abort and
+  deadline, 1-based indices, protocol overrides); behaviour without numpy.
 * `tests/ops_mcp_measure_safety.py`: gate, confirmation, level cap, gentle start, stepwise
-  level check, sub cap, max duration, preflight refusals, one-at-a-time, abort (real child
-  processes, an unrelated process survives) and the watchdog.
-* `tests/ops_mcp_measure_session.py`: room profile, modes, plan, session state machine,
-  averaging and the hand-off to the correction tools.
+  level check, level expiry and snapshot binding, reference-chirp level, sub cap on sub-only
+  outputs (sweep, tone, chirp), max duration, preflight refusals (including Music Assistant
+  unreachable), configuration guardrails (raw ALSA names, bare ALSA players, listing
+  allowlist), one-at-a-time, abort (real child processes, an unrelated process survives)
+  and the watchdog.
+* `tests/ops_mcp_measure_session.py`: room profile, modes, plan, session state machine
+  (including advance refused mid-sweep and stale results discarded by epoch), averaging
+  (vector timing refusal and the low-confidence flag) and the hand-off to the correction
+  tools.
 
 Not verified: a real microphone, interface, PipeWire sink, REW instance or room.
