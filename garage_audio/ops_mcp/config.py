@@ -78,8 +78,23 @@ DEFAULT = {
         'limits': {},
         'rew': {'url': None, 'timeout_seconds': 60, 'protocol': {}},
         'plan': {'radius_m': 0.3, 'positions': 6},
+        # Microphone calibration files (see docs/ops-mcp-measurement.md "Microphone calibration").
+        'calibration': {
+            'default_orientation': '90',    # mic pointing straight up (the plan default)
+            'retention': 20,
+            'import_dir': None,              # absolute directory the operator copies files into
+            'max_import_bytes': 1048576,
+            'timeout_seconds': 15,
+            'max_download_bytes': 1048576,
+            'min_fetch_interval_seconds': 30,
+            'providers': {
+                'minidsp': {'enabled': True},
+                'url': {'enabled': False, 'allowed_hosts': []},
+            },
+        },
     },
 }
+HOST_NAME = re.compile(r'(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]')
 MEASURE_CHANNELS = ('left', 'right', 'sub', 'sum')
 SMOOTHING = {'none': 0.0, '1/1': 1.0, '1/3': 1 / 3, '1/6': 1 / 6, '1/12': 1 / 12, '1/24': 1 / 24, '1/48': 1 / 48}
 PLACEHOLDERS = ('{file}', '{rate}', '{channels}', '{seconds}')
@@ -275,7 +290,47 @@ def _measurement(data, policy):
     plan = m['plan']
     out['plan'] = {'radius_m': _number('measurement.plan.radius_m', plan['radius_m'], 0.1, 1.0),
                    'positions': _int('measurement.plan.positions', plan['positions'], 4, 8)}
+    out['calibration'] = _calibration(m['calibration'])
     return out
+
+
+def _bool(name, value):
+    if not isinstance(value, bool):
+        raise ConfigError(f'{name} must be true or false')
+    return value
+
+
+def _calibration(c):
+    name = 'measurement.calibration'
+    if c['default_orientation'] not in ('0', '90'):
+        raise ConfigError(f'{name}.default_orientation must be "0" or "90"')
+    import_dir = _optional_path(f'{name}.import_dir', c['import_dir'])
+    if import_dir is not None and not import_dir.startswith('/'):
+        raise ConfigError(f'{name}.import_dir must be an absolute path')
+    providers = c['providers']
+    minidsp, url = providers['minidsp'], providers['url']
+    hosts = url['allowed_hosts']
+    if not isinstance(hosts, list) or len(hosts) > 16:
+        raise ConfigError(f'{name}.providers.url.allowed_hosts must be a list of at most 16 host names')
+    clean = []
+    for host in hosts:
+        if not isinstance(host, str) or not HOST_NAME.fullmatch(host.lower().rstrip('.')):
+            raise ConfigError(f'{name}.providers.url.allowed_hosts entries must be DNS host names (no IP '
+                              'addresses, ports, schemes or wildcards)')
+        clean.append(host.lower().rstrip('.'))
+    url_enabled = _bool(f'{name}.providers.url.enabled', url['enabled'])
+    if url_enabled and not clean:
+        raise ConfigError(f'{name}.providers.url.enabled needs a non-empty allowed_hosts list')
+    return {'default_orientation': c['default_orientation'],
+            'retention': _int(f'{name}.retention', c['retention'], 5, 200),
+            'import_dir': import_dir,
+            'max_import_bytes': _int(f'{name}.max_import_bytes', c['max_import_bytes'], 1024, 4 * 1048576),
+            'timeout_seconds': _number(f'{name}.timeout_seconds', c['timeout_seconds'], 2, 60),
+            'max_download_bytes': _int(f'{name}.max_download_bytes', c['max_download_bytes'], 1024, 4 * 1048576),
+            'min_fetch_interval_seconds': _number(f'{name}.min_fetch_interval_seconds',
+                                                  c['min_fetch_interval_seconds'], 5, 86400),
+            'providers': {'minidsp': {'enabled': _bool(f'{name}.providers.minidsp.enabled', minidsp['enabled'])},
+                          'url': {'enabled': url_enabled, 'allowed_hosts': clean}}}
 
 
 ENV = {

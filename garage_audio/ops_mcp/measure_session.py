@@ -157,6 +157,7 @@ def _view(session):
     return {'session_id': session['session_id'], 'status': session['status'], 'phase': session['phase'],
             'current_position': pos['id'] if pos else None, 'channels': session['channels'],
             'average': session['average'], 'calibration_id': session.get('calibration_id'),
+            'mic_orientation': session_orientation(session),
             'levels': session.get('levels', {}), 'positions': positions, 'result': session.get('result'),
             'next_step': instruction(session)}
 
@@ -169,16 +170,26 @@ def start(ctx, args):
     if unknown or len(set(channels)) != len(channels):
         raise OpsError('invalid_argument', f'channels must be distinct entries of measurement.channel_map '
                        f'{sorted(m["channel_map"])}', unknown=unknown)
+    from . import measure_cal  # late import: measure_cal imports measure
     cal_id = args.get('calibration_id')
     orientation = args.get('mic_orientation')
+    warnings = []
     if cal_id:
         cal = measure.get_calibration(ctx, cal_id)
         orientation = orientation or (cal['orientation'] if cal['orientation'] in ('0', '90') else None)
+        if cal['orientation'] in ('0', '90') and cal['orientation'] != orientation:
+            warnings.append(f'calibration {cal_id} is the {cal["orientation"]}-degree file but the mic orientation is '
+                            f'{orientation} degrees')
+    orientation = orientation or m['calibration']['default_orientation']
+    cal_source = 'explicit' if cal_id else None
+    if not cal_id:
+        cal_id = measure_cal.active_id(ctx, orientation)
+        cal_source = f'active {orientation}-degree calibration' if cal_id else None
     profile = room_model.load(ctx)
     listening = args.get('listening_position', 'main')
     the_plan = room_model.plan(profile, count=args.get('positions', m['plan']['positions']),
                                radius=args.get('radius_m', m['plan']['radius_m']), listening=listening,
-                               ear_height=args.get('ear_height_m'), orientation=orientation or '90')
+                               ear_height=args.get('ear_height_m'), orientation=orientation)
     with _locked(ctx) as directory:
         old = _active(directory)
         if old is not None:
@@ -192,6 +203,7 @@ def start(ctx, args):
         ident = new_id(ctx.clock)
         session = {'session_id': ident, 'status': 'active', 'phase': 'await_placement', 'current': 0,
                    'created_at': round(ctx.clock(), 3), 'channels': channels, 'calibration_id': cal_id,
+                   'calibration_source': cal_source, 'mic_orientation': orientation,
                    'average': args.get('average', 'power'), 'plan': the_plan, 'levels': {},
                    'positions': {p['id']: {'state': 'pending', 'channels': {}} for p in the_plan['positions']},
                    'profile_missing': room_model.missing_fields(profile)}
@@ -199,10 +211,34 @@ def start(ctx, args):
         _save(ctx, directory, session)
     view = _view(session)
     view['plan'] = the_plan
+    if cal_source and cal_source != 'explicit':
+        view['calibration_note'] = f'calibration {cal_id} ({cal_source}) applied automatically to this session'
     if not cal_id:
-        view['warning'] = ('no calibration_id: responses are uncorrected for the microphone (import one with '
-                           'measure_import_calibration for a calibrated mic)')
+        warnings.append(f'no active {orientation}-degree microphone calibration: responses are uncorrected for the '
+                        'mic. Check measure_calibration_status; measure_mic_detect + measure_calibration_fetch '
+                        '(needs allow_write) or measure_import_calibration install one, then start again with '
+                        'replace=true')
+    if warnings:
+        view['warning'] = '; '.join(warnings)
     return view
+
+
+def session_orientation(session):
+    """'0' or '90': stored since calibration auto-selection; older sessions are inferred from the plan text."""
+    if session.get('mic_orientation') in ('0', '90'):
+        return session['mic_orientation']
+    text = str((session.get('plan') or {}).get('mic_orientation', ''))
+    return '0' if 'horizontally' in text else '90'
+
+
+def active_calibration_view(ctx):
+    """The active session's calibration and mic orientation (None without an active session)."""
+    with _locked(ctx) as directory:
+        session = _active(directory)
+    if session is None:
+        return None
+    return {'session_id': session['session_id'], 'orientation': session_orientation(session),
+            'calibration_id': session.get('calibration_id'), 'calibration_source': session.get('calibration_source')}
 
 
 def status(ctx, args):
@@ -333,7 +369,7 @@ def plan_tool(ctx, args):
     out = room_model.plan(profile, count=args.get('positions', m['plan']['positions']),
                           radius=args.get('radius_m', m['plan']['radius_m']),
                           listening=args.get('listening_position', 'main'), ear_height=args.get('ear_height_m'),
-                          orientation=args.get('mic_orientation', '90'))
+                          orientation=args.get('mic_orientation', m['calibration']['default_orientation']))
     out['profile_missing'] = room_model.missing_fields(profile)
     return out
 

@@ -155,12 +155,16 @@ class SyntheticRecovery(unittest.TestCase):
         grid = [10.0 * 2 ** (i / 12.0) for i in range(12 * 11 + 1)]
         text = '"Sens Factor =-1.25dB, AGain =18dB, SERNO: 0000000"\n' + '\n'.join(
             f'{f:.3f}\t{mic_only.response_db(f):.4f}' for f in grid if f <= 20000.0)
+        raw = sweep(h, 'left')  # before any calibration is installed
         cal = tools.call(h.ctx, 'measure_import_calibration', {'text': text, 'name': 'synthetic 90deg'})
         self.assertEqual(cal['orientation'], '90')
         self.assertEqual(cal['sensitivity_factor_db'], -1.25)
-        raw = sweep(h, 'left')
-        corrected = sweep(h, 'left', calibration_id=cal['calibration_id'])
+        self.assertEqual(cal['activated'], {'90': cal['calibration_id']})
+        # No calibration_id: the active calibration for the default (90-degree) orientation is applied automatically.
+        corrected = sweep(h, 'left')
         self.assertTrue(corrected['calibration_applied'])
+        self.assertEqual(points(h, corrected['measurement_id'])[2]['calibration_id'], cal['calibration_id'])
+        self.assertTrue(any('applied automatically' in note for note in corrected['notes']))
         speaker = h.room.speakers[0]
         for result, expect_ok in ((raw, False), (corrected, True)):
             freqs, dbs, rec = points(h, result['measurement_id'])

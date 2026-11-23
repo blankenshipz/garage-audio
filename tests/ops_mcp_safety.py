@@ -35,6 +35,7 @@ WRITE_CALLS = {
     'dsp_set_channel_gain': {'channel': 'sub', 'gain_db': -2},
     'dsp_restore_backup': {'backup_id': ID},
     'room_apply_correction': {'proposal_id': ID},
+    'measure_calibration_fetch': {'model': 'UMIK-1', 'serial': '000-0000'},
 }
 
 

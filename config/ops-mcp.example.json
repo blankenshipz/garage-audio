@@ -2,6 +2,7 @@
   "_comment": "EXAMPLE ONLY - garage-audio ops MCP server configuration. Copy to a private location (for example /etc/garage-audio-ops-mcp/config.json), edit the placeholders and point --config or GARAGE_OPS_MCP_CONFIG at it. No script installs this file. See docs/ops-mcp.md.",
   "_comment_safety": "Read-only by default. allow_write enables recovery, DSP edits and pause/stop. allow_playback (together with allow_write) lets the agent start playback and change player volume. Limits can only be tightened below the hard caps in garage_audio/ops_mcp/safety.py; looser values are rejected at startup.",
   "_comment_measure": "allow_measure (together with allow_write) lets the agent play measurement signals (level-check tones, sweeps) through the stack sink. Requires the optional measurement extra (pip install '.[measurement]', numpy==2.2.6). See docs/ops-mcp-measurement.md. In measurement, replace every <placeholder>: play_argv must target the stack sink that feeds CamillaDSP (never hw:/plughw:/plug:/default:CARD=/alsa_output.*, an ALSA player without an explicit -D, or a shell); find the microphone with pw-record --list-targets, arecord -l or the measure_list_devices tool (list_devices_argv accepts only read-only listing programs). A confirmed level expires after limits.level_ttl_seconds (max 1800) and whenever the DSP volume, mute, routing, capture device or calibration changes. If Music Assistant is configured it must be reachable for any audible measurement. The sub cap applies to sub and to any channel that includes a sub-only output. rew.protocol can override the REW endpoint/command table, which is unverified against a live REW; automated REW sweeps need a REW Pro licence.",
+  "_comment_calibration": "measurement.calibration: mic calibration files. measure_calibration_fetch (needs allow_write, not allow_measure) is the only tool that uses the internet: HTTPS to each provider's host allowlist only, public addresses only, size/time capped, no retries. providers.minidsp downloads UMIK-1/UMIK-2 files from www.minidsp.com via its serial form (success reply unverified against a real serial; miniDSP's robots.txt disallows / - this is one user-initiated request per fetch; set enabled=false to use only the manual download + measure_import_calibration path). providers.url stays disabled unless you enable it AND list allowed_hosts (DNS names only). import_dir (absolute path) is the only directory measure_import_calibration may read files from; default_orientation 90 = mic pointing straight up. See docs/ops-mcp-measurement.md 'Microphone calibration'.",
   "allow_write": false,
   "allow_playback": false,
   "allow_measure": false,
@@ -81,6 +82,19 @@
       "level_ttl_seconds": 1800.0
     },
     "rew": {"url": null, "timeout_seconds": 60, "protocol": {}},
-    "plan": {"radius_m": 0.3, "positions": 6}
+    "plan": {"radius_m": 0.3, "positions": 6},
+    "calibration": {
+      "default_orientation": "90",
+      "retention": 20,
+      "import_dir": null,
+      "max_import_bytes": 1048576,
+      "timeout_seconds": 15,
+      "max_download_bytes": 1048576,
+      "min_fetch_interval_seconds": 30,
+      "providers": {
+        "minidsp": {"enabled": true},
+        "url": {"enabled": false, "allowed_hosts": []}
+      }
+    }
   }
 }

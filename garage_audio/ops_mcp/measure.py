@@ -481,7 +481,9 @@ def level_check(ctx, args, session=None):
         raise SafetyError(f'start_level_dbfs={start} is above the gentle start level {policy.start_level_dbfs}',
                           maximum=policy.start_level_dbfs)
     mm, stack, notes = _preflight(ctx, channel)
-    cal_id = args.get('calibration_id') or (session or {}).get('calibration_id')
+    cal_id, cal_source = resolve_calibration(ctx, args, session)
+    if cal_id and cal_source not in ('explicit', 'session'):
+        notes.append(f'calibration {cal_id} ({cal_source}) applied automatically')
     if cal_id:
         get_calibration(ctx, cal_id)  # must exist: the confirmation is bound to it
     snapshot = level_snapshot(ctx, channel, stack, cal_id)
@@ -599,9 +601,11 @@ def sweep(ctx, args, session=None):
     if 'level_dbfs' in args:
         safety.check_measure_level(policy, float(args['level_dbfs']))
     smoothing = args.get('smoothing', m['smoothing'])
-    cal_id = args.get('calibration_id') or session.get('calibration_id')
+    cal_id, cal_source = resolve_calibration(ctx, args, session)
     cal = get_calibration(ctx, cal_id) if cal_id else None
     mm, stack, notes = _preflight(ctx, channel)
+    if cal_id and cal_source not in ('explicit', 'session'):
+        notes.append(f'calibration {cal_id} ({cal_source}) applied automatically')
     # The confirmed level is matched against the stack as it is now (volume, routing, capture, calibration).
     allowed, basis = _allowed_level(ctx, channel, session, level_snapshot(ctx, channel, stack, cal_id))
     level = float(args.get('level_dbfs', allowed))
@@ -852,7 +856,21 @@ def get_measurement(ctx, args):
 
 # ---- microphone calibration ------------------------------------------------------------
 def calibrations(ctx):
-    return Journal(ctx.config.state_dir, CAL_DIR, CAL_RETENTION, ctx.clock)
+    from . import measure_cal  # the calibration journal never prunes an active calibration
+    return measure_cal.journal(ctx)
+
+
+def resolve_calibration(ctx, args, session):
+    """(calibration_id, source) for a measurement: explicit argument, else the session's pinned calibration, else
+    (no session) the active calibration for the configured default orientation."""
+    if args.get('calibration_id'):
+        return args['calibration_id'], 'explicit'
+    if session and session.get('session_id'):
+        return session.get('calibration_id'), 'session'
+    from . import measure_cal
+    orientation = ctx.config.measurement['calibration']['default_orientation']
+    ident = measure_cal.active_id(ctx, orientation)
+    return ident, (f'active {orientation}-degree calibration' if ident else None)
 
 
 _NUM = r'([-+]?(?:\d+(?:\.\d*)?|\.\d+))'  # UMIK files may write "-.7dB"
@@ -889,16 +907,8 @@ def parse_calibration(text, name, orientation=None):
 
 
 def import_calibration(ctx, args):
-    record = calibrations(ctx).save(parse_calibration(args['text'], args['name'], args.get('orientation')))
-    pts = record['points']
-    return {'calibration_id': record['id'], 'name': record['name'], 'orientation': record['orientation'],
-            'sensitivity_factor_db': record['sensitivity_factor_db'], 'points': len(pts),
-            'freq_range_hz': [pts[0][0], pts[-1][0]],
-            'correction_range_db': [round(min(p[1] for p in pts), 2), round(max(p[1] for p in pts), 2)],
-            'mic_orientation_advice': orientation_advice(record['orientation']),
-            'note': 'The correction is subtracted from every measurement that names this calibration_id. '
-                    'Sensitivity is recorded for reference; responses stay relative (dB re digital transfer), '
-                    'which is what EQ needs.'}
+    from . import measure_cal
+    return measure_cal.import_calibration(ctx, args)
 
 
 def orientation_advice(orientation):
@@ -918,16 +928,20 @@ def get_calibration(ctx, ident):
 
 
 def list_calibrations(ctx, _args):
+    from . import measure_cal
     out = []
     journal = calibrations(ctx)
-    for ident in journal.list(CAL_RETENTION):
+    active = {o: measure_cal.active_id(ctx, o) for o in measure_cal.ORIENTATIONS}
+    for ident in journal.list(ctx.config.measurement['calibration']['retention']):
         try:
             rec = journal.get(ident)
         except OpsError:
             continue
         out.append({'calibration_id': ident, 'name': rec.get('name'), 'orientation': rec.get('orientation'),
-                    'sensitivity_factor_db': rec.get('sensitivity_factor_db'), 'points': len(rec.get('points') or [])})
-    return {'calibrations': out}
+                    'sensitivity_factor_db': rec.get('sensitivity_factor_db'), 'points': len(rec.get('points') or []),
+                    'model': rec.get('model'), 'serial': rec.get('serial'), 'provider': rec.get('provider'),
+                    'active_for': [o for o, i in active.items() if i == ident]})
+    return {'calibrations': out, 'active': active}
 
 
 def calibration_offsets(points, grid):

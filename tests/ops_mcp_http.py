@@ -129,7 +129,7 @@ class Http(unittest.TestCase):
         listed = self.post(rpc('tools/list', ident=2), **{'mcp-protocol-version': '2025-06-18'})
         self.assertEqual(listed.status_code, 200, listed.text)
         names = {t['name']: t for t in listed.json()['result']['tools']}
-        self.assertEqual(len(names), 57)
+        self.assertEqual(len(names), 60)
         self.assertFalse(names['dsp_set_main_volume']['_meta']['garage-audio/enabled'])
         self.assertFalse(names['measure_sweep']['_meta']['garage-audio/enabled'])
         self.assertTrue(names['measure_sweep']['annotations']['destructiveHint'])

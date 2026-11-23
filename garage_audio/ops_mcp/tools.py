@@ -19,7 +19,7 @@ import logging
 from dataclasses import dataclass
 from typing import Callable
 
-from . import dsp, health, measure, measure_session, music, recovery, room, room_model
+from . import dsp, health, measure, measure_cal, measure_session, music, recovery, room, room_model
 from .config import CHANNELS, MEASURE_CHANNELS, SMOOTHING
 from .errors import OpsError
 from .schema import validate
@@ -76,6 +76,10 @@ PROFILE = obj({
     'seating': obj({'width': LEN, 'depth': LEN}),
     'obstacles': {'type': 'array', 'items': TEXT, 'maxItems': 20}})
 AVERAGE = {'type': 'string', 'enum': ['power', 'vector']}
+MIC_MODEL = {'type': 'string', 'pattern': r'^[A-Za-z0-9][A-Za-z0-9 ._-]{0,39}$',
+             'description': 'Microphone model, e.g. UMIK-1 or UMIK-2 (other models: provider "url" or an import).'}
+MIC_SERIAL = {'type': 'string', 'pattern': measure_cal.SERIAL_PATTERN,
+              'description': 'Serial number printed on the microphone, XXX-XXXX (7 digits).'}
 PLAN = {'positions': {'type': 'integer', 'minimum': 4, 'maximum': 8},
         'radius_m': {'type': 'number', 'minimum': 0.1, 'maximum': 1.5},
         'ear_height_m': {'type': 'number', 'minimum': 0.3, 'maximum': 2.5},
@@ -228,11 +232,39 @@ TOOLS = [
     Tool('measure_list_devices', READ, 'List capture devices via the configured read-only commands (e.g. arecord -l, '
          'pw-record --list-targets).', obj(), measure.list_devices),
     Tool('measure_import_calibration', LOCAL, 'Import a microphone calibration file (UMIK/miniDSP text with "Sens '
-         'Factor" header, or generic "freq dB" lines; 0- or 90-degree variant).',
+         'Factor" header, or generic "freq dB" lines; 0- or 90-degree variant). Give exactly one of: text (the file '
+         'contents), path (a file name inside the operator-configured measurement.calibration.import_dir; nothing '
+         'else on the server is readable), or calibration_id + orientation (activate a stored calibration). A '
+         'calibration with a known orientation becomes the active one for it (activate=false to only store it) and '
+         'is then applied automatically to measurements with the mic in that orientation.',
          obj({'text': {'type': 'string', 'minLength': 1, 'maxLength': 262144},
+              'path': {'type': 'string', 'minLength': 1, 'maxLength': 255},
+              'calibration_id': ID,
               'name': {'type': 'string', 'minLength': 1, 'maxLength': 100},
-              'orientation': {'type': 'string', 'enum': ['0', '90']}}, ['text', 'name']), measure.import_calibration),
-    Tool('measure_list_calibrations', READ, 'Imported microphone calibrations.', obj(), measure.list_calibrations),
+              'orientation': {'type': 'string', 'enum': ['0', '90']},
+              'model': MIC_MODEL, 'serial': MIC_SERIAL, 'activate': {'type': 'boolean'}}),
+         measure.import_calibration),
+    Tool('measure_list_calibrations', READ, 'Stored microphone calibrations (newest first) with model, serial, '
+         'provider and which orientation each is active for.', obj(), measure.list_calibrations),
+    Tool('measure_calibration_status', READ, 'Which microphone calibration is active for 0 and 90 degrees (with its '
+         'provenance), whether the active measurement session uses the calibration matching its mic orientation, '
+         'which download providers are enabled, and the next step when none is installed.', obj(),
+         measure_cal.status),
+    Tool('measure_mic_detect', READ, 'Detect the measurement microphone (read-only: USB device strings in /sys, '
+         'ALSA cards in /proc/asound, the configured device listing). Reports the model (UMIK-1 / UMIK-2 / unknown) '
+         'and a USB serial only as a candidate to confirm with the user; otherwise asks for the serial printed on '
+         'the mic.', obj({'include_device_listing': {'type': 'boolean'}}), measure_cal.detect),
+    Tool('measure_calibration_fetch', WRITE, 'Download the per-serial calibration file for the user\'s microphone '
+         'and install it (validated, stored with provenance, activated per orientation). provider "minidsp" '
+         '(UMIK-1/UMIK-2; default for those models) submits miniDSP\'s public serial form once; its success reply is '
+         'UNVERIFIED against a real serial. provider "url" (operator-enabled hosts only) downloads one https file. '
+         'One request per call, no retries, rate-limited. Needs allow_write (not allow_measure). If it fails or is '
+         'disabled, follow the returned manual_steps and use measure_import_calibration.',
+         obj({'model': MIC_MODEL, 'serial': MIC_SERIAL,
+              'orientation': {'type': 'string', 'enum': ['0', '90', 'both']},
+              'provider': {'type': 'string', 'enum': sorted(measure_cal.PROVIDERS)},
+              'url': {'type': 'string', 'minLength': 9, 'maxLength': 2048, 'pattern': r'^https://\S+$'},
+              'activate': {'type': 'boolean'}}, ['model']), measure_cal.fetch),
     Tool('measure_get', READ, 'One stored measurement: settings, timing (source/confidence), quality, octave '
          'summary, exported files (.frd, REW .txt, impulse WAV); include_points for the full curve.',
          obj({'measurement_id': ID, 'include_points': {'type': 'boolean'}}, ['measurement_id']),
@@ -302,6 +334,7 @@ TOOLS = [
 ]
 BY_NAME = {tool.name: tool for tool in TOOLS}
 assert len(BY_NAME) == len(TOOLS)
+OPEN_WORLD = frozenset({'measure_calibration_fetch'})  # the only tool that talks to the internet
 
 
 def enabled(config, tool):
@@ -336,7 +369,8 @@ def describe(config):
                     'access': tool.access, 'enabled': on,
                     'annotations': {'readOnlyHint': tool.access in (READ, LOCAL),
                                     'destructiveHint': tool.access in (WRITE, PLAYBACK, MEASURE),
-                                    'idempotentHint': tool.access == READ, 'openWorldHint': False}})
+                                    'idempotentHint': tool.access == READ,
+                                    'openWorldHint': tool.name in OPEN_WORLD}})
     return out
 
 

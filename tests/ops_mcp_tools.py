@@ -20,7 +20,7 @@ ROOT = Path(__file__).parents[1]
 
 class Registry(unittest.TestCase):
     def test_every_tool_has_strict_schema_and_description(self):
-        self.assertEqual(len(tools.TOOLS), 57)
+        self.assertEqual(len(tools.TOOLS), 60)
         for tool in tools.TOOLS:
             with self.subTest(tool=tool.name):
                 self.assertRegex(tool.name, r'^[a-z][a-z0-9_]{2,63}$')

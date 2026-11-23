@@ -105,7 +105,7 @@ Environment overrides (applied after the file):
 
 ## Security model
 
-* **Read-only by default.** All 57 tools are always listed, so an agent can see what
+* **Read-only by default.** All 60 tools are always listed, so an agent can see what
   exists. Each description starts with `[read-only]`, `[local state only]`, `[WRITE]`,
   `[PLAYBACK]`, `[MEASURE]` or `[STOP]`, and disabled tools say so. A disabled tool is
   **refused server-side** with `write_disabled` before its arguments are parsed or any
@@ -135,6 +135,12 @@ Environment overrides (applied after the file):
 * **No shell, no sudo.** Every command is an argv list from the configuration. The
   server never runs `docker stop`, `kill` or `start`, never escalates privileges and
   never edits supervisor state.
+* **Outbound internet: one tool only.** `measure_calibration_fetch` (write tier) downloads a
+  mic calibration file. It talks only to each provider's host allowlist, over HTTPS, with
+  manual redirects inside that allowlist, and it refuses any non-public address. Responses
+  have a size cap and timeouts, and there are no retries. The generic URL provider is off
+  unless the operator enables it with its own hosts. Details are in
+  [measurement](ops-mcp-measurement.md#microphone-calibration).
 
 ### Playback authority differs from the dashboard MCP
 
@@ -317,8 +323,11 @@ in `state_dir`.
 | `measure_plan` | read | Mic positions around a seat with plain metric/imperial descriptions |
 | `measure_status` | read | Measurement extra installed?, running measurement, confirmed levels, limits |
 | `measure_list_devices` | read | Capture-device listings from configured read-only commands |
-| `measure_import_calibration` | local | Import a UMIK-style or generic mic calibration file |
-| `measure_list_calibrations` | read | Stored mic calibrations |
+| `measure_mic_detect` | read | Find the measurement mic (read-only `/proc` + `/sys` + listing); candidate serial or ask the user |
+| `measure_calibration_status` | read | Active mic calibration per orientation (0°/90°), session match, providers, manual steps |
+| `measure_calibration_fetch` | write | Download the per-serial mic calibration (miniDSP UMIK-1/2; operator-enabled URL), validate, store, activate. The only tool that uses the internet |
+| `measure_import_calibration` | local | Import a UMIK-style or generic calibration from pasted contents or the operator's `import_dir`, or re-activate a stored one |
+| `measure_list_calibrations` | read | Stored mic calibrations with metadata and `active_for` |
 | `measure_noise_check` | measure | Record background noise (plays nothing) |
 | `measure_level_check` | measure | Stepwise level check with a short tone (audible) |
 | `measure_sweep` | measure | Log-sweep measurement of one channel (audible) |

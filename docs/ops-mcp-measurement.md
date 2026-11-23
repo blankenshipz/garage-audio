@@ -18,21 +18,29 @@ real run needs a person in the room.
 2. **Describe the room (agent + person):** `room_profile_update` with dimensions, speaker
    and sub positions, the main seat and ear height. Partial updates are fine; units m, cm,
    ft or in. `room_modes` explains the expected bass problems and placement advice.
-3. **Plan:** `measure_session_start` creates a plan: the main listening position plus 4–8
+3. **Mic calibration (once per microphone):** `measure_calibration_status` shows whether a
+   calibration is active for 0° and 90°. If not: `measure_mic_detect` → the agent asks the
+   person for the serial printed on the mic → `measure_calibration_fetch` (needs
+   `allow_write`) downloads, checks, stores and activates it; if that fails, the person
+   downloads the file in a browser and the agent imports it with
+   `measure_import_calibration`. See "Microphone calibration" below.
+4. **Plan:** `measure_session_start` creates a plan: the main listening position plus 4–8
    nearby positions on a circle (default 30 cm / 1 ft) at ear height, each described in
    plain words in metric and imperial ("about 30 cm to the left of the centre of the
-   seat, same height").
-4. **Per position:** the agent tells the person where to put the mic and **waits for their
+   seat, same height"). The active calibration for the session's mic orientation (default
+   90°, mic pointing up) is pinned automatically; without one the session still starts, with
+   a warning.
+5. **Per position:** the agent tells the person where to put the mic and **waits for their
    confirmation** → `measure_session_confirm_placement` → `measure_noise_check` (silent) →
    first position only: `measure_level_check` per channel (audible, needs
    `user_confirmed=true`) → `measure_sweep` per channel (audible, needs
    `user_confirmed=true`) → quality check → `measure_session_advance` (`next`,
    `redo_channel`, `redo_position`, `skip_position`).
-5. **Result:** `measure_session_finish` averages every channel across the positions
+6. **Result:** `measure_session_finish` averages every channel across the positions
    (power average by default, vector average optional) and stores the averages in the
    measurement history. Hand them to `room_compare_to_target` / `room_propose_peq`; hand
    the main-position sweeps to `room_propose_alignment` (`measurement_ids`).
-6. **Exit and reconnect:** sessions are files under `state_dir`. If the agent disconnects,
+7. **Exit and reconnect:** sessions are files under `state_dir`. If the agent disconnects,
    `measure_session_status` (or the `garage-audio://measure/session` resource) shows the
    exact step to resume at. `measure_abort` stops a running measurement at any time.
 
@@ -52,8 +60,9 @@ exactly this flow, including "never sweep without the person's confirmation".
 
 Mic orientation: with a **90°** calibration file point the mic **straight up** at the ceiling;
 with a **0°** file point it **horizontally at the speakers** (between them for the mains).
-The plan tells the person which one, based on the calibration file's name or the
-`mic_orientation` argument.
+The plan tells the person which one: the `mic_orientation` argument, else the orientation of
+an explicitly given calibration, else `measurement.calibration.default_orientation` (`"90"`).
+The matching active calibration is then applied automatically.
 
 ## How measurement interacts with the running stack
 
@@ -246,17 +255,201 @@ structure and hardware protection in place, and start with the DSP main volume l
     chirp's level and band (`reference_level_dbfs`, `reference_band_hz`).
   * `room_propose_alignment` with `measurement_ids` uses these arrivals, removes the DSP delays
     that were active while measuring, and refuses mixing timing sources or references.
-* **Calibration:** `measure_import_calibration` accepts UMIK/miniDSP files (`"Sens Factor
-  =…dB, AGain=…"` header) and generic `freq dB` files, records 0°/90° from the name or an
-  argument, and stores them (last 20). Pass `calibration_id` to sweeps or sessions; the
-  correction is subtracted from the response. The sensitivity factor is recorded; responses
-  are relative (dB re the digital transfer), not absolute SPL.
+* **Calibration:** the correction is subtracted from the response. Which file is used:
+  an explicit `calibration_id`, else the session's pinned calibration, else the active
+  calibration for `measurement.calibration.default_orientation`. The id is recorded in the
+  measurement metadata and in confirmed-level snapshots. The sensitivity factor is recorded;
+  responses are relative (dB re the digital transfer), not absolute SPL. See "Microphone
+  calibration".
 * **Files** (per measurement, under `state_dir/measurement-files/<id>/`, directory 0700,
   files 0600, written atomically): `measurement.json` (channel, position, session,
   calibration, settings, timing, quality, stack state, timestamp), `response.frd`,
   `response-rew.txt` (REW-importable text), `impulse.wav` (mono 32-bit PCM, peak-normalised). The response also
   enters the measurement history, so `room_compare_to_target` and `room_propose_peq` take its
   `measurement_id`. Bounded by `measurement.retention`.
+
+## Microphone calibration
+
+A calibrated measurement mic ships with a **per-serial** correction file, usually two
+variants: **0°** (mic pointing at the speakers) and **90°** (mic pointing straight up; miniDSP
+generates this one automatically). The server can find the mic, download its file, check
+it, store it and use it automatically.
+
+### Tools
+
+The user asked for tools to "detect the mic, download the calibration file, check its status
+and import one". This repo keeps its `measure_` prefix, so they are named:
+
+| Requested | Tool | Tier | What it does |
+|---|---|---|---|
+| detect mic | `measure_mic_detect` | read | Looks for UMIK-1 / UMIK-2 (and other USB capture devices) |
+| download calibration | `measure_calibration_fetch` | **write** (`allow_write`; not `allow_measure`) | Downloads, validates, stores and activates the file for a serial |
+| calibration status | `measure_calibration_status` | read | Active calibration per orientation, whether the session matches, providers, manual steps |
+| import calibration | `measure_import_calibration` (extended) | local | Pasted contents, a file from the import directory, or re-activating a stored one |
+| list calibrations | `measure_list_calibrations` | read | Stored calibrations with metadata and `active_for` |
+
+`measure_calibration_fetch` is the only tool that reaches the internet. It is marked
+`openWorldHint=true`.
+
+### Agent flow
+
+1. `measure_calibration_status`. If `ready_for_default_orientation` is true, you are done.
+2. `measure_mic_detect` is read-only. It reads `/proc/asound/cards`,
+   `/proc/asound/card*/{usbid,stream0}`,
+   `/sys/bus/usb/devices/*/{idVendor,idProduct,product,manufacturer,serial}` and the
+   configured `measure_list_devices` output. It runs no new commands and needs no extra
+   privileges. Possible results:
+   * `serial_candidate`: the USB serial string has the 7-digit form. It is reported as
+     **"candidate, confirm with user"**: nobody has verified that the USB string equals the
+     printed serial.
+   * `needs_serial`: a mic was found, but there is no usable serial.
+   * `no_microphone_found`: nothing was found.
+
+   In every case `ask_user` holds a plain question for the person. The serial is printed on
+   the mic body or its box as `XXX-XXXX`.
+3. `measure_calibration_fetch` with `model` (`UMIK-1` / `UMIK-2`), `serial`, `orientation`
+   (`0`, `90` or `both`, the default) and an optional `provider`:
+   * Files are stored and **activated per orientation**. The orientation comes from the
+     file name or header (`90`, `90deg`, `_90`). In a pair, the unmarked file is the 0°
+     file.
+   * A single unmarked file is stored but **not** activated (`needs_orientation`). Ask the
+     person, then call `measure_import_calibration` with `calibration_id` and `orientation`.
+   * Two files with the same marker are both stored and reported as
+     `ambiguous_orientations`.
+4. If the fetch fails (`not_found`, `calibration_unparseable`, `provider_disabled`,
+   `rate_limited`, a network refusal), the error carries `manual_steps`:
+   1. Open the product page in a browser.
+   2. Enter the serial and download the file(s).
+   3. Either paste the contents into `measure_import_calibration` (`text`, `name`,
+      `orientation`, `serial`), or have the operator copy the file into
+      `measurement.calibration.import_dir` and import it with `path`.
+
+The `guided-room-measurement` prompt walks through these steps before the session starts.
+`measure_session_start` without a matching active calibration **warns but still starts**: the
+measurement is then uncorrected.
+
+### Providers
+
+* **`minidsp`** (UMIK-1, UMIK-2; on by default, `providers.minidsp.enabled` turns it off).
+  The only host is `www.minidsp.com`. One fetch is:
+  1. One GET of the product page
+     (`https://www.minidsp.com/products/acoustic-measurement/umik-1` or `/umik-2`).
+  2. Parse *that page's* calibration form: `<form method="POST" action="#umikcalfile">`, or
+     `#umik2calfile` for UMIK-2.
+  3. One form-urlencoded POST to the same page, with `serial1` (3 digits), `serial2`
+     (4 digits) and every other field **exactly as served**. The hidden honeypot text field
+     (its name rotates, e.g. `your_name_here`) stays empty, and the hidden 32-hex-named token
+     keeps its served timestamp value.
+  4. Follow at most 4 file links named after the serial, or a meta-refresh, iframe or script
+     download location, on the allowlisted host.
+
+  An unknown serial gets miniDSP's own message ("Calibration data for UMIK 000-0000 not
+  found. Please check your serial number and try again."), returned as `not_found`.
+* **`url`** (off by default). A direct `https` download link for other microphones.
+  Enabling it needs `providers.url.enabled=true` **and** its own `allowed_hosts` (DNS names
+  only: no IPs, ports or wildcards). URLs with a query string are refused, and HTML pages are
+  not followed.
+* **`import`**: pasted contents or a file in `import_dir` through `measure_import_calibration`.
+  This is not a network provider.
+
+**Dayton Audio** (EMM-6, iMM-6, UMM-6) and **Cross-Spectrum** are not hard-coded: Dayton's
+pages refused automated requests (HTTP 403) and Cross-Spectrum is unverified. Use the `url`
+provider, if the operator allows the vendor's host, or download in a browser and import. A
+new vendor is a `Provider` subclass in `garage_audio/ops_mcp/measure_cal.py` with its own host
+allowlist and tests.
+
+### What is verified about the miniDSP endpoint
+
+* **Observed on 2026-11-23:** the product pages, the form (fields, honeypot, token) and the
+  "not found" reply for an unknown serial.
+* **Not observed: the success reply.** No real serial was available, so none was submitted.
+  The page says the files "begin downloading automatically", with manual links as a
+  fallback. The parser accepts the likely shapes: a direct text or attachment file, a zip, or
+  an HTML page with serial-named links, a meta refresh, an iframe or a script location. This
+  path is **unverified against a real serial**, and every miniDSP result and record says so
+  (`verification`). An unrecognised success page returns `calibration_unparseable` with the
+  manual steps.
+* **robots.txt:** miniDSP's robots.txt disallows `/` for all user agents (assets are
+  allowed). The server does not crawl. A fetch is a single request the user started, for the
+  user's own file:
+  * no retry loops and no artificial delays to get around the timestamp token;
+  * no captcha solving and no browser User-Agent: it sends
+    `garage-audio-ops-mcp/<version> (user-initiated calibration download)`;
+  * at least `min_fetch_interval_seconds` (default 30 s) between fetches from one provider;
+  * an operator switch per provider.
+
+  An operator who does not want this turns the provider off, and the manual path remains.
+
+### Network safety (code-enforced, tested)
+
+* HTTPS only, port 443, no credentials in URLs, and a per-provider host allowlist.
+* Redirects are followed manually, only inside the allowlist and at most 3. After a POST,
+  a 301, 302 or 303 becomes a GET without the body.
+* Every resolved address must be globally routable. Private, shared (CGNAT),
+  loopback, link-local, multicast, reserved, unspecified and IPv4-mapped forms of these are
+  refused **before** connecting. The connection is pinned to the checked address, with
+  certificate and SNI verification for the host name, so DNS cannot change between the
+  check and the connect.
+* Connect and read timeouts (`timeout_seconds`, default 15). The response is read in a
+  stream and refused above `max_download_bytes` (default 1 MiB).
+* Zip archives: at most 16 members, at most 4 MiB uncompressed. Absolute or `..` paths are
+  refused, and only `.txt`, `.cal` and `.frd` members are used.
+* Content-type sanity checks. Fetched URLs are stored as host + path only, never the query.
+* The standard library only (`http.client`, `ssl`, `ipaddress`, `zipfile`).
+
+### Validation
+
+Fetched files and imports are checked by the shared calibration parser, plus these checks:
+* The file must be text: no HTML, no binary.
+* Strictly increasing frequencies, 5 Hz–48 kHz, |dB| ≤ 30, covering at least
+  100 Hz–5 kHz.
+* At least 10 points for downloaded and `import_dir` files. Pasted text keeps the shared
+  parser's minimum, for compatibility.
+* A `SERNO:` header must match the requested serial (`calibration_serial_mismatch`).
+
+For miniDSP, a file is only accepted if it is tied to the serial, through its header or a
+serial-named file or link.
+
+The UMIK header (`"Sens Factor =…dB, AGain =…dB, SERNO: …"`) is kept: the sensitivity
+factor and the gain are recorded.
+
+### Storage
+
+Calibrations live under `state_dir/mic-calibrations/` (directory 0700, files 0600, atomic
+writes, a lock against concurrent imports). Each record holds:
+* `model`, `serial`, `orientation` and how the orientation was decided;
+* `provider`, `source` (host + path), `file_sha256` and `fetched_at`;
+* the parser summary and the verification note.
+
+Raw downloads are not kept. `active.json` maps `0` / `90` to a calibration id. Retention
+(`retention`, default 20) never removes an active calibration or one pinned by the current
+session.
+
+To activate a stored file again, call `measure_import_calibration` with `calibration_id`
+and `orientation`. For a file whose orientation was unknown, this creates a derived record.
+
+### Configuration
+
+```json
+"calibration": {
+  "default_orientation": "90",
+  "retention": 20,
+  "import_dir": null,
+  "max_import_bytes": 1048576,
+  "timeout_seconds": 15,
+  "max_download_bytes": 1048576,
+  "min_fetch_interval_seconds": 30,
+  "providers": {"minidsp": {"enabled": true}, "url": {"enabled": false, "allowed_hosts": []}}
+}
+```
+
+This block goes inside `measurement`.
+
+`import_dir` must be an absolute path. Path imports are resolved with `realpath` and must
+stay inside it; they are refused for:
+* symlinks that lead out, FIFOs and devices;
+* anything over `max_import_bytes`;
+* any path when `import_dir` is not configured. Server paths outside it are never read.
 
 ## Guided session
 
@@ -398,8 +591,11 @@ Design if it is ever built:
 | `measure_plan` | read | Positions around a listening position with plain descriptions |
 | `measure_status` | read | Extra installed?, running measurement, confirmed levels, effective limits |
 | `measure_list_devices` | read | Capture-device listings (configured read-only commands) |
-| `measure_import_calibration` | local | Import a mic calibration file |
-| `measure_list_calibrations` | read | Stored calibrations |
+| `measure_mic_detect` | read | Find the measurement mic (model, candidate serial, or ask for it) |
+| `measure_calibration_status` | read | Active calibration per orientation, session match, providers |
+| `measure_calibration_fetch` | write | Download, validate, store and activate the per-serial file (network) |
+| `measure_import_calibration` | local | Import pasted contents or an `import_dir` file, or re-activate a stored one |
+| `measure_list_calibrations` | read | Stored calibrations with metadata and `active_for` |
 | `measure_noise_check` | measure | Record background noise (plays nothing) |
 | `measure_level_check` | measure | Stepwise tone level check (audible; `user_confirmed`) |
 | `measure_sweep` | measure | Log-sweep measurement of one channel (audible; `user_confirmed`) |
@@ -427,5 +623,24 @@ Design if it is ever built:
   (including advance refused mid-sweep and stale results discarded by epoch), averaging
   (vector timing refusal and the low-confidence flag) and the hand-off to the correction
   tools.
+* `tests/ops_mcp_measure_calibration.py` runs against a fake miniDSP / URL site and fake
+  `/proc` + `/sys` trees from `tests/fixtures/ops_mcp/cal_site.py`. Every test blocks real
+  DNS and sockets. It covers:
+  * the form submitted as served, with an empty honeypot, the token and an honest UA;
+  * success shapes: a direct file, a zip, serial-named links, meta refresh and script
+    location;
+  * `not_found`, unparseable or changed pages with manual steps, and serial mismatch;
+  * redirect refusals (off-allowlist, http, credentials, port, loops) and private, loopback,
+    CGNAT, multicast and IPv4-mapped addresses refused before connecting;
+  * size and timeout caps (no retry) and zip bombs or traversal;
+  * the URL provider being off by default, its allowlist and query refusal, and config
+    validation;
+  * garbage files and the import-dir containment (traversal, symlink escape, FIFO, size);
+  * write-tier gating, metadata and permissions, retention keeping the active file,
+    concurrent imports and the rate limit;
+  * detection (UMIK-1, UMIK-2, unknown capture, none, listing fallback), automatic
+    selection by orientation, the session warning and the prompt.
 
-Not verified: a real microphone, interface, PipeWire sink, REW instance or room.
+Not verified:
+* a real microphone, interface, PipeWire sink, REW instance or room;
+* the miniDSP **success** reply for a real serial.
