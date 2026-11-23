@@ -67,7 +67,11 @@ measurement WAV -> play_argv (e.g. pw-play) -> stack sink (PipeWire) -> CamillaD
 * The ops server **never opens the DAC**. The DAC stays owned by the supervisor-managed
   stack. The configuration refuses `play_argv` that names a raw ALSA or PipeWire ALSA
   device (`hw:`, `plughw:`, `plug:`, `default:CARD=`, `sysdefault`, `front:`, `surround…`,
-  `iec958`, `dmix`, `dsnoop`, `alsa_output.*`, `/dev/snd/…`), runs an ALSA player (`aplay`,
+  `iec958`, `dmix`, `dsnoop`, `alsa_output.*`, `/dev/snd/…`), including the colon-less ALSA
+  forms (case-insensitive): a `-D`/`--device` value that starts with `hw`, `plughw`, `plug`,
+  `front`, `surround`, `iec958`, `dmix`, `dsnoop` or `sysdefault` is refused, and so is any
+  other argument or option value that is exactly such a name, optionally followed by `:` or
+  `,` and parameters (`hw`, `hw,0`, `surround51`). It also refuses an argv that runs an ALSA player (`aplay`,
   `speaker-test`) without an explicit device (`-D`/`--device`, and not `default`, which may
   be the DAC), or runs through a shell, `env` or `sudo`.
 * Every signal passes CamillaDSP, so its main volume, the volume ceiling, the limits and the
@@ -130,7 +134,7 @@ Without it the server starts and every other tool works; `measure_noise_check`,
 | `measurement.play_argv` | none | Player argv, no shell; must target the stack sink. Placeholders `{file}`, `{rate}`, `{channels}`, `{seconds}` |
 | `measurement.record_argv` | none | Recorder argv writing a WAV to `{file}` from the measurement mic |
 | `measurement.sink_check_argv` | none | Optional read-only probe that exits 0 when the stack sink exists |
-| `measurement.list_devices_argv` | `[["arecord","-l"],["pw-record","--list-targets"]]` | Listings for `measure_list_devices`. Only read-only listing programs are accepted: `arecord -l/-L`, `pw-record --list-targets`, `pw-cli ls/info`, `pw-dump` (no `--monitor`), `pactl list/info`, `wpctl status/inspect`; anything else (a player, a recorder, a setter) stops startup |
+| `measurement.list_devices_argv` | `[["arecord","-l"],["pw-record","--list-targets"]]` | Listings for `measure_list_devices`. Only read-only listing programs are accepted: `arecord -l/-L`, `pw-record --list-targets`, `pw-cli ls/list-objects/info/dump`, `pw-dump` (no `--monitor`), `pactl list/info`, `wpctl status/inspect`; anything else (a player, a recorder, a setter) stops startup. The program must be given by bare name or as exactly `/usr/bin/<name>`, `/bin/<name>` or `/usr/local/bin/<name>`; any other path (e.g. `/opt/x/arecord`) is refused |
 | `measurement.output_channels` | `2` | Channels of the played WAV (the sink's channel count) |
 | `measurement.channel_map` | L `[0]`, R `[1]`, sub `[0,1]`, sum `[0,1]` | Output channels per measured channel |
 | `measurement.capture_channels` / `.mic_channel` | `1` / `0` | Recorded channels and which one is the mic |
@@ -274,6 +278,13 @@ Phases: `await_placement` → `await_noise_check` → `await_sweeps` → `positi
   that started before the step changed (for example a second server process redid the
   position meanwhile) is kept in the history but **not attached** to the session
   (`session_note` says so), so the redone position still needs placement and a noise check.
+* Known limitation (advance): the `busy` check sees only measurements running in **this**
+  server process. A sibling process sharing `state_dir` is not detected there; its late
+  result is still kept out of the session by the epoch check, but the advance is not refused.
+* Known limitation (finish): `measure_session_finish` does not refuse while a measurement is
+  running, and only the vector timing check runs before anything is saved. If saving a later
+  channel's average fails for another reason (for example an unreadable record), averages
+  already saved for earlier channels stay in the history while the session remains active.
 * Averages: power average (default; robust, magnitude only) or vector average (keeps phase).
   The per-channel averages and the main-position sweeps are returned with the next steps.
 * **What phase a vector average uses:** each sweep's impulse response is windowed around

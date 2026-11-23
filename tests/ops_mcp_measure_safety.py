@@ -686,6 +686,41 @@ class MeasurementConfig(unittest.TestCase):
             with self.subTest(argv=argv):
                 self.assertEqual(config_with({'play_argv': argv}).measurement['play_argv'][0], argv[0])
 
+    def test_colonless_raw_alsa_device_names_refused(self):
+        # ALSA accepts "hw", "hw,0", "plughw", "front" ... without a colon; each would bypass the stack.
+        for device in ('hw', 'HW', 'hw,0', 'hw0', 'plughw', 'plughw,1,0', 'plug', 'front', 'Front,0', 'surround',
+                       'surround51', 'surround71,1', 'iec958', 'iec958,2', 'dmix', 'dmix,0', 'dsnoop', 'sysdefault',
+                       'sysdefault,1'):
+            for argv in (['aplay', '-D', device, '{file}'], ['aplay', f'-D{device}', '{file}'],
+                         ['aplay', f'--device={device}', '{file}'], ['aplay', '--device', device, '{file}'],
+                         ['/usr/bin/speaker-test', '-D', device, '-t', 'sine', '{file}']):
+                with self.subTest(argv=argv), self.assertRaises(ConfigError):
+                    config_with({'play_argv': argv})
+        # Other players: an argv item or option value that is exactly such a name is refused as well.
+        for argv in (['sox', '{file}', '-t', 'alsa', 'hw'], ['sox', '{file}', '-t', 'alsa', 'dmix,0'],
+                     ['pw-play', '--target=plughw', '{file}'], ['pw-play', '--target', 'front', '{file}']):
+            with self.subTest(argv=argv), self.assertRaises(ConfigError):
+                config_with({'play_argv': argv})
+        for argv in (['aplay', '-D', 'pipewire', '{file}'], ['pw-play', '--target', 'stack-sink', '{file}'],
+                     ['pw-play', '--target', 'frontroom-stack-sink', '{file}']):
+            with self.subTest(argv=argv):
+                self.assertEqual(config_with({'play_argv': argv}).measurement['play_argv'], argv)
+
+    def test_list_devices_argv_program_path_and_pw_cli_subcommands(self):
+        for lists in ([['/opt/x/arecord', '-l']], [['./arecord', '-l']], [['tmp/arecord', '-l']],
+                      [['/usr/bin/../tmp/arecord', '-l']], [['/usr/sbin/arecord', '-l']], [['//usr/bin/arecord', '-l']],
+                      [['/usr/bin/aplay', '-l']], [['pw-cli', 'i', '42']], [['pw-cli', 'load-module', 'x']],
+                      [['pw-cli', 'set-param', '42']], [['pw-cli', 'info', '-r']], [['pw-cli', 'ls', 'Node', 'x']]):
+            with self.subTest(lists=lists), self.assertRaises(ConfigError):
+                config_with({'list_devices_argv': lists})
+        ok = [['/usr/bin/arecord', '-l'], ['/bin/arecord', '-L'], ['/usr/local/bin/pw-record', '--list-targets'],
+              ['pw-cli', 'dump']]
+        self.assertEqual(config_with({'list_devices_argv': ok}).measurement['list_devices_argv'], ok)
+        for lists in ([['pw-cli', 'ls', 'Node']], [['pw-cli', 'list-objects']], [['pw-cli', 'info', 'all']],
+                      [['pw-cli', 'dump', 'Node']]):
+            with self.subTest(lists=lists):
+                config_with({'list_devices_argv': lists})
+
     def test_list_devices_argv_only_read_only_listers(self):
         for lists in ([['pw-play', '{file}']], [['aplay', '-l']], [['arecord', '-D', 'hw:0', 'x.wav']],
                       [['pw-record', 'x.wav']], [['pactl', 'set-sink-volume', '@DEFAULT_SINK@', '100%']],

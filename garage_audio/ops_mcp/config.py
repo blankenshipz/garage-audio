@@ -86,17 +86,49 @@ PLACEHOLDERS = ('{file}', '{rate}', '{channels}', '{seconds}')
 # Playback must go into the stack's sink (PipeWire -> CamillaDSP), never to a raw ALSA device.
 DIRECT_DAC = re.compile(r'(?i)hw:|plug:|default:card=|dmix|dsnoop|sysdefault|iec958|front:|surround\d|/dev/snd/'
                         r'|alsa_output\.')
+# Raw ALSA PCM names written without a colon (``hw``, ``hw,0``, ``plughw``, ``front``, ``surround51`` ...).
+# A -D/--device value that STARTS with one of these is refused; any other argv item (or option value after
+# '=') that is exactly such a name, optionally followed by ':' or ',' and parameters, is refused too.
+RAW_ALSA_PREFIXES = ('hw', 'plughw', 'plug', 'front', 'surround', 'iec958', 'dmix', 'dsnoop', 'sysdefault')
+RAW_ALSA_NAME = re.compile(r'(?i)(?:plughw|hw|plug|front|surround\d*|iec958|dmix|dsnoop|sysdefault)(?:[:,].*)?')
 # ALSA players that fall back to the ALSA default device (possibly the DAC) without an explicit -D/--device.
 ALSA_PLAYERS = frozenset({'aplay', 'speaker-test'})
 # measurement.list_devices_argv: read-only listing programs only, so the "local" tool can never play.
 LISTERS = {
     'arecord': lambda a: a in (['-l'], ['-L'], ['--list-devices'], ['--list-pcms']),
     'pw-record': lambda a: a == ['--list-targets'],
-    'pw-cli': lambda a: 1 <= len(a) <= 2 and a[0] in ('ls', 'list-objects', 'info', 'i'),
+    'pw-cli': lambda a: (1 <= len(a) <= 2 and a[0] in ('ls', 'list-objects', 'info', 'dump')
+                         and all(not x.startswith('-') for x in a[1:])),
     'pw-dump': lambda a: len(a) <= 2 and all(x in ('-N', '--no-colors') or not x.startswith('-') for x in a),
     'pactl': lambda a: 1 <= len(a) <= 3 and a[0] in ('list', 'info'),
     'wpctl': lambda a: 1 <= len(a) <= 2 and a[0] in ('status', 'inspect'),
 }
+# A lister's argv[0] is either the bare program name (resolved on the server's PATH) or exactly
+# <dir>/<name> for one of these system bin directories; any other path (/opt/x/arecord, ./arecord,
+# /usr/bin/../tmp/arecord) is refused even when its basename is allowlisted.
+LISTER_DIRS = ('/usr/bin', '/bin', '/usr/local/bin')
+
+
+def _lister_name(program):
+    """The allowlisted lister that ``program`` (argv[0]) names, or None."""
+    if '/' not in program:
+        return program if program in LISTERS else None
+    directory, _sep, name = program.rpartition('/')
+    return name if directory in LISTER_DIRS and name in LISTERS else None
+
+
+def _raw_alsa_device(argv):
+    """The first argv item naming a raw ALSA device without a colon (see RAW_ALSA_NAME), or None."""
+    device = _alsa_device(argv[1:])
+    if device and device.startswith(RAW_ALSA_PREFIXES):
+        return device
+    for item in argv[1:]:
+        value = item.split('=', 1)[1] if item.startswith('-') and '=' in item else item
+        if item.startswith('-D') and len(item) > 2 and not item.startswith('--'):
+            value = item[2:]
+        if RAW_ALSA_NAME.fullmatch(value.strip()):
+            return value
+    return None
 SAMPLE_RATES = (44100, 48000, 88200, 96000)
 _PLACEHOLDER = re.compile(r'\{[^{}]*\}')
 SHELLS = frozenset({'sh', 'bash', 'dash', 'zsh', 'ksh', 'fish', 'csh', 'tcsh', 'busybox', 'env', 'sudo', 'doas',
@@ -151,10 +183,11 @@ def _measurement(data, policy):
     out['play_argv'] = None
     if m['play_argv'] is not None:
         argv = _template('measurement.play_argv', m['play_argv'])
-        if any(DIRECT_DAC.search(item) for item in argv):
+        if any(DIRECT_DAC.search(item) for item in argv) or _raw_alsa_device(argv) is not None:
             raise ConfigError('measurement.play_argv must target the stack sink that feeds CamillaDSP, never a raw '
-                              'ALSA/DAC device (hw:, plughw:, plug:, default:CARD=, dmix, /dev/snd, alsa_output.*): '
-                              'the supervisor owns the DAC and the DSP limits must apply to measurement signals')
+                              'ALSA/DAC device (hw, plughw, plug, front, surround*, iec958, dmix, dsnoop, sysdefault '
+                              'with or without ":"/",", default:CARD=, /dev/snd, alsa_output.*): the supervisor owns '
+                              'the DAC and the DSP limits must apply to measurement signals')
         if os.path.basename(argv[0]) in ALSA_PLAYERS and _alsa_device(argv[1:]) in (None, '', 'default'):
             raise ConfigError('measurement.play_argv runs an ALSA player without an explicit device (-D): it would '
                               'play to the ALSA default, which may be the DAC. Name the stack sink explicitly '
@@ -168,11 +201,12 @@ def _measurement(data, policy):
         raise ConfigError('measurement.list_devices_argv must be a list of at most 4 argv lists')
     out['list_devices_argv'] = [_argv('measurement.list_devices_argv[]', item) for item in lists]
     for item in out['list_devices_argv']:
-        check = LISTERS.get(os.path.basename(item[0]))
-        if check is None or not check(item[1:]):
+        name = _lister_name(item[0])
+        if name is None or not LISTERS[name](item[1:]):
             raise ConfigError('measurement.list_devices_argv entries must be read-only device listings (arecord '
-                              '-l/-L, pw-record --list-targets, pw-cli ls/info, pw-dump, pactl list/info, wpctl '
-                              'status/inspect)', argv=item[:3])
+                              '-l/-L, pw-record --list-targets, pw-cli ls/list-objects/info/dump, pw-dump, pactl '
+                              'list/info, wpctl status/inspect), run by bare name or from /usr/bin, /bin or '
+                              '/usr/local/bin', argv=item[:3])
     out['output_channels'] = _int('measurement.output_channels', m['output_channels'], 1, 8)
     out['capture_channels'] = _int('measurement.capture_channels', m['capture_channels'], 1, 8)
     out['mic_channel'] = _int('measurement.mic_channel', m['mic_channel'], 0, out['capture_channels'] - 1)
