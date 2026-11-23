@@ -66,7 +66,7 @@ keys, wrong types and out-of-range values stop startup.
 |---|---|---|
 | `allow_write` | `false` | Enables write tools (recovery, DSP changes, pause/stop, room apply) |
 | `allow_playback` | `false` | Together with `allow_write`: start/resume playback, player volume/mute/grouping, DSP unmute |
-| `state_dir` | `$XDG_STATE_HOME/garage-audio-ops-mcp` | Backups, measurements, proposals. Must be owned by the server user with mode 0700 |
+| `state_dir` | `$XDG_STATE_HOME/garage-audio-ops-mcp` | Backups, measurements, proposals. Created with mode 0700 if missing. An existing directory must be owned by the server user with mode 0700; otherwise state writes are refused with `state_dir_unsafe` (it is not chmod-ed for you) |
 | `server.host` / `server.port` | `127.0.0.1` / `8766` | HTTP bind address |
 | `server.token_file` | none | HTTP bearer token file (preferred) |
 | `server.allowed_hosts` | `[]` | Extra `host:port` values accepted in the `Host` header (for example behind a proxy) |
@@ -203,7 +203,14 @@ linear), `Delay`, `Volume` on the Main fader, `Dither`, `Limiter`, Biquad
 Peaking/shelf/pass/notch/bandpass/allpass, and Butterworth/Linkwitz-Riley
 `BiquadCombo` crossovers. Any other filter (Biquad `Free` or `LinkwitzTransform`, `Conv`,
 `DiffEq`, `Loudness`, `Volume` on an Aux fader, other `BiquadCombo` shapes, unknown
-types) is reported as an "unbounded filter type" violation. No write can introduce one.
+types) is reported as an "unbounded filter type" violation. Second-order shelves also
+need `q` within the Q limits or `slope` within 1–12 dB/octave.
+
+The same applies outside `filters`. Every entry in the `processors` section (for
+example a `Compressor`, whose `makeup_gain` can add level), every `Processor` pipeline
+step, any pipeline step other than `Filter` and `Mixer`, and any top-level section other
+than `title`, `description`, `devices`, `filters`, `mixers`, `processors` and
+`pipeline` is reported as unbounded. No write can introduce any of these.
 
 ## DSP backups and rollback
 
@@ -222,16 +229,18 @@ runs under one lock (in-process plus a `flock` in `state_dir`) and follows these
 7. Read it back.
 
 If applying fails, nothing changes and the backup id is reported. Retention keeps the
-newest `camilladsp.backup_retention` backups.
+newest `camilladsp.backup_retention` backups and never prunes the one just written,
+even if the clock stepped back.
 
 `dsp_list_backups` shows them. `dsp_restore_backup` restores one:
 
 * The restore is itself validated against the **current** limits and backed up first,
   so a restore can be undone.
-* The restored config must be bounded as a whole. If any filter in it is an unbounded
-  type, or any value is outside the hard caps, the restore is refused with
-  `safety_limit` before anything is applied or backed up. This applies even if the same
-  filter is live now. Fix such configs through the reviewed configuration process.
+* The restored config must be bounded as a whole. If it contains anything unbounded
+  (filter, processor, pipeline step or section, as above), or any value is outside the
+  hard caps, the restore is refused with `safety_limit` before anything is applied or
+  backed up. This applies even if the same item is live now. Fix such configs through
+  the reviewed configuration process.
 * `restore_volume=true` also restores the volume. The volume is checked against the
   ceiling before anything is applied.
 * It restores an unmuted state only when `allow_playback` is on.
@@ -248,7 +257,7 @@ defaults to `auto`, which means restart if the unit is active, otherwise start.
 | `ready` | allowed. The plan notes that a restart interrupts current playback |
 | `starting`, or unit activating/deactivating/reloading | refused unless `force=true` |
 | `backoff` | refused unless `force=true`. The supervisor is already retrying, and a restart resets its bounded retry accounting |
-| `terminal` / `exhausted` | allowed. The plan includes the recorded explanation and guidance: find and fix the cause first |
+| `terminal` / `exhausted` | refused unless `force=true`. The supervisor stopped retrying on purpose; the refusal includes the recorded explanation and guidance. Find and fix the cause first, then use `force=true` |
 | unknown / unavailable | allowed. The service-manager state is the only evidence |
 
 Separately, a recovery action within `supervisor.min_action_interval_seconds` of the

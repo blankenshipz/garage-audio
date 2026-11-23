@@ -171,8 +171,13 @@ def delay_ms(parameters, samplerate):
 GAIN_BIQUADS = ('Peaking', 'Highshelf', 'Lowshelf', 'HighshelfFO', 'LowshelfFO')
 GAINLESS_BIQUADS = ('Highpass', 'Lowpass', 'HighpassFO', 'LowpassFO', 'Notch', 'Bandpass', 'Allpass', 'AllpassFO')
 Q_BIQUADS = ('Peaking', 'Notch', 'Bandpass', 'Allpass')
+SHELVES = ('Highshelf', 'Lowshelf')  # second-order shelves: q or slope (SHELF_SLOPE, dB/octave)
 CROSSOVER_COMBOS = ('ButterworthHighpass', 'ButterworthLowpass', 'LinkwitzRileyHighpass', 'LinkwitzRileyLowpass')
 LEVEL_NEUTRAL_TYPES = ('Dither', 'Limiter')  # never raise level
+# Top-level sections and pipeline steps the audit understands. ``processors`` is listed so
+# it is not reported twice; each of its entries is reported as unbounded individually.
+KNOWN_SECTIONS = ('title', 'description', 'devices', 'filters', 'mixers', 'processors', 'pipeline')
+KNOWN_PIPELINE_STEPS = ('Filter', 'Mixer')
 # A Volume filter is bounded only on the Main fader (capped by volume_ceiling_db); Aux faders
 # are not controlled or capped by this server.
 
@@ -214,6 +219,15 @@ def audit_filter(policy, name, definition, samplerate):
             outside('gain', params.get('gain'), policy.min_gain_db, policy.max_boost_db)
         if subtype in Q_BIQUADS and 'q' in params:
             outside('q', params['q'], policy.q_min, policy.q_max)
+        if subtype in SHELVES:
+            # A second-order shelf takes either q or slope (dB/octave); a high q overshoots
+            # beyond the stated gain, so both are range-checked and one must be present.
+            if 'q' in params:
+                outside('q', params['q'], policy.q_min, policy.q_max)
+            if 'slope' in params:
+                outside('slope', params['slope'], *SHELF_SLOPE)
+            if 'q' not in params and 'slope' not in params:
+                problems.append(f'{name}: shelf needs q or slope')
     elif kind == 'BiquadCombo':
         subtype = params.get('type')
         if subtype not in CROSSOVER_COMBOS:
@@ -239,12 +253,40 @@ def audit_filter(policy, name, definition, samplerate):
 
 
 def audit_config(policy, config):
-    """All limit violations in a CamillaDSP config (filters and mixer source gains)."""
+    """All limit violations in a CamillaDSP config.
+
+    Checks filters and mixer source gains. Anything the audit does not understand is an
+    "unbounded" violation: every ``processors`` entry (e.g. a Compressor's makeup_gain),
+    every ``Processor`` pipeline step, any other pipeline step type and any top-level
+    section other than KNOWN_SECTIONS.
+    """
     if not isinstance(config, dict):
         return ['configuration is not an object']
     devices = config.get('devices') if isinstance(config.get('devices'), dict) else {}
     samplerate = devices.get('samplerate')
     problems = []
+    for section in sorted(str(key) for key in config if key not in KNOWN_SECTIONS):
+        problems.append(f'section {section}: unbounded configuration section; the server cannot verify its level, '
+                        'so it may not be introduced or restored')
+    processors = config.get('processors')
+    if isinstance(processors, dict):
+        for name in sorted(processors):
+            kind = processors[name].get('type') if isinstance(processors[name], dict) else None
+            problems.append(f'processor {name}: unbounded processor type {kind!r}; the server cannot verify its '
+                            'level, so it may not be introduced or restored')
+    elif processors is not None:
+        problems.append('processors: unbounded processors section (not an object)')
+    pipeline = config.get('pipeline')
+    for step in pipeline if isinstance(pipeline, list) else []:
+        kind = step.get('type') if isinstance(step, dict) else None
+        if kind not in KNOWN_PIPELINE_STEPS:
+            # Keyed by type and name, not position, so unrelated pipeline edits do not make a
+            # pre-existing step look new.
+            label = step.get('name') if isinstance(step, dict) else None
+            problems.append(f'pipeline step {kind!r} {label!r}: unbounded pipeline step type; the server cannot '
+                            'verify its level, so it may not be introduced or restored')
+    if pipeline is not None and not isinstance(pipeline, list):
+        problems.append('pipeline: not a list')
     filters = config.get('filters') or {}
     if isinstance(filters, dict):
         for name in sorted(filters):
@@ -267,7 +309,8 @@ def hard_policy():
 
 
 def audit_whole_config(config):
-    """Violations of the hard caps anywhere in ``config``, including unbounded filter types.
+    """Violations of the hard caps anywhere in ``config``, including unbounded filter types,
+    processors, pipeline steps and sections (see ``audit_config``).
 
     Used for writes that push a configuration not derived from the live one (restore):
     such a config must be entirely boundable and inside the hard caps.

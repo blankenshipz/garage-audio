@@ -50,13 +50,31 @@ class Recovery(unittest.TestCase):
                 tools.call(h.ctx, 'recover_audio_stack', {})
             self.assertEqual(h.system.actions, [])
 
-    def test_terminal_and_exhausted_explained(self):
+    def test_terminal_and_exhausted_refused_unless_forced(self):
         for state in ('terminal', 'exhausted'):
-            h = self.harness(state, active='inactive')
-            result = tools.call(h.ctx, 'recover_audio_stack', {'action': 'start'})
-            self.assertEqual(h.system.actions, ['start'])
-            self.assertTrue(any(f"State '{state}'" in n and 'fix the cause' in n.lower()
-                                or 'Fix the underlying cause' in n for n in result['plan']['notes']))
+            with self.subTest(state=state):
+                h = self.harness(state, active='inactive')
+                plan = tools.call(h.ctx, 'plan_recovery', {'action': 'start'})
+                self.assertFalse(plan['allowed'])
+                with self.assertRaises(OpsError) as caught:
+                    tools.call(h.ctx, 'recover_audio_stack', {'action': 'start'})
+                self.assertEqual(caught.exception.code, 'recovery_refused')
+                self.assertIn(f"State '{state}'", caught.exception.message)
+                self.assertIn('fix the cause first', caught.exception.message.lower())
+                self.assertEqual(h.system.actions, [])
+                self.assertFalse((h.state_dir / recovery.ACTIONS_FILE).exists())
+                result = tools.call(h.ctx, 'recover_audio_stack', {'action': 'start', 'force': True})
+                self.assertTrue(result['ok'])
+                self.assertEqual(h.system.actions, ['start'])
+                self.assertTrue(any(f"State '{state}'" in n for n in result['plan']['notes']))
+
+    def test_terminal_force_still_rate_limited(self):
+        h = self.harness('terminal', active='inactive')
+        tools.call(h.ctx, 'recover_audio_stack', {'action': 'start', 'force': True})
+        with self.assertRaises(OpsError) as caught:
+            tools.call(h.ctx, 'recover_audio_stack', {'action': 'start', 'force': True})
+        self.assertIn('min_action_interval_seconds', caught.exception.message)
+        self.assertEqual(h.system.actions, ['start'])
 
     def test_rate_limit_is_not_bypassed_by_force(self):
         h = self.harness('stopped', active='inactive')

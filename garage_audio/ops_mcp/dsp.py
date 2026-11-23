@@ -95,8 +95,9 @@ def apply_config(ctx, tool, reason, mutate, whole_config=False):
     """Backup-then-apply a config change built by ``mutate(config_copy)``.
 
     ``whole_config=True`` is for writes that replace the configuration with one not
-    derived from the live config (restore): every filter in it must be of a boundable
-    type and inside the hard caps, not only the filters that differ from live.
+    derived from the live config (restore): every filter, processor, pipeline step and
+    section in it must be boundable and inside the hard caps, not only the filters that
+    differ from live (see ``safety.audit_config``).
     """
     policy = ctx.config.policy
     cam = ctx.clients.camilla
@@ -107,7 +108,8 @@ def apply_config(ctx, tool, reason, mutate, whole_config=False):
         if whole_config:
             hard = safety.audit_whole_config(candidate)
             if hard:
-                raise SafetyError('configuration rejected: it contains filters the server cannot bound or values '
+                raise SafetyError('configuration rejected: it contains filters, processors or pipeline steps the '
+                                  'server cannot bound, or values '
                                   'outside the hard speaker-protection caps; fix it through the reviewed '
                                   'configuration process instead', violations=hard)
         before = set(safety.audit_config(policy, current))

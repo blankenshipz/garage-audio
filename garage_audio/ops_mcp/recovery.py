@@ -1,8 +1,9 @@
 """Recovery through the supervisor's sanctioned path only: the service manager on the owner unit.
 
 Never touches containers directly. Refuses while the owner is already retrying
-(``backoff``) or mid-transition unless ``force`` is set, rate-limits actions, and
-explains ``terminal``/``exhausted`` (which never retry by themselves).
+(``backoff``), mid-transition, or has stopped on purpose (``terminal``/``exhausted``,
+whose cause must be found first) unless ``force`` is set. The action rate limit
+applies even with ``force``.
 """
 from . import health
 from .backups import atomic_write_json, read_json, _ensure_private_dir
@@ -41,7 +42,10 @@ def plan(ctx, action='auto', force=False):
         msg = f'The service manager reports the unit as {active}; a job is already in progress.'
         (notes if force else reasons).append(msg)
     if state in ('terminal', 'exhausted'):
-        notes.append(f"State '{state}': {rec.get('explanation')} Guidance: {rec.get('restart_guidance')}")
+        msg = (f"State '{state}': the owner stopped retrying on purpose ({rec.get('explanation')}). "
+               f"Guidance: {rec.get('restart_guidance')} Find and fix the cause first; starting it again "
+               'unchanged will fail the same way. Pass force=true only once the cause is addressed.')
+        (notes if force else reasons).append(msg)
     if state == 'ready' and action == 'restart':
         notes.append('The stack is ready; a restart interrupts any current playback and creates a new generation.')
     if state in ('unknown', 'unavailable'):

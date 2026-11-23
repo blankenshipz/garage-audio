@@ -23,12 +23,18 @@ MAX_FILE_BYTES = 4 * 1024 * 1024
 
 
 def _ensure_private_dir(path):
+    """Create ``path`` with mode 0700 if missing; refuse an existing one that is not private.
+
+    A group/world-accessible directory is refused rather than silently tightened, so
+    the operator notices a misconfigured location instead of the server changing it.
+    """
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = path.lstat()
     if path.is_symlink() or not path.is_dir() or info.st_uid != os.geteuid():
         raise OpsError('state_dir_unsafe', 'state directory must be a real directory owned by this user')
     if info.st_mode & 0o077:
-        os.chmod(path, 0o700)
+        raise OpsError('state_dir_unsafe', 'state directory (or a subdirectory) is group/world accessible; '
+                       'run chmod 700 on it (mode 0700 is required)')
     return path
 
 
@@ -101,12 +107,15 @@ class Journal:
             ident = new_id(self.clock)
             record = dict(record, id=ident, saved_at=round(self.clock(), 6))
             atomic_write_json(directory / f'{ident}.json', record)
-            self._prune(directory)
+            self._prune(directory, keep=ident)
             return record
 
-    def _prune(self, directory):
-        ids = self._ids(directory)
-        for ident in ids[:-self.retention] if len(ids) > self.retention else []:
+    def _prune(self, directory, keep):
+        # Ids sort by timestamp; if the clock stepped back, the entry just written may sort
+        # oldest. It is never pruned: it is the rollback point for the write in progress.
+        ids = [i for i in self._ids(directory) if i != keep]
+        excess = len(ids) + 1 - self.retention
+        for ident in ids[:excess] if excess > 0 else []:
             try:
                 (directory / f'{ident}.json').unlink()
             except OSError:

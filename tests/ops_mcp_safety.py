@@ -10,7 +10,7 @@ import stat
 import unittest
 from pathlib import Path
 
-from garage_audio.ops_mcp import safety, tools
+from garage_audio.ops_mcp import dsp, safety, tools
 from garage_audio.ops_mcp.errors import ConfigError, OpsError, SafetyError
 
 _spec = importlib.util.spec_from_file_location('ops_mcp_fakes', Path(__file__).parent / 'fixtures/ops_mcp/fakes.py')
@@ -194,6 +194,23 @@ class HardLimits(unittest.TestCase):
         self.assertTrue(safety.audit_filter(policy, 'xo_low', {'type': 'BiquadCombo', 'parameters': {
             'type': 'ButterworthLowpass', 'freq': 10, 'order': 2}}, 48000))
 
+    def test_shelf_q_and_slope_are_range_checked(self):
+        policy = safety.build_policy({})
+
+        def shelf(**extra):
+            return {'type': 'Biquad', 'parameters': {'type': 'Lowshelf', 'freq': 100, 'gain': 2.0, **extra}}
+        self.assertEqual(safety.audit_filter(policy, 's', shelf(q=0.7), 48000), [])
+        self.assertEqual(safety.audit_filter(policy, 's', shelf(slope=6.0), 48000), [])
+        for bad, label in ((shelf(q=40.0), 'q='), (shelf(q=0.01), 'q='), (shelf(slope=0.0), 'slope='),
+                           (shelf(slope=24.0), 'slope='), (shelf(slope='steep'), 'slope='),
+                           (shelf(), 'needs q or slope')):
+            with self.subTest(params=bad['parameters']):
+                problems = safety.audit_filter(policy, 's', bad, 48000)
+                self.assertTrue(any(label in p for p in problems), problems)
+        # First-order shelves take neither q nor slope.
+        self.assertEqual(safety.audit_filter(policy, 's', {'type': 'Biquad', 'parameters': {
+            'type': 'HighshelfFO', 'freq': 3000, 'gain': -2.0}}, 48000), [])
+
 
 class BackupBeforeWrite(unittest.TestCase):
     def harness(self, **kw):
@@ -298,6 +315,19 @@ class BackupBeforeWrite(unittest.TestCase):
             tools.call(h.ctx, 'dsp_set_mute', {'muted': True})
         self.assertEqual(len(h.ctx.backups.list(100)), 5)
 
+    def test_retention_never_prunes_the_backup_just_written_after_clock_step_back(self):
+        h = self.harness(overrides={'camilladsp': {'channels': {'left': 0, 'right': 1, 'sub': 2},
+                                                   'backup_retention': 5}})
+        for _ in range(5):
+            tools.call(h.ctx, 'dsp_set_mute', {'muted': True})
+            h.clock.advance(1)
+        h.clock.advance(-3600)  # wall clock stepped back: the next id sorts oldest
+        result = tools.call(h.ctx, 'dsp_set_mute', {'muted': True})
+        kept = h.ctx.backups.list(100)
+        self.assertEqual(len(kept), 5)
+        self.assertIn(result['backup_id'], kept)
+        self.assertEqual(h.ctx.backups.get(result['backup_id'])['tool'], 'dsp_set_mute')
+
     def test_unmute_needs_playback_permission(self):
         h = self.harness()   # allow_write only
         with self.assertRaises(OpsError) as caught:
@@ -363,6 +393,64 @@ class Rollback(unittest.TestCase):
                 self.assertNotIn(('set_volume', -20.0), h.camilla.events)
                 self.assertEqual(h.ctx.backups.list(), [record['id']])  # no new backup written
 
+    def test_restore_refuses_processors_processor_steps_and_unknown_sections(self):
+        compressor = {'type': 'Compressor', 'parameters': {
+            'channels': 2, 'attack': 0.025, 'release': 1.0, 'threshold': -25, 'factor': 5.0,
+            'makeup_gain': 20.0, 'monitor_channels': [0, 1], 'process_channels': [0, 1]}}
+
+        def with_processor_section(config):
+            config['processors'] = {'squash': compressor}
+            return 'processor squash:'
+
+        def with_processor_step(config):
+            config['processors'] = {'squash': compressor}
+            config['pipeline'].append({'type': 'Processor', 'name': 'squash'})
+            return "pipeline step 'Processor' 'squash':"
+
+        def with_unknown_step(config):
+            config['pipeline'].append({'type': 'Mystery', 'name': 'x'})
+            return "pipeline step 'Mystery' 'x':"
+
+        def with_unknown_section(config):
+            config['extras'] = {'boost_db': 20}
+            return 'section extras:'
+
+        for variant in (with_processor_section, with_processor_step, with_unknown_step, with_unknown_section):
+            with self.subTest(variant=variant.__name__):
+                config = fakes.base_config()
+                expected = variant(config)
+                # Already live, so only an audit of the whole restored config catches it.
+                h = fakes.Harness(self, {'allow_write': True}, camilla=fakes.FakeCamilla(copy.deepcopy(config)))
+                record = h.ctx.backups.save({'tool': 'synthetic', 'reason': 'x', 'volume_db': -20.0, 'mute': True,
+                                             'config': config})
+                with self.assertRaises(SafetyError) as caught:
+                    tools.call(h.ctx, 'dsp_restore_backup', {'backup_id': record['id'], 'restore_volume': True})
+                self.assertIn('cannot bound', caught.exception.message)
+                self.assertTrue(any(p.startswith(expected) for p in caught.exception.details['violations']),
+                                caught.exception.details['violations'])
+                self.assertNotIn('set_config', h.camilla.events)
+                self.assertNotIn(('set_volume', -20.0), h.camilla.events)
+                self.assertEqual(h.ctx.backups.list(), [record['id']])
+        # A plain config with only filters, mixers and Filter/Mixer steps is not flagged.
+        self.assertEqual(safety.audit_whole_config(fakes.base_config()), [])
+
+    def test_write_cannot_add_processor_but_works_beside_a_live_one(self):
+        config = fakes.base_config()
+        config['processors'] = {'squash': {'type': 'Compressor', 'parameters': {'makeup_gain': 20.0}}}
+        config['pipeline'].append({'type': 'Processor', 'name': 'squash'})
+        h = fakes.Harness(self, {'allow_write': True}, camilla=fakes.FakeCamilla(config))
+        result = tools.call(h.ctx, 'dsp_set_channel_delay', {'channel': 'sub', 'delay_ms': 2.0})
+        self.assertTrue(result['ok'])  # new step appended; the existing Processor step is not "new"
+        self.assertTrue(any(p.startswith('processor squash:') for p in result['preexisting_limit_violations']))
+        clean = fakes.Harness(self, {'allow_write': True})
+
+        def add_processor(candidate):
+            candidate['processors'] = {'squash': {'type': 'Compressor', 'parameters': {'makeup_gain': 20.0}}}
+            return []
+        with self.assertRaises(SafetyError):
+            dsp.apply_config(clean.ctx, 'synthetic', 'x', add_processor)
+        self.assertNotIn('set_config', clean.camilla.events)
+
     def test_incremental_write_keeps_working_beside_live_unbounded_filter(self):
         config = fakes.base_config()
         config['filters']['fir'] = {'type': 'Conv', 'parameters': {'type': 'Raw', 'filename': 'x.raw'}}
@@ -424,6 +512,20 @@ class Rollback(unittest.TestCase):
             tools.call(h.ctx, 'dsp_set_mute', {'muted': True})
         self.assertEqual(caught.exception.code, 'state_dir_unsafe')
         self.assertNotIn(('set_mute', True), h.camilla.events)
+
+    def test_loose_state_dir_is_refused_not_silently_tightened(self):
+        for path in ('state', 'state/dsp-backups'):
+            with self.subTest(path=path):
+                h = fakes.Harness(self, {'allow_write': True})
+                (h.root / path).mkdir(parents=True, mode=0o700)
+                os.chmod(h.root / path, 0o755)
+                with self.assertRaises(OpsError) as caught:
+                    tools.call(h.ctx, 'dsp_set_mute', {'muted': True})
+                self.assertEqual(caught.exception.code, 'state_dir_unsafe')
+                self.assertIn('chmod 700', caught.exception.message)
+                self.assertEqual(stat.S_IMODE((h.root / path).stat().st_mode), 0o755)  # not changed for the operator
+                self.assertNotIn(('set_mute', True), h.camilla.events)
+                self.assertNotIn('set_config', h.camilla.events)
 
 
 if __name__ == '__main__':

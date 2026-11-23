@@ -87,8 +87,8 @@ TOOLS = [
          obj({'action': {'type': 'string', 'enum': ['auto', 'start', 'restart']}, 'force': {'type': 'boolean'}}),
          lambda ctx, a: recovery.plan(ctx, a.get('action', 'auto'), a.get('force', False))),
     Tool('recover_audio_stack', WRITE, "Start or restart the owner unit through the service manager (the supervisor's "
-         'sanctioned recovery path; never touches containers). Refused during backoff/starting or an in-progress '
-         'job unless force=true; rate-limited. terminal/exhausted are explained: fix the cause first.',
+         'sanctioned recovery path; never touches containers). Refused during backoff/starting, an in-progress '
+         'job or terminal/exhausted (fix the cause first) unless force=true; rate-limited even with force.',
          obj({'action': {'type': 'string', 'enum': ['auto', 'start', 'restart']}, 'force': {'type': 'boolean'}}),
          recovery.recover),
     # 3 Music Assistant --------------------------------------------------------------
@@ -149,7 +149,8 @@ TOOLS = [
     Tool('dsp_list_backups', READ, 'Automatic DSP backups (newest first).',
          obj({'limit': {'type': 'integer', 'minimum': 1, 'maximum': 200}}), dsp.list_backups),
     Tool('dsp_restore_backup', WRITE, 'Restore a DSP backup. The restore is validated against limits and itself backed '
-         'up first; a backup with unbounded filter types or values outside the hard caps is refused. '
+         'up first; a backup with unbounded filters, processors or pipeline steps, or values outside '
+         'the hard caps, is refused. '
          'restore_volume also restores main volume/mute (ceiling enforced; an unmuted '
          'backup is only unmuted when allow_playback is on).',
          obj({'backup_id': ID, 'restore_volume': {'type': 'boolean'}}, ['backup_id']), dsp.restore_backup),
