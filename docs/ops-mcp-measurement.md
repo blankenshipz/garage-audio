@@ -338,10 +338,12 @@ measurement is then uncorrected.
      `#umik2calfile` for UMIK-2.
   3. One form-urlencoded POST to the same page, with `serial1` (3 digits), `serial2`
      (4 digits) and every other field **exactly as served**. The hidden honeypot text field
-     (its name rotates, e.g. `your_name_here`) stays empty, and the hidden 32-hex-named token
-     keeps its served timestamp value.
+     (its name rotates, e.g. `your_name_here`) stays empty, and so does any other text input or
+     `<textarea>`. A `<select>` sends its selected (else first) option, and the hidden
+     32-hex-named token keeps its served timestamp value.
   4. Follow at most 4 file links named after the serial, or a meta-refresh, iframe or script
-     download location, on the allowlisted host.
+     download location, on the allowlisted host. "Named after the serial" means one contiguous
+     run `XXXXXXX` or `XXX-XXXX` inside a single path, never digits gathered across segments.
 
   An unknown serial gets miniDSP's own message ("Calibration data for UMIK 000-0000 not
   found. Please check your serial number and try again."), returned as `not_found`.
@@ -390,8 +392,12 @@ allowlist and tests.
   refused **before** connecting. The connection is pinned to the checked address, with
   certificate and SNI verification for the host name, so DNS cannot change between the
   check and the connect.
-* Connect and read timeouts (`timeout_seconds`, default 15). The response is read in a
-  stream and refused above `max_download_bytes` (default 1 MiB).
+* Known limitation: NAT64 (`64:ff9b::/96`) and 6to4 (`2002::/16`) addresses are not decoded
+  to their embedded IPv4 address, so an allowlisted host resolving to one is not re-checked.
+* Connect and read timeouts (`timeout_seconds`, default 15) per network operation, plus one
+  wall-clock deadline of 4 × `timeout_seconds` for the whole fetch (every request, redirect,
+  header and body byte), so a server dripping bytes slowly cannot hold the call open. The
+  response is read in a stream and refused above `max_download_bytes` (default 1 MiB).
 * Zip archives: at most 16 members, at most 4 MiB uncompressed. Absolute or `..` paths are
   refused, and only `.txt`, `.cal` and `.frd` members are used.
 * Content-type sanity checks. Fetched URLs are stored as host + path only, never the query.
@@ -408,7 +414,8 @@ Fetched files and imports are checked by the shared calibration parser, plus the
 * A `SERNO:` header must match the requested serial (`calibration_serial_mismatch`).
 
 For miniDSP, a file is only accepted if it is tied to the serial, through its header or a
-serial-named file or link.
+serial-named file or link. The file name and the URL path are checked separately, each for
+one contiguous `XXXXXXX` / `XXX-XXXX` run not touching other digits.
 
 The UMIK header (`"Sens Factor =…dB, AGain =…dB, SERNO: …"`) is kept: the sensitivity
 factor and the gain are recorded.
@@ -422,8 +429,11 @@ writes, a lock against concurrent imports). Each record holds:
 * the parser summary and the verification note.
 
 Raw downloads are not kept. `active.json` maps `0` / `90` to a calibration id. Retention
-(`retention`, default 20) never removes an active calibration or one pinned by the current
-session.
+(`retention`, default 20) never removes an active calibration, the one pinned by any active
+measurement session or by the most recent session, or the file just stored. This protected
+set is computed under the calibration lock at every store. Pins from older finished or
+cancelled sessions are not kept, so the count stays bounded (a few protected files may exceed
+it).
 
 To activate a stored file again, call `measure_import_calibration` with `calibration_id`
 and `orientation`. For a file whose orientation was unknown, this creates a derived record.
@@ -626,18 +636,22 @@ Design if it is ever built:
 * `tests/ops_mcp_measure_calibration.py` runs against a fake miniDSP / URL site and fake
   `/proc` + `/sys` trees from `tests/fixtures/ops_mcp/cal_site.py`. Every test blocks real
   DNS and sockets. It covers:
-  * the form submitted as served, with an empty honeypot, the token and an honest UA;
+  * the form submitted as served, with an empty honeypot (text input or textarea), select
+    options, the token and an honest UA;
   * success shapes: a direct file, a zip, serial-named links, meta refresh and script
     location;
   * `not_found`, unparseable or changed pages with manual steps, and serial mismatch;
   * redirect refusals (off-allowlist, http, credentials, port, loops) and private, loopback,
     CGNAT, multicast and IPv4-mapped addresses refused before connecting;
-  * size and timeout caps (no retry) and zip bombs or traversal;
+  * size and timeout caps (no retry), the whole-fetch deadline against a local slow-drip
+    socket pair, and zip bombs or traversal;
+  * serial evidence only from one contiguous run in the file name or the URL path;
   * the URL provider being off by default, its allowlist and query refusal, and config
     validation;
   * garbage files and the import-dir containment (traversal, symlink escape, FIFO, size);
-  * write-tier gating, metadata and permissions, retention keeping the active file,
-    concurrent imports and the rate limit;
+  * write-tier gating, metadata and permissions, retention keeping the active and
+    session-pinned files (a session sweep still uses its pinned file), concurrent imports
+    and the rate limit;
   * detection (UMIK-1, UMIK-2, unknown capture, none, listing fallback), automatic
     selection by orientation, the session warning and the prompt.
 

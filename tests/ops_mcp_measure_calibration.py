@@ -3,10 +3,12 @@ import (contents / confined path / re-activation), storage and retention, automa
 gating and the guided prompt. Fakes only: no socket is ever opened (enforced per test).
 Serial numbers are placeholders (000-0000 style).
 """
+import http.client
 import importlib.util
 import io
 import json
 import os
+import socket
 import stat
 import tempfile
 import threading
@@ -32,6 +34,11 @@ def _load(name, path):
 fakes = _load('ops_mcp_fakes', FIXTURES / 'fakes.py')
 site_mod = _load('ops_mcp_cal_site', FIXTURES / 'cal_site.py')
 FakeSite, cal_text, html, text_file = site_mod.FakeSite, site_mod.cal_text, site_mod.html, site_mod.text_file
+try:
+    import numpy  # noqa: F401
+    sim = _load('ops_mcp_room_sim', FIXTURES / 'room_sim.py')
+except ImportError:
+    sim = None
 PAGE = 'https://www.minidsp.com' + site_mod.UMIK1_PAGE
 PROFILE = {'dimensions_m': {'length': 5.0, 'width': 3.7, 'height': 2.6},
            'speakers': {'left': {'x': 0.9, 'y': 0.6, 'z': 1.0}, 'right': {'x': 2.8, 'y': 0.6, 'z': 1.0},
@@ -556,6 +563,235 @@ class Storage(NoSockets):
         self.assertEqual(set(active), {'0', '90'})
         ids = {r['calibration_id'] for r in results}
         self.assertTrue({v['calibration_id'] for v in active.values()} <= ids)
+
+    def test_active_id_is_read_under_the_calibration_lock(self):
+        h = self.harness()
+        ident = tools.call(h.ctx, 'measure_import_calibration', {'text': cal_text(), 'name': 'mic 90deg'})['calibration_id']
+        held, release = threading.Event(), threading.Event()
+
+        def holder():
+            with measure_cal._locked(h.ctx):
+                held.set()
+                release.wait(5)
+
+        thread = threading.Thread(target=holder)
+        thread.start()
+        self.assertTrue(held.wait(5))
+        threading.Timer(0.3, release.set).start()
+        began = time.monotonic()
+        self.assertEqual(measure_cal.active_id(h.ctx, '90'), ident)
+        self.assertGreaterEqual(time.monotonic() - began, 0.25)  # waited for the store/prune holder to finish
+        thread.join()
+
+
+# ---- retention vs. session-pinned calibrations ------------------------------------------------------
+def _spares(ctx, count, start=0):
+    for i in range(start, start + count):  # no orientation marker: stored, never activated
+        tools.call(ctx, 'measure_import_calibration', {'text': cal_text(offset=i / 10 + 3), 'name': f'spare {i}'})
+
+
+def _listed(ctx):
+    return [c['calibration_id'] for c in tools.call(ctx, 'measure_list_calibrations', {})['calibrations']]
+
+
+class SessionPinnedRetention(NoSockets):
+    def test_retention_keeps_the_calibration_a_session_pinned(self):
+        h = self.harness(cal_config(retention=5))
+        ctx = h.ctx
+        tools.call(ctx, 'room_profile_update', {'set': PROFILE})
+        pinned = tools.call(ctx, 'measure_import_calibration', {'text': cal_text(), 'name': 'old 90deg'})['calibration_id']
+        session = tools.call(ctx, 'measure_session_start', {'positions': 4, 'channels': ['left']})
+        self.assertEqual(session['calibration_id'], pinned)
+        newer = tools.call(ctx, 'measure_import_calibration', {'text': cal_text(offset=1), 'name': 'new 90deg'})
+        self.assertEqual(measure_cal.active_id(ctx, '90'), newer['calibration_id'])  # the pin is no longer active
+        _spares(ctx, 8)                                                                # well past retention=5
+        ids = _listed(ctx)
+        self.assertEqual(len(ids), 5)
+        self.assertIn(pinned, ids)
+        self.assertIn(newer['calibration_id'], ids)
+        self.assertEqual(measure.get_calibration(ctx, pinned)['id'], pinned)
+        live = measure_session._load(measure_session._dir(ctx), session['session_id'])
+        self.assertEqual(measure.resolve_calibration(ctx, {}, live), (pinned, 'session'))
+        # A cancelled session is still the most recent one (its results may be reviewed): still protected.
+        tools.call(ctx, 'measure_session_cancel', {'session_id': session['session_id']})
+        _spares(ctx, 2, start=8)
+        self.assertIn(pinned, _listed(ctx))
+        # Once a newer session pins the active file, the old pin is ordinary history again: retention stays bounded.
+        later = tools.call(ctx, 'measure_session_start', {'positions': 4, 'channels': ['left']})
+        self.assertEqual(later['calibration_id'], newer['calibration_id'])
+        _spares(ctx, 2, start=10)
+        ids = _listed(ctx)
+        self.assertEqual(len(ids), 5)
+        self.assertNotIn(pinned, ids)
+        self.assertIn(newer['calibration_id'], ids)
+
+    def test_protected_set_reads_every_active_session_and_skips_damaged_files(self):
+        h = self.harness()
+        directory = measure_session._dir(h.ctx)
+        sessions = {'20260101T000000.000000Z-aaaaaaaa': {'status': 'active', 'calibration_id': 'cal-active'},
+                    '20260102T000000.000000Z-bbbbbbbb': {'status': 'finished', 'calibration_id': 'cal-finished'},
+                    '20260103T000000.000000Z-cccccccc': {'status': 'cancelled', 'calibration_id': None},
+                    '20260104T000000.000000Z-dddddddd': {'status': 'cancelled', 'calibration_id': 'cal-latest'}}
+        for ident, body in sessions.items():
+            (directory / f'{ident}.json').write_text(json.dumps({'session_id': ident, **body}))
+        (directory / '20260105T000000.000000Z-eeeeeeee.json').write_text('{')  # damaged: skipped, not fatal
+        # Every non-terminal session plus the most recent readable one; finished older ones are not pinned.
+        self.assertEqual(measure_cal._session_pins(h.config.state_dir), {'cal-active', 'cal-latest'})
+
+
+@unittest.skipIf(sim is None, 'numpy (measurement extra) not installed')
+class SessionPinnedSweep(NoSockets):
+    def test_session_sweep_uses_the_pinned_calibration_after_retention(self):
+        h = sim.harness(fakes, self, measurement={'calibration': {'retention': 5}})
+        call = lambda tool, **args: tools.call(h.ctx, tool, args)  # noqa: E731
+        call('room_profile_update', set=PROFILE)
+        pinned = call('measure_import_calibration', text=cal_text(), name='old 90deg')['calibration_id']
+        sid = call('measure_session_start', positions=4, channels=['left'])['session_id']
+        call('measure_import_calibration', text=cal_text(offset=1), name='new 90deg')  # replaces the active file
+        _spares(h.ctx, 8)
+        self.assertIn(pinned, _listed(h.ctx))
+        call('measure_session_confirm_placement', session_id=sid, position_id='P0')
+        self.assertEqual(call('measure_noise_check', session_id=sid, seconds=1)['verdict'], 'ok')
+        self.assertTrue(call('measure_level_check', channel='left', session_id=sid, user_confirmed=True)['ok'])
+        swept = call('measure_sweep', channel='left', session_id=sid, user_confirmed=True, sweep_seconds=1.5)
+        self.assertEqual(h.ctx.history.get(swept['measurement_id'])['calibration_id'], pinned)
+
+
+# ---- overall fetch deadline (slow-drip server) ---------------------------------------------------
+HEAD = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 64\r\nConnection: close\r\n\r\n'
+
+
+class FetchDeadline(NoSockets):
+    def drip(self, fast, slow, delay):
+        """A local socketpair 'server' (no network): sends ``fast`` at once, then ``slow`` one byte per ``delay``."""
+        server, client = socket.socketpair()
+        self.addCleanup(client.close)
+        self.addCleanup(server.close)
+
+        def run():
+            try:
+                server.recv(65536)  # the request
+                server.sendall(fast)
+                for i in range(len(slow)):
+                    time.sleep(delay)
+                    server.sendall(slow[i:i + 1])
+            except OSError:
+                pass
+
+        threading.Thread(target=run, daemon=True).start()
+        return client
+
+    def exchange(self, client, timeout, budget):
+        deadline = time.monotonic() + budget
+        conn = http.client.HTTPConnection(site_mod.HOST, timeout=timeout)
+        conn.sock = measure_cal.DeadlineSocket(client, timeout, deadline)
+        return measure_cal.http_exchange(conn, 'GET', '/', {'Connection': 'close'}, None, 4096, deadline)
+
+    def test_slow_drip_headers_hit_the_overall_deadline(self):
+        client = self.drip(b'', HEAD + b'x' * 64, 0.05)  # every byte well inside the 5 s per-read timeout
+        began = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            self.exchange(client, timeout=5, budget=0.4)
+        self.assertLess(time.monotonic() - began, 1.5)
+
+    def test_slow_drip_body_hits_the_overall_deadline(self):
+        client = self.drip(HEAD, b'x' * 64, 0.05)
+        began = time.monotonic()
+        with self.assertRaises(TimeoutError):
+            self.exchange(client, timeout=5, budget=0.4)
+        self.assertLess(time.monotonic() - began, 1.5)
+
+    def test_prompt_reply_completes_within_the_deadline(self):
+        client = self.drip(HEAD + b'x' * 64, b'', 0)
+        status, _headers, body = self.exchange(client, timeout=5, budget=5)
+        self.assertEqual((status, body), (200, b'x' * 64))  # 'Connection: close' body read after conn.close()
+        self.assertEqual(client.fileno(), -1)               # and the socket is closed once the body is read
+
+    def test_connect_after_the_deadline_never_opens_a_socket(self):
+        conn = measure_cal._PinnedHTTPS(site_mod.HOST, site_mod.PUBLIC_ADDRESS, 5, time.monotonic() - 1)
+        with self.assertRaises(TimeoutError):
+            conn.connect()
+        self.assertFalse(any(g.called for g in self.guard_mocks))
+
+    def test_redirect_hop_after_the_deadline_is_not_requested(self):
+        calls = []
+
+        def slow_transport(method, address, host, path, headers, body, timeout, limit, deadline):
+            calls.append(path)
+            time.sleep(0.3)
+            return 302, [('Location', '/next')], b''
+
+        fetcher = measure_cal.SafeFetcher([site_mod.HOST], timeout=5, limit=1024, transport=slow_transport,
+                                          resolver=lambda host: [site_mod.PUBLIC_ADDRESS], deadline_seconds=0.2)
+        error = self.refused('calibration_fetch_failed', fetcher.request, 'GET', f'https://{site_mod.HOST}/a')
+        self.assertIn('timed out', error.message)
+        self.assertEqual(calls, ['/a'])
+
+    def test_one_budget_spans_every_request_of_a_tool_call(self):
+        site = FakeSite().minidsp(text_file(cal_text(), '0000000_90deg.txt'))
+        began = time.monotonic()
+        self.fetch(self.harness(site=site))
+        deadlines = {c['deadline'] for c in site.calls}
+        self.assertEqual(len(deadlines), 1)  # GET and POST share one deadline
+        budget = deadlines.pop() - began
+        self.assertLessEqual(budget, measure_cal.FETCH_DEADLINE_FACTOR * 15 + 0.5)
+        self.assertGreater(budget, 0)
+
+
+# ---- serial evidence: one component, one contiguous run ------------------------------------------
+class SerialEvidence(NoSockets):
+    def test_serial_in_matches_one_contiguous_run_per_component(self):
+        for text in ('0000000_90deg.txt', '000-0000.txt', 'UMIK 000-0000 90.txt', '/files/cal/0000000.txt'):
+            self.assertTrue(measure_cal.serial_in(text, '000-0000'), text)
+        for text in ('/files/000/0000_90deg.txt', '000_0000.txt', '00000000.txt', '10000000.txt', '000-00000.txt',
+                     '000 0000.txt', '', None):
+            self.assertFalse(measure_cal.serial_in(text, '000-0000'), text)
+        self.assertFalse(measure_cal.serial_in('0000000.txt', None))
+
+    def test_link_with_serial_split_across_path_segments_is_not_followed(self):
+        page = '<html><body><a href="/files/000/0000_90deg.txt">90 degree</a></body></html>'
+        site = FakeSite().minidsp(html(page))
+        site.route('GET', site_mod.HOST, '/files/000/0000_90deg.txt', text_file(cal_text()))
+        self.refused('calibration_unparseable', self.fetch, self.harness(site=site))
+        self.assertNotIn('/files/000/0000_90deg.txt', [c['path'] for c in site.calls])
+
+    def test_digits_joined_across_name_and_path_are_not_serial_evidence(self):
+        # Old behaviour: '0000.txt' + '/dl/000/0000.txt' had all digits concatenated and "contained" the serial.
+        page = '<html><head><meta http-equiv="refresh" content="0; url=/dl/000/0000.txt"></head></html>'
+        site = FakeSite().minidsp(html(page))
+        site.route('GET', site_mod.HOST, '/dl/000/0000.txt', text_file(cal_text(header=False)))
+        h = self.harness(site=site)
+        self.refused('serial_unverified', self.fetch, h)
+        self.assertEqual(tools.call(h.ctx, 'measure_list_calibrations', {})['calibrations'], [])
+
+
+# ---- form parsing: textarea and select ---------------------------------------------------------------
+class FormFields(NoSockets):
+    FORM = ('<!DOCTYPE html><html><body><form method="POST" action="#umikcalfile" id="umikcalfile">'
+            '<input type="text" name="serial1" value=""> - <input type="text" name="serial2" value="">'
+            '<textarea name="your_message_here" style="display:none">prefilled by the page</textarea>'
+            '<select name="region"><option value="us">US</option><option value="eu" selected>EU</option></select>'
+            '<select name="kind"><option> Standard </option><option>Other</option></select>'
+            '<select name="empty"></select>'
+            f'<input type="hidden" name="{site_mod.TOKEN_NAME}" value="1795000000">'
+            '<input type="submit" name="submit" value="Download"></form></body></html>')
+
+    def test_textarea_honeypot_is_sent_empty_and_selects_send_their_choice(self):
+        site = FakeSite().minidsp(text_file(cal_text(), '0000000_90deg.txt'), page=self.FORM.encode())
+        self.fetch(self.harness(site=site))
+        _post, fields = site.posted()
+        self.assertEqual(fields['your_message_here'], [''])     # reshaped honeypot still submitted empty
+        self.assertEqual(fields['region'], ['eu'])              # the selected option
+        self.assertEqual(fields['kind'], ['Standard'])          # no selection, no value: the first option's text
+        self.assertNotIn('empty', fields)                       # a select without options sends nothing
+        self.assertEqual((fields['serial1'], fields['serial2']), (['000'], ['0000']))
+        self.assertEqual(fields[site_mod.TOKEN_NAME], ['1795000000'])
+
+    def test_build_form_counts_a_textarea_as_a_honeypot(self):
+        form = measure_cal.parse_page(self.FORM).forms[0]
+        fields, info = measure_cal.build_form(form, '000-0000')
+        self.assertEqual(info['honeypot_fields'], 1)
+        self.assertIn(('your_message_here', ''), fields)
 
 
 # ---- automatic selection, sessions, status, prompt -------------------------------------------------

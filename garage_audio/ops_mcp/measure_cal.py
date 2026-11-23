@@ -61,6 +61,7 @@ ZIP_MAX_MEMBERS = 16
 ZIP_MAX_TOTAL = 4 * 1024 * 1024
 ZIP_MEMBER_EXT = ('.txt', '.cal', '.frd')
 FILE_EXT = ZIP_MEMBER_EXT + ('.zip',)
+FETCH_DEADLINE_FACTOR = 4  # whole fetch: at most 4 x timeout_seconds of wall-clock time
 MIN_POINTS = 10
 FREQ_RANGE = (5.0, 48000.0)
 MAX_ABS_DB = 30.0
@@ -102,13 +103,24 @@ def normalize_serial(value, required=True):
     return f'{match.group(1)}-{match.group(2)}'
 
 
+def serial_in(component, serial):
+    """True if one string (a file name OR a URL path, never both joined) contains the serial as one contiguous
+    7-digit run (an optional '-' after the first 3 digits), not touching other digits."""
+    if not serial or not isinstance(component, str):
+        return False
+    first, last = serial.split('-')
+    return re.search(rf'(?<![0-9]){first}-?{last}(?![0-9])', component) is not None
+
+
 def _cfg(ctx):
     return ctx.config.measurement['calibration']
 
 
 # ---- storage ---------------------------------------------------------------------------
 class CalJournal(Journal):
-    """The calibration journal: bounded, but an active (or just-written) calibration is never pruned."""
+    """The calibration journal: bounded, but an active, session-pinned (any active measurement session or the
+    most recent one) or just-written calibration is never pruned. ``protected`` runs inside save(), which
+    store() calls under the calibration lock."""
 
     def __init__(self, root, retention, clock, protected):
         super().__init__(root, measure.CAL_DIR, retention, clock)
@@ -131,9 +143,38 @@ def _dir(ctx):
 
 
 def journal(ctx):
-    return CalJournal(ctx.config.state_dir, _cfg(ctx)['retention'], ctx.clock,
-                      lambda: [v['calibration_id'] for v in _read_active(Path(ctx.config.state_dir) / measure.CAL_DIR)
-                               .values()])
+    return CalJournal(ctx.config.state_dir, _cfg(ctx)['retention'], ctx.clock, lambda: _protected_ids(ctx))
+
+
+def _session_pins(state_dir):
+    """Calibration ids referenced by measurement sessions that may still measure: every non-terminal (active)
+    session and the most recent session. Session files are written atomically, so they are read without the
+    session lock (no lock nesting with the calibration lock)."""
+    from . import measure_session  # late import: measure_session imports measure
+    directory = Path(state_dir) / measure_session.SESSION_DIR
+    try:
+        ids = measure_session._ids(directory)
+    except OSError:
+        return set()
+    pins, latest = set(), True
+    for ident in reversed(ids):
+        try:
+            session = read_json(directory / f'{ident}.json')
+        except (OSError, ValueError, OpsError):
+            continue
+        if not isinstance(session, dict):
+            continue
+        cal_id = session.get('calibration_id')
+        if isinstance(cal_id, str) and (latest or session.get('status') == 'active'):
+            pins.add(cal_id)
+        latest = False  # only the most recent readable session counts as "most recent"
+    return pins
+
+
+def _protected_ids(ctx):
+    """Never pruned: active calibrations plus session-pinned ones (computed during a save, under the lock)."""
+    active = {v['calibration_id'] for v in _read_active(Path(ctx.config.state_dir) / measure.CAL_DIR).values()}
+    return active | _session_pins(ctx.config.state_dir)
 
 
 @contextlib.contextmanager
@@ -163,15 +204,17 @@ def _read_active(directory):
 
 
 def active_id(ctx, orientation):
-    """The active calibration id for ``orientation`` ('0' or '90') if its record still exists, else None."""
-    entry = _read_active(Path(ctx.config.state_dir) / measure.CAL_DIR).get(orientation)
-    if not entry:
-        return None
-    try:
-        measure.get_calibration(ctx, entry['calibration_id'])
-    except OpsError:
-        return None
-    return entry['calibration_id']
+    """The active calibration id for ``orientation`` ('0' or '90') if its record still exists, else None.
+    Read under the calibration lock so a concurrent store/prune is never observed half-way."""
+    with _locked(ctx) as directory:
+        entry = _read_active(directory).get(orientation)
+        if not entry:
+            return None
+        try:
+            measure.get_calibration(ctx, entry['calibration_id'])
+        except OpsError:
+            return None
+        return entry['calibration_id']
 
 
 def store(ctx, items, activate=True):
@@ -343,11 +386,76 @@ def default_resolver(host):
     return [info[4][0] for info in infos]
 
 
+def remaining(timeout, deadline):
+    """Seconds for the next network operation: min(per-operation timeout, time left until the overall deadline).
+    Raises TimeoutError once the deadline has passed."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError('fetch deadline exceeded')
+    return min(timeout, left)
+
+
+class _DeadlineReader(io.RawIOBase):
+    """Raw reader over a socket: every recv gets min(timeout, time left), so a server dripping bytes slowly
+    (headers or body) cannot stretch one request past the overall deadline."""
+
+    def __init__(self, owner):
+        super().__init__()
+        self._owner = owner
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        sock = self._owner._sock
+        sock.settimeout(remaining(self._owner._timeout, self._owner._deadline))
+        return sock.recv_into(buffer)
+
+    def close(self):
+        if not self.closed:
+            self._owner._release()
+        super().close()
+
+
+class DeadlineSocket:
+    """Wraps a connected socket for http.client: sends and every read are bounded by the overall deadline.
+    Like socket.makefile(), an open reader keeps the socket alive after close() (http.client closes the
+    connection before the body of a 'Connection: close' response has been read)."""
+
+    def __init__(self, sock, timeout, deadline):
+        self._sock, self._timeout, self._deadline = sock, timeout, deadline
+        self._readers = 0
+        self._closed = False
+
+    def makefile(self, mode='rb', *_args, **_kwargs):
+        if 'w' in mode:
+            raise ValueError('read-only socket file')
+        self._readers += 1
+        return io.BufferedReader(_DeadlineReader(self))
+
+    def sendall(self, data):
+        self._sock.settimeout(remaining(self._timeout, self._deadline))
+        return self._sock.sendall(data)
+
+    def _release(self):
+        self._readers -= 1
+        if self._closed and self._readers <= 0:
+            self._sock.close()
+
+    def close(self):
+        self._closed = True
+        if self._readers <= 0:
+            self._sock.close()
+
+    def __getattr__(self, name):
+        return getattr(self._sock, name)
+
+
 def read_capped(stream, limit, deadline):
     chunks, total = [], 0
     while True:
         if time.monotonic() > deadline:
-            raise TimeoutError('read deadline')
+            raise TimeoutError('fetch deadline exceeded')
         chunk = stream.read(65536)
         if not chunk:
             return b''.join(chunks)
@@ -360,31 +468,49 @@ def read_capped(stream, limit, deadline):
 class _PinnedHTTPS(http.client.HTTPSConnection):
     """HTTPS to the already-checked address; certificate and SNI are verified for the host name."""
 
-    def __init__(self, host, address, timeout):
+    def __init__(self, host, address, timeout, deadline):
         super().__init__(host, 443, timeout=timeout, context=ssl.create_default_context())
         self._address = address
+        self._deadline = deadline
 
     def connect(self):
-        sock = socket.create_connection((self._address, 443), self.timeout)
-        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+        # The connect and the TLS handshake each get min(timeout, time left).
+        sock = socket.create_connection((self._address, 443), remaining(self.timeout, self._deadline))
+        try:
+            tls = self._context.wrap_socket(sock, server_hostname=self.host)
+        except BaseException:
+            sock.close()
+            raise
+        self.sock = DeadlineSocket(tls, self.timeout, self._deadline)
 
 
-def default_transport(method, address, host, path, headers, body, timeout, limit):
-    conn = _PinnedHTTPS(host, address, timeout)
+def http_exchange(conn, method, path, headers, body, limit, deadline):
+    """One request on an http.client connection whose socket is a DeadlineSocket: headers and body together
+    must arrive before ``deadline`` (time.monotonic())."""
+    conn.request(method, path, body=body, headers=headers)
+    resp = conn.getresponse()
     try:
-        conn.request(method, path, body=body, headers=headers)
-        resp = conn.getresponse()
-        data = read_capped(resp, limit, time.monotonic() + 2 * timeout)
+        data = read_capped(resp, limit, deadline)
         return resp.status, resp.getheaders(), data
+    finally:
+        resp.close()
+
+
+def default_transport(method, address, host, path, headers, body, timeout, limit, deadline):
+    conn = _PinnedHTTPS(host, address, timeout, deadline)
+    try:
+        return http_exchange(conn, method, path, headers, body, limit, deadline)
     finally:
         conn.close()
 
 
 class SafeFetcher:
-    def __init__(self, hosts, *, timeout, limit, transport=None, resolver=None):
+    def __init__(self, hosts, *, timeout, limit, transport=None, resolver=None, deadline_seconds=None):
         self.hosts = frozenset(h.lower() for h in hosts)
         self.timeout = timeout
         self.limit = limit
+        # One wall-clock budget for the whole fetch (every request, redirect, header and body byte).
+        self.deadline = time.monotonic() + (deadline_seconds or FETCH_DEADLINE_FACTOR * timeout)
         self.transport = transport or default_transport
         self.resolver = resolver or default_resolver
         self.requests = []  # (method, host, path, status): provenance without query strings
@@ -409,8 +535,9 @@ class SafeFetcher:
             if body is not None:
                 headers['Content-Type'] = 'application/x-www-form-urlencoded'
             try:
+                remaining(self.timeout, self.deadline)
                 status, raw_headers, data = self.transport(method, address, host, path, headers, body,
-                                                           self.timeout, self.limit)
+                                                           self.timeout, self.limit, self.deadline)
             except OpsError:
                 raise
             except (TimeoutError, socket.timeout):
@@ -482,6 +609,8 @@ class _PageParser(HTMLParser):
         self.forms = []
         self._form = None
         self.links = []    # (kind, url)
+        self._select = None
+        self._option = None
 
     def handle_starttag(self, tag, attrs):
         a = {k.lower(): (v if v is not None else '') for k, v in attrs}
@@ -492,6 +621,17 @@ class _PageParser(HTMLParser):
             self._form['inputs'].append({'tag': tag, 'name': a.get('name', ''),
                                          'type': a.get('type', 'text' if tag == 'input' else 'submit').lower(),
                                          'value': a.get('value', ''), 'checked': 'checked' in a})
+        elif tag == 'textarea' and self._form is not None:
+            # Its served text is never submitted: a non-serial textarea is a honeypot and is sent empty.
+            self._form['inputs'].append({'tag': tag, 'name': a.get('name', ''), 'type': 'textarea', 'value': '',
+                                         'checked': False})
+        elif tag == 'select' and self._form is not None:
+            self._select = {'tag': tag, 'name': a.get('name', ''), 'type': 'select', 'value': '', 'checked': False,
+                            'options': []}
+            self._form['inputs'].append(self._select)
+        elif tag == 'option' and self._select is not None:
+            self._option = {'value': a.get('value'), 'text': '', 'selected': 'selected' in a}
+            self._select['options'].append(self._option)
         elif tag == 'a' and a.get('href'):
             self.links.append(('anchor', a['href']))
         elif tag == 'iframe' and a.get('src'):
@@ -504,9 +644,18 @@ class _PageParser(HTMLParser):
     def handle_startendtag(self, tag, attrs):
         self.handle_starttag(tag, attrs)
 
+    def handle_data(self, data):
+        if self._option is not None and len(self._option['text']) < 200:
+            self._option['text'] += data
+
     def handle_endtag(self, tag):
         if tag == 'form':
             self._form = None
+            self._select = self._option = None
+        elif tag == 'select':
+            self._select = self._option = None
+        elif tag == 'option':
+            self._option = None
 
 
 def parse_page(text):
@@ -547,6 +696,11 @@ def build_form(form, serial):
         elif kind in ('checkbox', 'radio'):
             if item['checked']:
                 fields.append((name, item['value'] or 'on'))
+        elif kind == 'select':  # as a browser sends it: the selected option, else the first one
+            options = item.get('options') or []
+            chosen = next((o for o in options if o['selected']), options[0] if options else None)
+            if chosen is not None:
+                fields.append((name, chosen['value'] if chosen['value'] is not None else chosen['text'].strip()))
         elif kind in ('button', 'reset', 'file'):
             continue
         else:  # any other visible-or-hidden text box is a honeypot: it must stay empty
@@ -597,7 +751,6 @@ def _files_from(resp, fetcher, serial, limit, allow_links):
     if not allow_links:
         raise OpsError('calibration_unparseable', 'the reply is an HTML page, not a calibration file')
     page = parse_page(text)
-    digits = serial.replace('-', '') if serial else None
     picked, offsite = [], 0
     for kind, link in page.links:
         target = urljoin(resp.url, link.strip())
@@ -607,8 +760,7 @@ def _files_from(resp, fetcher, serial, limit, allow_links):
         if parts.scheme != 'https' or (parts.hostname or '').lower() not in fetcher.hosts:
             offsite += 1
             continue
-        path_digits = re.sub(r'[^0-9]', '', parts.path)
-        has_serial = bool(digits and digits in path_digits)
+        has_serial = serial_in(parts.path, serial)
         # Anchors on a product page may point at unrelated downloads: only follow those naming the serial.
         # Redirect-style links (meta refresh, iframe, script location) are the "download starts" mechanism.
         if kind == 'anchor' and not has_serial:
@@ -751,8 +903,7 @@ def _ingest(ctx, files, *, model, serial, provider, wanted, activate, require_se
         seen.add(digest)
         parsed, summary = validate(raw, item['name'], orientation='unknown', serial=serial, strict=True)
         if require_serial_evidence:
-            digits = serial.replace('-', '')
-            in_name = digits in re.sub(r'[^0-9]', '', item['name'] + ' ' + urlsplit(item.get('url') or '').path)
+            in_name = serial_in(item['name'], serial) or serial_in(urlsplit(item.get('url') or '').path, serial)
             if summary['header_serial'] != serial and not in_name:
                 raise OpsError('serial_unverified', 'a downloaded file could not be tied to the requested serial '
                                '(no matching SERNO header or serial in its name); nothing stored')

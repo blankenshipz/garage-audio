@@ -85,9 +85,10 @@ class FakeSite:
         self.resolved.append(host)
         return list(self.addresses)
 
-    def transport(self, method, address, host, path, headers, body, timeout, limit):
+    def transport(self, method, address, host, path, headers, body, timeout, limit, deadline):
         self.calls.append({'method': method, 'address': address, 'host': host, 'path': path,
-                           'headers': dict(headers), 'body': body, 'timeout': timeout, 'limit': limit})
+                           'headers': dict(headers), 'body': body, 'timeout': timeout, 'limit': limit,
+                           'deadline': deadline})
         reply = self.routes.get((method, host, path.split('?', 1)[0]))
         if reply is None:
             return 404, [('Content-Type', 'text/html')], b'<html><body>missing</body></html>'
