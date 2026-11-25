@@ -194,6 +194,30 @@ class PreadmissionRestart(unittest.TestCase):
   call,events=self.fixture(start_error=subprocess.CalledProcessError(2,['nsenter','ip','link','set','ga-lan','up']))
   self.assertEqual(call(),'preadmission');self.assertIn('closed',events)
   self.assertFalse(any(str(x).startswith('start:') for x in events))
+ def policy_failure(self,safe_class):
+  call,events=self.fixture()
+  seen=[];original=lifecycle.classify_failure
+  def classify(error,receipt,carrier):
+   seen.append(error);carrier.dependents.append('music-assistant')  # dependents registered: only transient evidence may retry
+   return original(error,receipt,carrier)
+  def run(argv,**kwargs):
+   if argv[0]=='docker':
+    kwargs['stdout'].write(json.dumps({'policy_admission':False,'safe_error_class':safe_class}).encode())
+    return SimpleNamespace(returncode=1)
+   return SimpleNamespace(returncode=0)
+  ticks=iter([0,10]+[1000]*50)
+  patch.object(lifecycle,'classify_failure',side_effect=classify).start()
+  patch.object(lifecycle.subprocess,'run',side_effect=run).start()
+  patch.object(lifecycle.time,'monotonic',side_effect=lambda:next(ticks)).start()
+  return call(),seen,events
+ def test_policy_transient_class_raises_transient_error_and_is_retried(self):
+  result,seen,events=self.policy_failure('ClientConnectorDNSError')
+  self.assertEqual(len(seen),1);self.assertIsInstance(seen[0],recovery.TransientNetworkError)
+  self.assertEqual(result,'preadmission');self.assertFalse(any(str(x).startswith('start:audio-transport') for x in events))
+ def test_policy_non_transient_class_stays_terminal(self):
+  result,seen,events=self.policy_failure('RuntimeError')
+  self.assertEqual(len(seen),1);self.assertNotIsInstance(seen[0],recovery.TransientNetworkError)
+  self.assertEqual(result,'terminal')
  def test_preadmission_ownership_failures_stay_terminal(self):
   carrier=SimpleNamespace(dependents=[],worker_ack=None)
   self.assertTrue(recovery.preadmission(RuntimeError('bounded DHCP admission timed out'),carrier))
