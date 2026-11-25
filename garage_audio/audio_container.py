@@ -20,6 +20,7 @@ import stat
 RATE = 48000
 WATCHDOG = 3.0
 MAX_PLAY = 4 * 3600
+CAPTURE_STARTUP_WINDOW = .5  # a capture child that exits within this window failed to connect
 MAX_PAUSE = 600
 TICKET_SECONDS = 1.5
 
@@ -302,6 +303,12 @@ class Worker:
         except BaseException:
             self.halt('child_start_failed')
             raise
+        # A capture that cannot connect (e.g. the PipeWire socket is unreachable) exits within
+        # milliseconds and CamillaDSP then finishes silently: never report that as playing.
+        failed = self.startup_failure(capture, dsp, started_generation)
+        if failed:
+            self.halt(failed)
+            raise RuntimeError(failed)
         with self.children_lock:
             if self.stop_generation != started_generation or not self.scalar_valid_locked() or time.monotonic()-self.last_observation > WATCHDOG or not self.network_valid():
                 stale = True
@@ -313,6 +320,21 @@ class Worker:
         if stale:
             self.halt('child_launch_observation_expired')
             raise RuntimeError('child launch observation expired')
+
+    def startup_failure(self, capture, dsp, generation):
+        """Reason code if an owned child exits within the short startup window, else None."""
+        end = time.monotonic()+CAPTURE_STARTUP_WINDOW
+        while True:
+            if capture.poll() is not None:
+                return 'capture_connect_failed'
+            if dsp.poll() is not None:
+                return 'owned_child_exited'
+            with self.children_lock:
+                if self.stop_generation != generation:
+                    return None  # already halted/replaced by its owner; the caller's checks decide
+            if time.monotonic() >= end:
+                return None
+            time.sleep(.02)
 
     def status(self):
         configuration = self.loaded_configuration or self.configurations.state['configuration']
