@@ -55,7 +55,15 @@ resolution", "Name or service not known", "No address associated with hostname",
 "Connection refused", "Connection reset by peer"), and the exception class the policy
 script reports across `docker exec` (`ClientConnectorDNSError`, `ClientConnectorError`,
 `ServerDisconnectedError`, ...). A bare timeout, any permission error in the chain, other
-`OSError`/`ValueError` and every unknown error stay terminal.
+`OSError`/`ValueError` and every unknown error stay terminal. A recorded
+`guard-failure.json` with a non-recoverable kind is terminal regardless of any network-looking
+error in the chain. After a hardware worker acknowledgement, closure is proven against the
+guard failure's timestamp; with no `guard-failure.json` there is nothing to prove against, so
+`verify_closed` fails (terminal) by design: fail-safe, never assume the worker closed. Transient
+policy-admission failures happen before any worker acknowledgement, so they are unaffected.
+`GARAGE_TRANSPORT_CONTROL_GID` (test-only override of group 1003) must be numeric or the
+transport script exits 1. If the capture fails, `audio.status` keeps the specific reason
+(`capture_connect_failed`/`owned_child_exited`) rather than the generic start-failure reason.
 
 The transport container removes a stale PipeWire socket and lock left on the persistent
 runtime volume before starting PipeWire, waits for this PipeWire's own socket, then sets

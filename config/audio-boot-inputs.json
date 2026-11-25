@@ -37,7 +37,7 @@
     "scripts/apply-ma-volume-patch.py": "bc6bc0a6005495bc935ff1eaf22e48328c9b796a5f902512759d5b4973bc5b4d",
     "scripts/audio-runtime-inventory.py": "6f28b74f655e81c76eb1384a6f265ce1bb05e3b25a0107bdbd2795d15930dc83",
     "scripts/bootstrap-audio-network.py": "00b722ac36d69690bc6cf8852c3a09ebbff69cfae768dca8f7e1f21d2925e79f",
-    "scripts/container-transport": "a6ad28c3a4f98cad56599c0a582f7b4122f584e3956a816a23653c12f953ad7a",
+    "scripts/container-transport": "41ac2ed3c0efe402c55ebb7adc3e0c7cfabf6262732b7ea91093a97d0f7096c4",
     "scripts/install-audio-network.py": "69d02fd9c62ac2d039719907a14e88665a8532015bbe63ed91da981543dfbe6d",
     "scripts/network-entry.py": "8fe1fcf94bc1ea3461cc5c508f4dd5a22ba1f70c8b0e33ce0d5419447a3dbdf7",
     "tests/audio_scalar.py": "8eb7c97d19ee125f8bfa971ecde77b345bac550b1874469b766ebedbccad1637",

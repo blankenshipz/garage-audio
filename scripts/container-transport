@@ -4,6 +4,9 @@ set -eu
 # script unprivileged; the image never sets them (defaults are the fixed volume and group 1003).
 export PIPEWIRE_RUNTIME_DIR=${GARAGE_TRANSPORT_RUNTIME_DIR:-/run/garage-audio/pipewire}
 control_gid=${GARAGE_TRANSPORT_CONTROL_GID:-1003}
+case $control_gid in
+  ''|*[!0-9]*) echo "container-transport: GARAGE_TRANSPORT_CONTROL_GID must be numeric (got: $control_gid)" >&2; exit 1;;
+esac
 export PIPEWIRE_REMOTE=garage-pipewire
 export XDG_RUNTIME_DIR=$PIPEWIRE_RUNTIME_DIR
 export ALSA_CONFIG_PATH=/app/audio/asound.conf

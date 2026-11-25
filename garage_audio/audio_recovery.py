@@ -131,6 +131,10 @@ def classify_failure(error,receipt,carrier):
     verdict is not final in time the failure is terminal: never guess recoverable."""
     if not carrier.await_guard_verdict():return 'terminal'
     if recoverable(error,receipt):return 'recoverable'
+    # A recorded guard failure of a non-recoverable kind is final: no network-looking error in the
+    # chain may turn it into a retry.
+    guard=_read_json(Path(receipt)/'guard-failure.json')
+    if guard is not None and guard.get('kind') not in RECOVERABLE_KINDS:return 'terminal'
     # A positively identified transient resolver/connection failure is retried (bounded) even after
     # dependents registered: Music Assistant itself is a dependent, so DNS trouble at startup always
     # happens after registration. Teardown is proven by verify_closed before any retry. It keeps the

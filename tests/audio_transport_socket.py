@@ -54,6 +54,13 @@ class Transport(unittest.TestCase):
         result=self.run_script()
         self.assertEqual(result.returncode,1)
         self.assertIn('mode 0660',result.stderr)
+    def test_non_numeric_control_gid_fails_loudly_before_pipewire(self):
+        for bad in ('audio','10x3',' '):
+            env=dict(os.environ,PATH=f'{self.shims}:{os.environ["PATH"]}',GARAGE_TRANSPORT_RUNTIME_DIR=str(self.run_dir),
+                GARAGE_TRANSPORT_CONTROL_GID=bad,FAKE_PW_MODE='ok')
+            result=subprocess.run(['sh',str(SCRIPT)],env=env,capture_output=True,text=True,timeout=20)
+            self.assertEqual(result.returncode,1,bad);self.assertIn('must be numeric',result.stderr)
+            self.assertFalse((self.run_dir/'launch-state').exists())
     def test_pipewire_exit_before_socket_fails_loudly_even_with_stale_socket(self):
         self.stale()
         result=self.run_script('die')

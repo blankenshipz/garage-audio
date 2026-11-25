@@ -63,6 +63,45 @@ class CaptureFailure(unittest.TestCase):
             self.start(worker, 0)
         self.assertEqual(worker.status()['reason'], 'capture_connect_failed')
 
+    def test_delta_handler_keeps_specific_reason_not_output_start_failed(self):
+        worker = self.worker()
+        base = {'epoch': 'e', 'active': True, 'logged_in': True, 'volume': 50}
+        worker.event(dict(base, sequence=1, kind='baseline', state='paused'))
+        reply = worker.event(dict(base, sequence=2, kind='prepare', state='playing'))
+        with patch.object(worker, 'network_valid', return_value=True), \
+             patch.object(audio_container.subprocess, 'Popen', fake_popen(1)), \
+             patch.object(audio_container, 'CAPTURE_STARTUP_WINDOW', 3):
+            with self.assertRaisesRegex(RuntimeError, 'capture_connect_failed'):
+                worker.event(dict(base, sequence=3, kind='delta', state='playing', ticket=reply['pending_ticket']))
+        status = worker.status()
+        self.assertEqual((status['state'], status['reason']), ('off', 'capture_connect_failed'))
+        # The preserved reason is consumed: a later generic start failure is reported generically.
+        worker.halt('output_start_failed')
+        self.assertEqual(worker.status()['reason'], 'output_start_failed')
+
+    def test_child_exit_reason_is_preserved_too(self):
+        worker = self.worker()
+        worker.startup_failed = 'owned_child_exited'
+        worker.halt('output_start_failed')
+        self.assertEqual(worker.status()['reason'], 'owned_child_exited')
+
+    def test_scalar_start_path_keeps_specific_reason(self):
+        import os
+        from types import SimpleNamespace
+        worker = self.worker()
+        read, write = os.pipe(); self.addCleanup(os.close, read)
+        worker.scalar = SimpleNamespace(writer=lambda segment: write, healthy=lambda: False)
+        def failing_start(fd):
+            worker.startup_failed = 'capture_connect_failed'
+            worker.halt('capture_connect_failed')
+            worker.startup_failed = 'capture_connect_failed'
+            raise RuntimeError('capture_connect_failed')
+        with patch.object(worker, 'check_scalar'), patch.object(worker, 'start_owned', side_effect=failing_start):
+            with self.assertRaisesRegex(RuntimeError, 'capture_connect_failed'):
+                worker.start()
+        self.assertEqual(worker.status()['reason'], 'capture_connect_failed')
+        worker.scalar = None
+
     def test_healthy_capture_reaches_playing(self):
         worker = self.worker()
         with patch.object(audio_container, 'CAPTURE_STARTUP_WINDOW', .1):

@@ -272,6 +272,17 @@ class TransientNetwork(unittest.TestCase):
   # A bare timeout or unrelated OSError text is NOT transient evidence.
   for error in [asyncio.TimeoutError(),OSError('disk full'),urllib.error.URLError('unknown url type')]:
    self.assertFalse(recovery.transient_network(error),repr(error))
+ def test_nonrecoverable_guard_failure_blocks_transient_retry(self):
+  import socket
+  late=SimpleNamespace(dependents=['ma'],worker_ack=None,await_guard_verdict=lambda:True)
+  gai=socket.gaierror(socket.EAI_AGAIN,'x')
+  receipt=self.root/'guard-receipt';receipt.mkdir()
+  self.assertEqual(recovery.classify_failure(gai,receipt,late),'preadmission')  # no guard failure recorded
+  (receipt/'guard-failure.json').write_text(json.dumps({'kind':'dependent_identity_mismatch'}))
+  for error in [gai,ConnectionResetError(),recovery.TransientNetworkError('x')]:
+   self.assertEqual(recovery.classify_failure(error,receipt,late),'terminal',repr(error))
+  (receipt/'guard-failure.json').write_text('not json')
+  self.assertEqual(recovery.classify_failure(gai,receipt,late),'preadmission')
  def test_dependents_registered_transient_network_is_recoverable_but_unknown_terminal(self):
   import socket
   late=SimpleNamespace(dependents=['ma'],worker_ack='ack',await_guard_verdict=lambda:True)
