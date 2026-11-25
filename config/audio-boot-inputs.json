@@ -7,7 +7,7 @@
     "Dockerfile.audio": "4f93031ea399848fc3fb05db16e129c72b75f859d0892d85d004bd8a8db0a39a",
     "Dockerfile.audio.cached": "2721ec1955a022b543e4f8be0666605009443a8b990251815a734b4c06d911a7",
     "Dockerfile.ma": "5146591946adda8dadde88ca4b3505d55f68f441511096946a169afc26be86f0",
-    "compose.audio-boot.yaml": "e3b9b575443ff4252b169fc4ec7e7781ceac6fd5d308ffbefc6628a1f225102d",
+    "compose.audio-boot.yaml": "8d39085a619dadaba5431430405fe93b565d12221b2f88800d07a08753f996ff",
     "compose.audio-hardware.yaml": "53fff0724917a286b11f2706f51679020e4a67085d63a978387bb4509f19acac",
     "compose.audio-network.yaml": "4db4582f1297185c17a759d1565a19a044dfcb900c7edf5fc74b74b4f1b03276",
     "compose.audio-scalar.yaml": "04789a0a3640c0802c51ead7e7b6daacee0dd86453bdd2397f0c8fc88abdfeec",
