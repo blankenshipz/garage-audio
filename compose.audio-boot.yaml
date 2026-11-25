@@ -14,6 +14,7 @@ services:
     user: "1001:1001"
     group_add: ["1003"]
     read_only: true
+    tmpfs: ["/tmp:rw,noexec,nosuid,size=4m"]
     cap_drop: [ALL]
     security_opt: [no-new-privileges:true]
     pids_limit: 32

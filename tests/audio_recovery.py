@@ -194,6 +194,30 @@ class PreadmissionRestart(unittest.TestCase):
   call,events=self.fixture(start_error=subprocess.CalledProcessError(2,['nsenter','ip','link','set','ga-lan','up']))
   self.assertEqual(call(),'preadmission');self.assertIn('closed',events)
   self.assertFalse(any(str(x).startswith('start:') for x in events))
+ def policy_failure(self,safe_class):
+  call,events=self.fixture()
+  seen=[];original=lifecycle.classify_failure
+  def classify(error,receipt,carrier):
+   seen.append(error);carrier.dependents.append('music-assistant')  # dependents registered: only transient evidence may retry
+   return original(error,receipt,carrier)
+  def run(argv,**kwargs):
+   if argv[0]=='docker':
+    kwargs['stdout'].write(json.dumps({'policy_admission':False,'safe_error_class':safe_class}).encode())
+    return SimpleNamespace(returncode=1)
+   return SimpleNamespace(returncode=0)
+  ticks=iter([0,10]+[1000]*50)
+  patch.object(lifecycle,'classify_failure',side_effect=classify).start()
+  patch.object(lifecycle.subprocess,'run',side_effect=run).start()
+  patch.object(lifecycle.time,'monotonic',side_effect=lambda:next(ticks)).start()
+  return call(),seen,events
+ def test_policy_transient_class_raises_transient_error_and_is_retried(self):
+  result,seen,events=self.policy_failure('ClientConnectorDNSError')
+  self.assertEqual(len(seen),1);self.assertIsInstance(seen[0],recovery.TransientNetworkError)
+  self.assertEqual(result,'preadmission');self.assertFalse(any(str(x).startswith('start:audio-transport') for x in events))
+ def test_policy_non_transient_class_stays_terminal(self):
+  result,seen,events=self.policy_failure('RuntimeError')
+  self.assertEqual(len(seen),1);self.assertNotIsInstance(seen[0],recovery.TransientNetworkError)
+  self.assertEqual(result,'terminal')
  def test_preadmission_ownership_failures_stay_terminal(self):
   carrier=SimpleNamespace(dependents=[],worker_ack=None)
   self.assertTrue(recovery.preadmission(RuntimeError('bounded DHCP admission timed out'),carrier))
@@ -207,6 +231,86 @@ class PreadmissionRestart(unittest.TestCase):
   supervisor=recovery.Supervisor(self.root,stop,lambda:0)
   self.assertEqual(supervisor.run(lambda:calls.append(1) or 'preadmission'),'exhausted')
   self.assertEqual((len(calls),supervisor.last),(4,'preadmission'))
+
+class TransientNetwork(unittest.TestCase):
+ setUp=Recovery.setUp
+ carrier=SimpleNamespace(dependents=[],worker_ack=None)
+ def test_transient_dns_and_connection_errors_are_preadmission(self):
+  import socket
+  for error in [socket.gaierror(socket.EAI_AGAIN,'Temporary failure in name resolution'),ConnectionRefusedError(),ConnectionResetError(),
+    RuntimeError('Temporary failure in name resolution'),RuntimeError('Connection refused by music assistant')]:
+   self.assertTrue(recovery.preadmission(error,self.carrier),repr(error))
+  wrapped=RuntimeError('MA unavailable');wrapped.__cause__=socket.gaierror(socket.EAI_AGAIN,'x')
+  self.assertTrue(recovery.preadmission(wrapped,self.carrier))
+ def test_unknown_and_permanent_errors_stay_terminal(self):
+  import socket
+  denied=ValueError('x');denied.__cause__=PermissionError()
+  denied_net=RuntimeError('Temporary failure in name resolution');denied_net.__context__=PermissionError()
+  ident=ValueError('identity');ident.__cause__=socket.gaierror(socket.EAI_AGAIN,'x')
+  for error in [OSError('boom'),TimeoutError(),BrokenPipeError(),socket.gaierror(socket.EAI_FAMILY,'x'),
+    PermissionError(),KeyError('x'),denied,denied_net,ident,ValueError('unrelated'),FileNotFoundError('x')]:
+   self.assertFalse(recovery.preadmission(error,self.carrier),repr(error))
+  self.assertFalse(recovery.preadmission(ConnectionRefusedError(),SimpleNamespace(dependents=['ma'],worker_ack=None)))
+ def test_wrapped_and_stringified_shapes(self):
+  import socket,urllib.error,asyncio
+  gai=socket.gaierror(socket.EAI_AGAIN,'Temporary failure in name resolution')
+  nonam=socket.gaierror(socket.EAI_NONAME,'Name or service not known')
+  shapes=[nonam,
+   urllib.error.URLError(gai),urllib.error.URLError('Temporary failure in name resolution'),
+   OSError(-3,'Temporary failure in name resolution'),OSError(111,'Connect call failed'),
+   OSError('Connection reset by peer'),
+   subprocess.CalledProcessError(1,['docker','exec'],output=b'',stderr=b'curl: Could not resolve; Temporary failure in name resolution')]
+  try:
+   import aiohttp
+   key=aiohttp.client_reqrep.ConnectionKey('music-assistant',8095,False,None,None,None,None)
+   shapes+=[aiohttp.ClientConnectorDNSError(key,gai),aiohttp.ClientConnectorError(key,ConnectionRefusedError(111,'x'))]
+  except ImportError:pass
+  wrapper=RuntimeError('MA unavailable');wrapper.__cause__=gai
+  shapes.append(wrapper)
+  for error in shapes:
+   self.assertTrue(recovery.transient_network(error),repr(error));self.assertTrue(recovery.preadmission(error,self.carrier),repr(error))
+  # A bare timeout or unrelated OSError text is NOT transient evidence.
+  for error in [asyncio.TimeoutError(),OSError('disk full'),urllib.error.URLError('unknown url type')]:
+   self.assertFalse(recovery.transient_network(error),repr(error))
+ def test_nonrecoverable_guard_failure_blocks_transient_retry(self):
+  import socket
+  late=SimpleNamespace(dependents=['ma'],worker_ack=None,await_guard_verdict=lambda:True)
+  gai=socket.gaierror(socket.EAI_AGAIN,'x')
+  receipt=self.root/'guard-receipt';receipt.mkdir()
+  self.assertEqual(recovery.classify_failure(gai,receipt,late),'preadmission')  # no guard failure recorded
+  (receipt/'guard-failure.json').write_text(json.dumps({'kind':'dependent_identity_mismatch'}))
+  for error in [gai,ConnectionResetError(),recovery.TransientNetworkError('x')]:
+   self.assertEqual(recovery.classify_failure(error,receipt,late),'terminal',repr(error))
+  (receipt/'guard-failure.json').write_text('not json')
+  self.assertEqual(recovery.classify_failure(gai,receipt,late),'preadmission')
+ def test_dependents_registered_transient_network_is_recoverable_but_unknown_terminal(self):
+  import socket
+  late=SimpleNamespace(dependents=['ma'],worker_ack='ack',await_guard_verdict=lambda:True)
+  gai=socket.gaierror(socket.EAI_AGAIN,'x')
+  self.assertEqual(recovery.classify_failure(gai,self.root,late),'preadmission')
+  self.assertEqual(recovery.classify_failure(recovery.TransientNetworkError('x'),self.root,late),'preadmission')
+  for error in [RuntimeError('supported Soloist policy admission failed before transport'),OSError('x'),ValueError('x'),PermissionError('Temporary failure in name resolution')]:
+   self.assertEqual(recovery.classify_failure(error,self.root,late),'terminal',repr(error))
+ def test_policy_stdout_class_names(self):
+  for name,expected in [('ClientConnectorDNSError',True),('ClientConnectorError',True),('ConnectionRefusedError',True),
+    ('RuntimeError',False),('PermissionError',False),('KeyError',False)]:
+   path=self.root/('p-'+name);path.write_text(json.dumps({'safe_error_class':name,'policy_admission':False}))
+   self.assertIs(recovery.policy_failure_transient(path),expected,name)
+  bad=self.root/'bad';bad.write_text('not json')
+  self.assertFalse(recovery.policy_failure_transient(bad));self.assertFalse(recovery.policy_failure_transient(self.root/'missing'))
+ def test_dns_failure_retries_three_times_then_exhausts_and_does_not_restart(self):
+  import socket
+  carrier=SimpleNamespace(dependents=[],worker_ack=None,await_guard_verdict=lambda:True)
+  error=socket.gaierror(socket.EAI_AGAIN,'Temporary failure in name resolution')
+  stop=SimpleNamespace(is_set=lambda:False,wait=lambda _:False);calls=[]
+  def generation():
+   calls.append(1);return recovery.classify_failure(error,self.root,carrier)
+  supervisor=recovery.Supervisor(self.root,stop,lambda:0)
+  self.assertEqual(supervisor.run(generation),'exhausted')
+  self.assertEqual((len(calls),supervisor.retries,supervisor.last),(4,3,'preadmission'))
+  unknown=SimpleNamespace(is_set=lambda:False,wait=lambda _:False);calls.clear()
+  self.assertEqual(recovery.Supervisor(self.root,unknown,lambda:0).run(lambda:calls.append(1) or recovery.classify_failure(OSError('x'),self.root,carrier)),'terminal')
+  self.assertEqual(len(calls),1)
 
 class CarrierMacRelease(unittest.TestCase):
  def carrier(self,holders,link_up_failures):
