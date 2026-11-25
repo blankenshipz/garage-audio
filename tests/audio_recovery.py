@@ -220,11 +220,49 @@ class TransientNetwork(unittest.TestCase):
   self.assertTrue(recovery.preadmission(wrapped,self.carrier))
  def test_unknown_and_permanent_errors_stay_terminal(self):
   import socket
-  wrapped=RuntimeError('x');wrapped.__cause__=socket.gaierror(socket.EAI_NONAME,'Name or service not known')
-  for error in [socket.gaierror(socket.EAI_NONAME,'Name or service not known'),OSError('boom'),TimeoutError(),BrokenPipeError(),
-    PermissionError(),KeyError('x'),wrapped]:
+  denied=ValueError('x');denied.__cause__=PermissionError()
+  denied_net=RuntimeError('Temporary failure in name resolution');denied_net.__context__=PermissionError()
+  ident=ValueError('identity');ident.__cause__=socket.gaierror(socket.EAI_AGAIN,'x')
+  for error in [OSError('boom'),TimeoutError(),BrokenPipeError(),socket.gaierror(socket.EAI_FAMILY,'x'),
+    PermissionError(),KeyError('x'),denied,denied_net,ident,ValueError('unrelated'),FileNotFoundError('x')]:
    self.assertFalse(recovery.preadmission(error,self.carrier),repr(error))
   self.assertFalse(recovery.preadmission(ConnectionRefusedError(),SimpleNamespace(dependents=['ma'],worker_ack=None)))
+ def test_wrapped_and_stringified_shapes(self):
+  import socket,urllib.error,asyncio
+  gai=socket.gaierror(socket.EAI_AGAIN,'Temporary failure in name resolution')
+  nonam=socket.gaierror(socket.EAI_NONAME,'Name or service not known')
+  shapes=[nonam,
+   urllib.error.URLError(gai),urllib.error.URLError('Temporary failure in name resolution'),
+   OSError(-3,'Temporary failure in name resolution'),OSError(111,'Connect call failed'),
+   OSError('Connection reset by peer'),
+   subprocess.CalledProcessError(1,['docker','exec'],output=b'',stderr=b'curl: Could not resolve; Temporary failure in name resolution')]
+  try:
+   import aiohttp
+   key=aiohttp.client_reqrep.ConnectionKey('music-assistant',8095,False,None,None,None,None)
+   shapes+=[aiohttp.ClientConnectorDNSError(key,gai),aiohttp.ClientConnectorError(key,ConnectionRefusedError(111,'x'))]
+  except ImportError:pass
+  wrapper=RuntimeError('MA unavailable');wrapper.__cause__=gai
+  shapes.append(wrapper)
+  for error in shapes:
+   self.assertTrue(recovery.transient_network(error),repr(error));self.assertTrue(recovery.preadmission(error,self.carrier),repr(error))
+  # A bare timeout or unrelated OSError text is NOT transient evidence.
+  for error in [asyncio.TimeoutError(),OSError('disk full'),urllib.error.URLError('unknown url type')]:
+   self.assertFalse(recovery.transient_network(error),repr(error))
+ def test_dependents_registered_transient_network_is_recoverable_but_unknown_terminal(self):
+  import socket
+  late=SimpleNamespace(dependents=['ma'],worker_ack='ack',await_guard_verdict=lambda:True)
+  gai=socket.gaierror(socket.EAI_AGAIN,'x')
+  self.assertEqual(recovery.classify_failure(gai,self.root,late),'preadmission')
+  self.assertEqual(recovery.classify_failure(recovery.TransientNetworkError('x'),self.root,late),'preadmission')
+  for error in [RuntimeError('supported Soloist policy admission failed before transport'),OSError('x'),ValueError('x'),PermissionError('Temporary failure in name resolution')]:
+   self.assertEqual(recovery.classify_failure(error,self.root,late),'terminal',repr(error))
+ def test_policy_stdout_class_names(self):
+  for name,expected in [('ClientConnectorDNSError',True),('ClientConnectorError',True),('ConnectionRefusedError',True),
+    ('RuntimeError',False),('PermissionError',False),('KeyError',False)]:
+   path=self.root/('p-'+name);path.write_text(json.dumps({'safe_error_class':name,'policy_admission':False}))
+   self.assertIs(recovery.policy_failure_transient(path),expected,name)
+  bad=self.root/'bad';bad.write_text('not json')
+  self.assertFalse(recovery.policy_failure_transient(bad));self.assertFalse(recovery.policy_failure_transient(self.root/'missing'))
  def test_dns_failure_retries_three_times_then_exhausts_and_does_not_restart(self):
   import socket
   carrier=SimpleNamespace(dependents=[],worker_ack=None,await_guard_verdict=lambda:True)

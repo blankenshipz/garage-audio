@@ -44,10 +44,18 @@ in the chain) use the same bounded retries; on exhaustion the owner exits 75
 limit. Exit 1 is never restarted. The carrier waits (bounded) for a just-stopped prior
 generation's namespace to release the dedicated MAC instead of failing on
 `RTNETLINK: Address already in use`; a foreign MAC holder still fails.
-Transient resolver or connection-startup failures (`socket.gaierror` with `EAI_AGAIN`,
-connection refused/reset, or their stringified `RuntimeError` forms) are pre-admission
-failures too and use the same three bounded retries. Permanent resolver answers
-(`EAI_NONAME`), other `OSError`s, permission errors and unknown errors stay terminal.
+Transient resolver or connection-startup failures use the same three bounded retries and
+the same exhaustion exit 75, even after dependents (Music Assistant itself) are registered;
+teardown is proven closed before any retry. Recognised: `socket.gaierror`
+(`EAI_AGAIN`, `EAI_NONAME`, `EAI_NODATA`; a degraded local resolver stub returns them
+interchangeably, and a truly wrong hostname still ends after the 3 retries), connection
+refused/reset, wrappers that carry them (`__cause__`/`__context__`, aiohttp `os_error`,
+`URLError.reason`, exception groups), stringified forms ("Temporary failure in name
+resolution", "Name or service not known", "No address associated with hostname",
+"Connection refused", "Connection reset by peer"), and the exception class the policy
+script reports across `docker exec` (`ClientConnectorDNSError`, `ClientConnectorError`,
+`ServerDisconnectedError`, ...). A bare timeout, any permission error in the chain, other
+`OSError`/`ValueError` and every unknown error stay terminal.
 
 The transport container removes a stale PipeWire socket and lock left on the persistent
 runtime volume before starting PipeWire, waits for this PipeWire's own socket, then sets

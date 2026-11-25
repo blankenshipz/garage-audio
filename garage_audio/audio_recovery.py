@@ -1,5 +1,5 @@
 """Private lifecycle recovery: classified workload exits only, never authority renewal."""
-import argparse,fcntl,json,math,os,socket,stat,subprocess,sys,time,uuid
+import argparse,errno,fcntl,json,math,os,socket,stat,subprocess,sys,time,uuid
 from pathlib import Path
 from .audio_network import (HEARTBEAT_TOLERANCE_DEFAULT,HEARTBEAT_TOLERANCE_ENV,HEARTBEAT_TOLERANCE_MAX,
     HEARTBEAT_TOLERANCE_MIN,STALL_KIND,atomic,docker,heartbeat_tolerance)
@@ -51,30 +51,76 @@ def recoverable(error,receipt):
 EX_TEMPFAIL=75
 
 # Transient resolver/connection failures while the network or Music Assistant is still starting.
-# Only these exact kinds are retryable; every other OSError stays terminal.
-_TRANSIENT_GAI=tuple(getattr(socket,name) for name in ('EAI_AGAIN',) if hasattr(socket,name))
+# EAI_NONAME is included on purpose: with a degraded local resolver stub (e.g. systemd-resolved
+# that cannot reach its upstream) lookups of the fixed internal MA hostname return EAI_AGAIN or
+# EAI_NONAME interchangeably. A genuinely wrong hostname still ends terminal-by-exhaustion after
+# the existing 3 bounded retries (5+30+120 s), so the cost of the wider net is bounded.
+_TRANSIENT_GAI=tuple(getattr(socket,name) for name in ('EAI_AGAIN','EAI_NONAME','EAI_NODATA') if hasattr(socket,name))
+_TRANSIENT_ERRNO=(errno.ECONNREFUSED,errno.ECONNRESET)
+_TRANSIENT_TEXT=('temporary failure in name resolution','name or service not known',
+    'no address associated with hostname','connection refused','connection reset by peer')
+# Exception class names that cross the docker-exec boundary as `safe_error_class` (the MA policy
+# script prints only the class name on stdout). aiohttp wraps DNS/connect failures in these.
+TRANSIENT_CLASS_NAMES=frozenset(('ClientConnectorDNSError','ClientConnectorError','ClientConnectionResetError',
+    'ServerDisconnectedError','ConnectionRefusedError','ConnectionResetError','gaierror','CannotConnect','ConnectionFailed'))
+
+class TransientNetworkError(RuntimeError):
+    """Startup failure positively attributed to a transient resolver/connection problem."""
+
+def _text_transient(value):
+    return isinstance(value,str) and any(item in value[:4096].lower() for item in _TRANSIENT_TEXT)
+
+def _direct_transient(error):
+    if isinstance(error,TransientNetworkError):return True
+    if isinstance(error,socket.gaierror):return error.errno in _TRANSIENT_GAI
+    if isinstance(error,(ConnectionRefusedError,ConnectionResetError)):return True
+    if isinstance(error,OSError) and (error.errno in _TRANSIENT_GAI or error.errno in _TRANSIENT_ERRNO):return True
+    # Stringified across a boundary (RuntimeError(str), CalledProcessError output, URLError.reason text).
+    if _text_transient(str(error)):return True
+    for name in ('stderr','output','reason'):
+        value=getattr(error,name,None)
+        if isinstance(value,bytes):value=value[:4096].decode('utf-8','replace')
+        if _text_transient(value):return True
+    return False
+
+def _inner(error):
+    """Exceptions a wrapper carries besides __cause__/__context__ (aiohttp .os_error, URLError .reason)."""
+    for name in ('os_error','reason'):
+        value=getattr(error,name,None)
+        if isinstance(value,BaseException):yield value
+    for value in getattr(error,'exceptions',()) or ():
+        if isinstance(value,BaseException):yield value
+
+def _chain(error):
+    seen=set();todo=[error]
+    while todo:
+        current=todo.pop(0)
+        if current is None or id(current) in seen:continue
+        seen.add(id(current));yield current
+        todo.extend([current.__cause__,current.__context__,*_inner(current)])
 
 def transient_network(error):
-    """True for a typed resolver-down (EAI_AGAIN) or connection refused/reset failure.
+    """True if the error graph shows a transient resolver/connection failure and no permission denial."""
+    nodes=list(_chain(error))
+    if any(isinstance(node,PermissionError) for node in nodes):return False
+    return any(_direct_transient(node) for node in nodes)
 
-    Errors stringified across a process boundary arrive as RuntimeError/SubprocessError, which
-    preadmission already retries (bounded); a permanent resolver answer (EAI_NONAME) and every
-    other OSError stay terminal."""
-    if isinstance(error,PermissionError):return False
-    if isinstance(error,socket.gaierror):return error.errno in _TRANSIENT_GAI
-    return isinstance(error,(ConnectionRefusedError,ConnectionResetError))
+def policy_failure_transient(stdout_path):
+    """Whether a policy-admission attempt's stdout names a transient connection failure class."""
+    try:
+        with open(stdout_path,'rb') as handle:value=json.loads(handle.read(2048))
+    except (OSError,ValueError):return False
+    return isinstance(value,dict) and value.get('safe_error_class') in TRANSIENT_CLASS_NAMES
 
 def preadmission(error,carrier):
     """Infrastructure failure before any dependent was registered: no worker, DAC or receiver existed."""
     if carrier.dependents or carrier.worker_ack:return False
-    seen=set();current=error;transient=False
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
+    transient=False
+    for current in _chain(error):
         # Ownership, identity and consent failures stay terminal.
         if isinstance(current,PermissionError):return False
-        if transient_network(current):transient=True
+        if _direct_transient(current) or any(_direct_transient(x) for x in _inner(current)):transient=True
         elif isinstance(current,(OSError,ValueError)):return False
-        current=current.__cause__ or current.__context__
     return transient or isinstance(error,(subprocess.SubprocessError,RuntimeError))
 
 def classify_failure(error,receipt,carrier):
@@ -85,6 +131,11 @@ def classify_failure(error,receipt,carrier):
     verdict is not final in time the failure is terminal: never guess recoverable."""
     if not carrier.await_guard_verdict():return 'terminal'
     if recoverable(error,receipt):return 'recoverable'
+    # A positively identified transient resolver/connection failure is retried (bounded) even after
+    # dependents registered: Music Assistant itself is a dependent, so DNS trouble at startup always
+    # happens after registration. Teardown is proven by verify_closed before any retry. It keeps the
+    # 'preadmission' label so exhaustion exits EX_TEMPFAIL (the unit retries under its start limit).
+    if transient_network(error):return 'preadmission'
     return 'preadmission' if preadmission(error,carrier) else 'terminal'
 
 def verify_closed(carrier):

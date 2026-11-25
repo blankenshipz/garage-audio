@@ -7,7 +7,7 @@ import json,pathlib,subprocess,time,signal,os,threading
 from garage_audio.audio_boot import Boot,load_config
 from garage_audio.audio_network import Carrier,atomic,docker,run
 from garage_audio.audio_receiver import ReceiverEndpoint,ReceiverOwnershipError,PairingAdvertisements,pairing_instances,verify_pairing_instances
-from garage_audio.audio_recovery import EX_TEMPFAIL,Supervisor,classify_failure,guard_classification,owner_lock,verify_closed
+from garage_audio.audio_recovery import EX_TEMPFAIL,Supervisor,TransientNetworkError,policy_failure_transient,classify_failure,guard_classification,owner_lock,verify_closed
 
 ROOT=pathlib.Path(__file__).parent
 
@@ -56,7 +56,7 @@ def generation(config,stop,root,ready=None):
     run('ip','route','add',c.address+'/32','dev',bridge,'src',gateway);host_route=(c.address,bridge)
     atomic(c.receipt/'authority/app-ready.json',{'generation':c.generation,'route_ready':True},mode=0o444)
   # Preserve admission BEFORE transport start: no receiver under old sync policy.
-  deadline=time.monotonic()+45;policy_ok=False
+  deadline=time.monotonic()+45;policy_ok=False;attempt=None
   while time.monotonic()<deadline and not stop.is_set():
    c.healthy();attempt=receipt/('policy-'+str(time.time_ns()))
    with (attempt.with_suffix('.stdout')).open('wb') as out,(attempt.with_suffix('.stderr')).open('wb') as err,(ROOT/'audio-lifecycle-policy.py').open('rb') as code:
@@ -65,7 +65,12 @@ def generation(config,stop,root,ready=None):
    if p.returncode==0:policy_ok=True;break
    stop.wait(2)
   if stop.is_set():return 'stopped'
-  if not policy_ok:raise RuntimeError('supported Soloist policy admission failed before transport')
+  if not policy_ok:
+   # The policy script reports only an exception class on stdout. A transient connection/DNS
+   # class (MA unreachable while the resolver or MA is starting) is retried by the bounded Supervisor.
+   if attempt is not None and policy_failure_transient(attempt.with_suffix('.stdout')):
+    raise TransientNetworkError('supported Soloist policy admission failed before transport: transient network')
+   raise RuntimeError('supported Soloist policy admission failed before transport')
   code="from garage_audio.audio_container import request;from pathlib import Path;import json;print(json.dumps(request(Path('/run/garage-audio/public/control.sock'),{'operation':'audio.status'})))"
   value=json.loads(subprocess.check_output(['docker','exec','--user','1000:1000',b.roles['dashboard'],'python','-c',code],text=True,timeout=5))
   if value['state']!='off' or value['owned_children'] or value['device_open'] or value['scalar_readers_ready']:
