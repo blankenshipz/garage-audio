@@ -1,5 +1,5 @@
 """Private lifecycle recovery: classified workload exits only, never authority renewal."""
-import argparse,fcntl,json,math,os,stat,subprocess,sys,time,uuid
+import argparse,fcntl,json,math,os,socket,stat,subprocess,sys,time,uuid
 from pathlib import Path
 from .audio_network import (HEARTBEAT_TOLERANCE_DEFAULT,HEARTBEAT_TOLERANCE_ENV,HEARTBEAT_TOLERANCE_MAX,
     HEARTBEAT_TOLERANCE_MIN,STALL_KIND,atomic,docker,heartbeat_tolerance)
@@ -50,16 +50,32 @@ def recoverable(error,receipt):
 
 EX_TEMPFAIL=75
 
+# Transient resolver/connection failures while the network or Music Assistant is still starting.
+# Only these exact kinds are retryable; every other OSError stays terminal.
+_TRANSIENT_GAI=tuple(getattr(socket,name) for name in ('EAI_AGAIN',) if hasattr(socket,name))
+
+def transient_network(error):
+    """True for a typed resolver-down (EAI_AGAIN) or connection refused/reset failure.
+
+    Errors stringified across a process boundary arrive as RuntimeError/SubprocessError, which
+    preadmission already retries (bounded); a permanent resolver answer (EAI_NONAME) and every
+    other OSError stay terminal."""
+    if isinstance(error,PermissionError):return False
+    if isinstance(error,socket.gaierror):return error.errno in _TRANSIENT_GAI
+    return isinstance(error,(ConnectionRefusedError,ConnectionResetError))
+
 def preadmission(error,carrier):
     """Infrastructure failure before any dependent was registered: no worker, DAC or receiver existed."""
     if carrier.dependents or carrier.worker_ack:return False
-    seen=set();current=error
+    seen=set();current=error;transient=False
     while current is not None and id(current) not in seen:
         seen.add(id(current))
         # Ownership, identity and consent failures stay terminal.
-        if isinstance(current,(PermissionError,OSError,ValueError)):return False
+        if isinstance(current,PermissionError):return False
+        if transient_network(current):transient=True
+        elif isinstance(current,(OSError,ValueError)):return False
         current=current.__cause__ or current.__context__
-    return isinstance(error,(subprocess.SubprocessError,RuntimeError))
+    return transient or isinstance(error,(subprocess.SubprocessError,RuntimeError))
 
 def classify_failure(error,receipt,carrier):
     """'recoverable' | 'preadmission' | 'terminal' for a generation failure.

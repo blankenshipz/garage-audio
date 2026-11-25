@@ -208,6 +208,37 @@ class PreadmissionRestart(unittest.TestCase):
   self.assertEqual(supervisor.run(lambda:calls.append(1) or 'preadmission'),'exhausted')
   self.assertEqual((len(calls),supervisor.last),(4,'preadmission'))
 
+class TransientNetwork(unittest.TestCase):
+ setUp=Recovery.setUp
+ carrier=SimpleNamespace(dependents=[],worker_ack=None)
+ def test_transient_dns_and_connection_errors_are_preadmission(self):
+  import socket
+  for error in [socket.gaierror(socket.EAI_AGAIN,'Temporary failure in name resolution'),ConnectionRefusedError(),ConnectionResetError(),
+    RuntimeError('Temporary failure in name resolution'),RuntimeError('Connection refused by music assistant')]:
+   self.assertTrue(recovery.preadmission(error,self.carrier),repr(error))
+  wrapped=RuntimeError('MA unavailable');wrapped.__cause__=socket.gaierror(socket.EAI_AGAIN,'x')
+  self.assertTrue(recovery.preadmission(wrapped,self.carrier))
+ def test_unknown_and_permanent_errors_stay_terminal(self):
+  import socket
+  wrapped=RuntimeError('x');wrapped.__cause__=socket.gaierror(socket.EAI_NONAME,'Name or service not known')
+  for error in [socket.gaierror(socket.EAI_NONAME,'Name or service not known'),OSError('boom'),TimeoutError(),BrokenPipeError(),
+    PermissionError(),KeyError('x'),wrapped]:
+   self.assertFalse(recovery.preadmission(error,self.carrier),repr(error))
+  self.assertFalse(recovery.preadmission(ConnectionRefusedError(),SimpleNamespace(dependents=['ma'],worker_ack=None)))
+ def test_dns_failure_retries_three_times_then_exhausts_and_does_not_restart(self):
+  import socket
+  carrier=SimpleNamespace(dependents=[],worker_ack=None,await_guard_verdict=lambda:True)
+  error=socket.gaierror(socket.EAI_AGAIN,'Temporary failure in name resolution')
+  stop=SimpleNamespace(is_set=lambda:False,wait=lambda _:False);calls=[]
+  def generation():
+   calls.append(1);return recovery.classify_failure(error,self.root,carrier)
+  supervisor=recovery.Supervisor(self.root,stop,lambda:0)
+  self.assertEqual(supervisor.run(generation),'exhausted')
+  self.assertEqual((len(calls),supervisor.retries,supervisor.last),(4,3,'preadmission'))
+  unknown=SimpleNamespace(is_set=lambda:False,wait=lambda _:False);calls.clear()
+  self.assertEqual(recovery.Supervisor(self.root,unknown,lambda:0).run(lambda:calls.append(1) or recovery.classify_failure(OSError('x'),self.root,carrier)),'terminal')
+  self.assertEqual(len(calls),1)
+
 class CarrierMacRelease(unittest.TestCase):
  def carrier(self,holders,link_up_failures):
   c=object.__new__(network.Carrier);c.name='gaudio-net-x';c.generation='g';c.id=None

@@ -44,6 +44,19 @@ in the chain) use the same bounded retries; on exhaustion the owner exits 75
 limit. Exit 1 is never restarted. The carrier waits (bounded) for a just-stopped prior
 generation's namespace to release the dedicated MAC instead of failing on
 `RTNETLINK: Address already in use`; a foreign MAC holder still fails.
+Transient resolver or connection-startup failures (`socket.gaierror` with `EAI_AGAIN`,
+connection refused/reset, or their stringified `RuntimeError` forms) are pre-admission
+failures too and use the same three bounded retries. Permanent resolver answers
+(`EAI_NONAME`), other `OSError`s, permission errors and unknown errors stay terminal.
+
+The transport container removes a stale PipeWire socket and lock left on the persistent
+runtime volume before starting PipeWire, waits for this PipeWire's own socket, then sets
+group 1003 / mode 0660 and verifies it (socket, group, mode); a mismatch or timeout exits
+nonzero. PipeWire 0.3.65 has no verified config option for the native socket mode/group,
+so the post-start chgrp/chmod plus verification is used. If a capture child (pw-record)
+exits within the first 0.5 s of a segment, the worker halts with reason
+`capture_connect_failed` (shown in `audio.status` and the observer decision trace as
+`ipc_error`) instead of reporting `playing`.
 needrestart must not restart the owner (`config/system/needrestart-garage-audio.conf`):
 on 2026-11-13 a libc upgrade restarted it and the restart lost that race.
 SIGTERM/SIGINT cancel backoff and do not restart. Use **systemctl stop on the owner**,
