@@ -31,8 +31,8 @@ class AudioObserverComposeTests(unittest.TestCase):
         for line in self.block:
             m = re.match(r'^    tmpfs:\s*\[(.*)\]\s*$', line)
             if m:
-                for item in m.group(1).split(','):
-                    item = item.strip().strip('"\'')
+                for dq, sq in re.findall(r'"([^"]*)"|\'([^\']*)\'', m.group(1)):
+                    item = dq or sq
                     if item:
                         targets.append((item.split(':')[0], item))
         return targets
@@ -43,7 +43,10 @@ class AudioObserverComposeTests(unittest.TestCase):
     def test_tmp_tmpfs_writable(self):
         mounts = dict(self.tmpfs_targets())
         self.assertIn('/tmp', mounts)
-        self.assertIn('rw', mounts['/tmp'].split(':', 1)[1].split(','))
+        options = mounts['/tmp'].split(':', 1)[1].split(',')
+        for opt in ('rw', 'noexec', 'nosuid'):
+            self.assertIn(opt, options)
+        self.assertEqual(['/tmp'], [t for t, _ in self.tmpfs_targets()])
 
     def test_decision_trace_dir_is_tmpfs(self):
         parent = self.trace_path.parent
