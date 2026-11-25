@@ -1,5 +1,5 @@
 """Synthetic: scripts/container-transport socket handling against fake pipewire (no Docker/PipeWire)."""
-import os,socket,stat,subprocess,tempfile,unittest
+import fcntl,os,socket,stat,subprocess,tempfile,unittest
 from pathlib import Path
 
 SCRIPT=Path(__file__).parents[1]/'scripts/container-transport'
@@ -66,6 +66,23 @@ class Transport(unittest.TestCase):
         result=self.run_script('die')
         self.assertEqual(result.returncode,1)
         self.assertIn('exited before creating',result.stderr)
+
+    def test_live_pipewire_lock_is_never_removed(self):
+        ino=self.stale()
+        lock=self.run_dir/'garage-pipewire.lock'
+        with open(lock,'rb') as held:
+            fcntl.flock(held,fcntl.LOCK_EX|fcntl.LOCK_NB)  # a running PipeWire holds this
+            result=self.run_script()
+        self.assertEqual(result.returncode,1)
+        self.assertIn('held by a running pipewire',result.stderr)
+        self.assertFalse((self.run_dir/'launch-state').exists())  # pipewire never started
+        self.assertEqual(os.stat(self.run_dir/'garage-pipewire').st_ino,ino)
+        self.assertTrue(lock.exists())
+    def test_unlocked_stale_lock_without_socket_is_removed(self):
+        (self.run_dir/'garage-pipewire.lock').write_text('')
+        result=self.run_script()
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual((self.run_dir/'launch-state').read_text(),'clean')
 
 if __name__=='__main__':
     unittest.main()

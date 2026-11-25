@@ -17,6 +17,13 @@ sock=$PIPEWIRE_RUNTIME_DIR/garage-pipewire
 # remain. This container is the volume's only PipeWire owner, so remove them BEFORE starting
 # PipeWire; otherwise the readiness wait below would accept the stale file and PipeWire would
 # later recreate the socket with its default 0755 mode, unreachable for the device worker.
+# Never remove a LIVE daemon's socket: a running PipeWire holds an exclusive flock on
+# "$sock.lock", so only files whose lock is free are stale. (python3: always in this image.)
+if [ -e "$sock.lock" ] && ! python3 -c 'import fcntl,sys
+f=open(sys.argv[1],"rb");fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)' "$sock.lock" 2>/dev/null; then
+  echo "container-transport: $sock.lock is held by a running pipewire; refusing to remove its socket" >&2
+  exit 1
+fi
 rm -f "$sock" "$sock.lock"
 pipewire -c /app/audio/pipewire.conf &
 pw=$!
