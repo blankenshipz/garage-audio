@@ -36,7 +36,8 @@ class DecisionTrace:
              'origin': {'observe', 'drive', 'rpc', 'corroborate', 'accept', 'other'},
              'ipc_error': {'peer_uid', 'network_generation', 'schema', 'sequence',
                            'baseline', 'ticket', 'scalar_terminal', 'unavailable',
-                           'device_ownership', 'device_mapping', 'device_identity', 'other'}}
+                           'device_ownership', 'device_mapping', 'device_identity',
+                           'capture_connect_failed', 'owned_child_exited', 'other'}}
     BOOLS = {'active', 'logged_in', 'volume_known', 'ticket_created', 'eligible', 'ok',
              'qualifies', 'token_bound', 'consumed'}
 
@@ -175,7 +176,9 @@ class DecisionTrace:
                         'fresh one-use worker ticket required': 'ticket',
                         'scalar qualification terminal': 'scalar_terminal',
                         'scalar qualification terminal or launch revoked': 'scalar_terminal',
-                        'audio IPC reply unavailable': 'unavailable'}.get(str(error), 'other')
+                        'audio IPC reply unavailable': 'unavailable',
+                        'capture_connect_failed': 'capture_connect_failed',
+                        'owned_child_exited': 'owned_child_exited'}.get(str(error), 'other')
             category = {
                 'exclusive numeric UID1002/GID1003 mode0600 required': 'device_ownership',
                 'verified UMC node missing from container; recreate identity-bound mapping': 'device_mapping',
